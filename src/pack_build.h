@@ -24,8 +24,9 @@ namespace packbuild {
 
 // The weights and root constants the recipe refers to (parts.json: intel_upload by ordinal, intel_const by dispatch
 // index). The builder checks every blob against the recipe's SHA-256, so a wrong source fails by naming the part.
-// DevCaptureSource below reads an offline capture; the decoder of libxess_fg's own data (story B3) implements this
-// interface later.
+// IntelFileSource (intel_file_source.h) rebuilds every weight upload from the player's libxess_fg.dll file;
+// DevCaptureSource below reads an offline capture (development only, and the stand-in for the root constants until
+// they are derived too).
 class IntelDataSource {
 public:
     virtual ~IntelDataSource() = default;
@@ -44,6 +45,8 @@ public:
 class DevCaptureSource : public IntelDataSource {
 public:
     DevCaptureSource(const std::wstring& weightsDir, const std::wstring& capLog);
+    // Root constants only (the weights come from elsewhere): Upload() then always fails.
+    explicit DevCaptureSource(const std::wstring& capLog) : capLog_(capLog) {}
     std::string Id() const override { return "dev"; }
     bool Upload(int ordinal, std::vector<uint8_t>& out) override;
     bool RootConstants(int index, std::vector<uint8_t>& out) override;
