@@ -165,10 +165,10 @@ recon/blend modules, the same rest). Module names are SHA-256 prefixes (8 hex di
 |---|---|---|---|---|---|---|
 | k0 | input prep once per app frame: both frames into the flow net's 2 input textures | **own** (`gen_prep_ptx.py`, story B2b round 1) | a6aefb7a (both) | own kernel, runs on D3D12 and CUDA; native stays blocked by its consumers (k2, k3, cubins reading the textures as buffers) | bit-exact against the module on 9 cases (odd sizes, rect, 2560x1440, 1505x847); 0.022 ms at 2560x1440 vs 0.0345 translated and 0.022 native | done, no translation |
 | k1 | box downscale of the previous depth to 640x360 | **own** (`gen_depth_down_ptx.py`, story B2b round 1) | fc68cb62 (both) | own kernel; native **blocked** (consumer k18 is a cubin reading the buffer) | exact rounding matters: div.approx vs div.rn was 1 ulp off on 19% of pixels; bit-exact on 10 cases; 0.0113 ms (2560x1440 -> 640x360) vs 0.017 translated and 0.024 native | done, no translation |
-| k2 | flow net A stem, 18-bit clamp | clamp:18 (module ships 17) | 61e52c4b (both) | native **impossible** (module's clamp is fixed at 17); own stem kernel (needs a stem generator, family B generator is the closest); translate + clamp re-bound (today) | proven both ways 17<->18 with check_all V clamp rows | **own** (stem generator) |
-| k3 | flow net B stem, 17-bit clamp | clamp:17 (module ships 18) | 654e0607 (both) | as k2 | as k2 | **own** (same generator) |
-| k11 | flow net B front stage (U0 only) | plain | c68b3843 (both) | native **blocked** (outputs read by our family B cubins as buffers); own; translate | no separate timing; once per app frame | translate until an own kernel exists; role inferred from dispatch order, not verified |
-| k12 | flow net B front stage (x128 in/out) | plain | 338f1957 (both) | as k11 | as k11 | as k11 |
+| k2 | net A stem: 4 -> 128 channels, stride 2, 18-bit clamp | **own** (`gen_stem_ptx.py --stem a`, story B2b round 2) | 61e52c4b (both) | own kernel (the module's clamp is fixed at 17, the pack runs 18); native impossible | bit-exact against the pack's former translated+re-bounded kernel on 19 cases per slot (real weights, saturating, odd sizes 65x33 .. 2560x1440, crop 0/1, texture and limit edges); 0.0024 ms at 2560x1440 vs 0.0025 | done, no translation |
+| k3 | net A 112 -> 224 channels, stride 2, 17-bit clamp | **own** (`gen_s2_ptx.py --shape a112`, story B2b round 2) | 654e0607 (both) | as k2 | as k2; 0.0105 ms vs 0.0109 | done, no translation |
+| k11 | net B stem: 8 -> 32 channels from the half-float flow and the warp, stride 2 | **own** (`gen_stem_ptx.py --stem b`, story B2b round 2) | c68b3843 (both) | own kernel; native blocked (outputs read by our family B kernels as buffers) | bit-exact against the module on the same kind of cases (flow buffer slack, unaligned 12-byte pixels); 0.0108 ms vs 0.0118 | done, no translation |
+| k12 | net B 32 -> 64 channels, stride 2 | **own** (`gen_s2_ptx.py --shape b32`, story B2b round 2) | 338f1957 (both) | as k11 | as k11; 0.0121 ms vs 0.0130 | done, no translation |
 | k17 | motion splat of the game's motion + depth, per generated frame | plain | aae5e2f6 (both) | **native works** (existing `native` line, no padding); own; translate | native == PTX 0.11 ms per pass in pack_d3d (kernel alone 0.046); outputs equal byte for byte; the cost was the clear before it, now range-cleared | **native** |
 | k17 variants | same, flag variants (inverted depth / no depth cut) | plain | c0481f4f, 4847df5d, 903ffa0d (both) | as k17 | as k17 | **native** |
 | k18 | per-t forward splat of the flow (atomic key buffer) | plain | 9ef8c15d (both) | native possible but **slower** (kept as PTX in the personal pack); own kernel (semantics documented: key = flag, depth, fp16 flow x t, atomic max into 2x2); translate | notes 2026-10-24: "slower native: stays PTX" (no number recorded) | **own** kernel; translate meanwhile |
@@ -179,7 +179,7 @@ recon/blend modules, the same rest). Module names are SHA-256 prefixes (8 hex di
 | k31 variant | blend without premultiplied alpha | plain | 0f8619d4 / 47821c21 | as k31 | as k31 | as k31 |
 
 Summary: 16 slots per pack run native today (12 recon, 4 splat) and stay native; 10 do not and need an own
-kernel or the translation: k0, k1, k2, k3, k11, k12, k18 (+ variant), k31 (+ variant) = 8 slots with 10 modules
+kernel or the translation: k0, k1, k2, k3, k11, k12 now have one (B2b rounds 1-2); k18 (+ variant) and k31 (+ variant) remain = 8 slots with 10 modules
 (the recipe's other 16 `intel_xlate` modules are the PTX twins of the native ones, kept for the CUDA path).
 
 Open (needs GPU timing, not measured here): own vs translated for k0/k1/k11/k12 (all small, once per app frame,

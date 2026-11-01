@@ -11,17 +11,15 @@
    "generator": "gen_depth_down_ptx.py",
    "args": []
   },
-  "k02_x61e52c4b_c18.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "61e52c4bfa07398ce032051c1f2efe3b434511f0e95fd745b54336c6f1f7dde3",
-   "transform": "clamp:18",
-   "fmts": ["S0=rg8i", "U0=x64"]
+  "k02_stem_a_18.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_stem_ptx.py",
+   "args": ["--stem", "a", "--bits", "18"]
   },
-  "k03_x654e0607_c17.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "654e0607beb06b757483d9dfd860a5e62f48053b7d3612adcda5ff1840f415bf",
-   "transform": "clamp:17",
-   "fmts": ["S0=x64", "U0=x64"]
+  "k03_s2_a112_17.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_s2_ptx.py",
+   "args": ["--shape", "a112", "--bits", "17"]
   },
   "k04_famb_a224_17_sm80.ptx": {
    "kind": "own_gen",
@@ -81,17 +79,15 @@
    "label": "warp_1",
    "fmts": ["S0=rg8i"]
   },
-  "k11_xc68b3843.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "c68b38430a94f4ead3096f5b9fdaac74ca6aa761e599334059f7403195cfdca3",
-   "transform": "plain",
-   "fmts": ["U0=x128"]
+  "k11_stem_b_18.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_stem_ptx.py",
+   "args": ["--stem", "b", "--bits", "18"]
   },
-  "k12_x338f1957.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "338f19578972fb48fdba84ef5f4759f8033cee115827d1a3bb71caae84492259",
-   "transform": "plain",
-   "fmts": ["S0=x128", "U0=x128"]
+  "k12_s2_b32_18.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_s2_ptx.py",
+   "args": ["--shape", "b32", "--bits", "18"]
   },
   "k13_famb_b64_18_sm80.ptx": {
    "kind": "own_gen",
