@@ -147,8 +147,35 @@ OWN_PTX_ENTRIES = {b"swaprb", b"fill"}
 RE_ENTRY = re.compile(rb"\.entry\s+([A-Za-z_][A-Za-z0-9_]*)")
 
 
+BUNDLE_MAGIC = b"F5OWN1\n"
+
+
+def parse_bundle(data, at):
+    """The bundle of tools/recipe/build_own.py at `at`: ("<size> <name>\\n", bytes, "\\n")* then "end\\n".
+    Returns (end offset, [(name, bytes)]), or (0, []) if what follows is not a complete bundle."""
+    pos = at + len(BUNDLE_MAGIC)
+    records = []
+    while True:
+        eol = data.find(b"\n", pos, pos + 600)
+        if eol < 0:
+            return 0, []
+        line = data[pos:eol]
+        pos = eol + 1
+        if line == b"end":
+            return pos, records
+        size, _, name = line.partition(b" ")
+        if not size.isdigit() or not name:
+            return 0, []
+        n = int(size)
+        if pos + n + 1 > len(data) or data[pos + n:pos + n + 1] != b"\n":
+            return 0, []
+        records.append((name.decode("ascii", "replace"), data[pos:pos + n]))
+        pos += n + 1
+
+
 def own_blob_hashes(path):
-    """SHA-256 list build.ps1 writes for the shader containers it compiles in (first word per line)."""
+    """SHA-256 list build.ps1 writes (first word per line): the shader containers it compiles in and every file of the
+    bundle it embeds (resource 102)."""
     if not path or not os.path.exists(path):
         return set()
     return {line.split()[0].lower() for line in open(path, encoding="ascii") if line.strip()}
@@ -180,10 +207,25 @@ def audit_dll(path, own_blobs=None):
     noisy = [o for o in range(0, len(data) - win + 1, win) if entropy(data[o:o + win]) > 7.5]
     if noisy:
         found.append(f"compressed/encrypted data: {len(noisy)} x 64 KB from 0x{noisy[0]:x}")
-    if b".target sm_" in data:
-        names = set(RE_ENTRY.findall(data))
+    # Resource 102 (build_own.py's bundle) is located by its structure; every file in it must be listed by hash in
+    # own_blobs.txt (what our build put in). Its bytes are then set aside: PTX text anywhere else in the DLL may only
+    # be the hand-written utility kernels.
+    rest = bytearray(data)
+    at = data.find(BUNDLE_MAGIC)
+    while at >= 0:
+        end, records = parse_bundle(data, at)
+        if end:
+            for name, blob in records:
+                if hashlib.sha256(blob).hexdigest() not in own:
+                    found.append(f"bundle file {name} ({len(blob)} bytes) not built by us (not in own_blobs.txt)")
+            rest[at:end] = bytes(end - at)
+            at = data.find(BUNDLE_MAGIC, end)
+        else:  # the same word as a constant in the DLL's code, not a bundle
+            at = data.find(BUNDLE_MAGIC, at + 1)
+    if b".target sm_" in rest:
+        names = set(RE_ENTRY.findall(bytes(rest)))
         if not names or names - OWN_PTX_ENTRIES:
-            found.append(f"PTX text with entries {sorted(n.decode() for n in names - OWN_PTX_ENTRIES) or '?'}")
+            found.append(f"PTX text outside our bundle with entries {sorted(n.decode() for n in names - OWN_PTX_ENTRIES) or '?'}")
     for what in found:
         print(f"FAIL {path}: {what} inside the DLL")
     return len(found)
@@ -230,13 +272,27 @@ def self_test():
         import hashlib
         dxbc = b"DXBC" + bytes(16) + bytes.fromhex("01000000") + (40).to_bytes(4, "little") + bytes(12)
         own_list = os.path.join(tmp, "own_blobs.txt")
-        with open(own_list, "w", encoding="ascii") as f:
-            f.write(hashlib.sha256(dxbc).hexdigest() + "  test\n")
         ptx_own = b".target sm_75\n.visible .entry swaprb(\n"
         ptx_other = b".target sm_80\n.visible .entry k04_conv(\n"
+        ptx_gen = b".target sm_80\n.visible .entry dxil_main(\n// ours\n"          # listed
+        ptx_intel = b".target sm_80\n.visible .entry dxil_main(\n// translated\n"  # same entry name, not listed
+        with open(own_list, "w", encoding="ascii") as f:
+            f.write(hashlib.sha256(dxbc).hexdigest() + "  test\n")
+            f.write(hashlib.sha256(ptx_gen).hexdigest() + "  listed ptx\n")
+
+        def bundle(*files):
+            out = b"F5OWN1\n"
+            for i, d in enumerate(files):
+                out += f"{len(d)} i0/f{i}.ptx\n".encode() + d + b"\n"
+            return out + b"end\n"
         cases = [("own DXBC + own PTX pass", b"MZ" + dxbc + ptx_own, own_list, False),
                  ("unlisted DXBC fails", b"MZ" + dxbc, None, True),
                  ("foreign PTX entry fails", b"MZ" + ptx_own + ptx_other, own_list, True),
+                 ("listed PTX inside the bundle passes", b"MZ" + ptx_own + bundle(ptx_gen, ptx_gen), own_list, False),
+                 ("unlisted PTX (same entry name) inside the bundle fails",
+                  b"MZ" + bundle(ptx_gen, ptx_intel), own_list, True),
+                 ("listed PTX outside the bundle fails", b"MZ" + ptx_gen + bundle(ptx_gen), own_list, True),
+                 ("the bundle magic as a code constant is no bundle", b"MZ" + b"F5OWN1\n\0\0" + ptx_own, own_list, False),
                  ("decoder constants (3 zstd magics) pass", b"MZ" + (bytes.fromhex("28b52ffd") + bytes(8)) * 3, own_list, False),
                  ("a zstd payload (40 frames) fails", b"MZ" + (bytes.fromhex("28b52ffd") + bytes(8)) * 40, own_list, True),
                  ("compressed payload fails",b"MZ" + os.urandom(200 * 1024), own_list, True)]
