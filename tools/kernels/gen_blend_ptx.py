@@ -189,10 +189,25 @@ ptx("ld.param.u32", bsz, "[p_s7+32]")
 sub4 = r()
 ptx("shl.b32", sub4, sub_, "2")
 
-weights = []           # five sigmoid outputs
-rows = []
-for k in range(5):
-    row = rs(4)
+img = {}
+
+
+def fetch_images():
+    """The motion-free pair, then the reconstructed images. Issued after the weights: with the reads first the
+    kernel needs 81 registers instead of 54 and runs a quarter slower in the D3D12 pack."""
+    global f11, f12
+    f11 = fetch(11, x11, y11)
+    f12 = fetch(12, x11, y11)
+    if HDR:
+        for s in (3, 4, 1, 2):
+            img[s] = fetch(s, x, y)
+    else:
+        for s in (1, 2, 3):
+            img[s] = fetch(s, x, y)
+
+
+def weight_row(k, dst):
+    """dst = the four words of row (sub + 4k) of the weights buffer, 0 when the row does not fit."""
     ro = r()
     ptx("or.b32", ro, sub_, str(4 * k))
     off = r()
@@ -200,12 +215,11 @@ for k in range(5):
     end = r()
     ptx("add.s32", end, off, "16")
     ptx("setp.le.u32", "%pw", end, wsz)
-    for v in row:
+    for v in dst:
         ptx("mov.b32", v, "0")
     w("    cvt.u64.u32 %%wa, %s;" % off)
     ptx("add.s64", "%wa", "%wb", "%wa")
-    w("    @%%pw ld.global.nc.v4.u32 {%s}, [%%wa];" % ", ".join(row))
-    rows.append(row)
+    w("    @%%pw ld.global.nc.v4.u32 {%s}, [%%wa];" % ", ".join(dst))
 
 
 def scalar(base, size, k, dst):
@@ -221,37 +235,24 @@ def scalar(base, size, k, dst):
     w("    @%%ps ld.global.nc.u32 %s, [%%wa];" % dst)
 
 
-scales, biases = rs(5), rs(5)
+# ---- the five weights, one channel after the other (few registers live at a time) ---------------------------
+weights = []
 for k in range(5):
-    scalar("%sb", ssz, k, scales[k])
-    scalar("%bb", bsz, k, biases[k])
-
-# ---- the reconstructed images (issued before the arithmetic so the reads are in flight together) -------------
-img = {}
-if HDR:
-    for s in (3, 4, 1, 2):
-        img[s] = fetch(s, x, y)
-else:
-    for s in (1, 2, 3):
-        img[s] = fetch(s, x, y)
-f11 = fetch(11, x11, y11)
-f12 = fetch(12, x11, y11)
-
-# ---- weights ---------------------------------------------------------------------------------------------
-for k in range(5):
-    acc = r()
-    ptx("mov.b32", acc, "0")
-    d0 = r()
+    row = rs(4)
+    weight_row(k, row)
+    scale, bias = r(), r()
+    scalar("%sb", ssz, k, scale)
+    scalar("%bb", bsz, k, bias)
     # dp4a chain over the four words, first word first, accumulating from 0
     cur = "0"
     for j in range(4):
         nxt = r()
-        ptx("dp4a.s32.s32", nxt, u[j], rows[k][j], cur)
+        ptx("dp4a.s32.s32", nxt, u[j], row[j], cur)
         cur = nxt
     f = r()
     ptx("cvt.rn.f32.s32", f, cur)
     v = r()
-    fma(v, scales[k], f, biases[k])
+    fma(v, scale, f, bias)
     e = r()
     mul(e, v, "0fBFB8AA3B")
     ex = r()
@@ -262,6 +263,7 @@ for k in range(5):
     ptx("div.approx.ftz.f32", sg, ONE, den)
     weights.append(sg)
 w0, w1, w2, w3, w4 = weights
+fetch_images()
 
 
 def lerp3(dst, p, q, wt):

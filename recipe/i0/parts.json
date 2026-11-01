@@ -251,7 +251,7 @@
    "generator": "gen_conv_ptx.py",
    "args": ["--layer", "c16", "--sm", "75"]
   },
-  "k31_blend.ptx": {
+  "k31_blend_sdr.ptx": {
    "kind": "own_gen",
    "generator": "gen_blend_ptx.py",
    "args": []
@@ -346,7 +346,7 @@
    "transform": "plain",
    "fmts": ["S0=x32"]
   },
-  "v_blend_straight.ptx": {
+  "v_blend_sdr_straight.ptx": {
    "kind": "own_gen",
    "generator": "gen_blend_ptx.py",
    "args": ["--premul", "0"]
