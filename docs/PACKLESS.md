@@ -184,3 +184,23 @@ kernel or the translation: k0, k1, k2, k3, k11, k12, k18 (+ variant), k31 (+ var
 
 Open (needs GPU timing, not measured here): own vs translated for k0/k1/k11/k12 (all small, once per app frame,
 total about 0.2 ms of the 1.45 ms app-frame budget), and the number behind "k18 slower native".
+
+## libxess_fg builds checked (story B4, 2026-11-01)
+
+Every distinct libxess_fg.dll found on the development PC (SHA-256 first 8 hex; `tests/modules_test`, `tests/intel_file_test`
+with `recipe`, `-XessInc` headers of OptiScaler-NR). translate_test was run on no new build (only builds with all modules found qualify, and
+the two that do were covered in B2/B3).
+
+| Version | sha8 | Size | Link time (UTC) | Modules found | Weight uploads / root constants | Result |
+|---|---|---|---|---|---|---|
+| 1.1.0.19 | D82D9ADA | 45,557,608 | 2025-03-13 | decode fails (no zstd dictionaries) | not found | unsupported |
+| 1.2.0.87 | 7FA2116E | 45,541,752 | 2025-07-18 | decode fails | not found | unsupported |
+| 1.2.2.118 | E042A111 | 47,119,216 | 2025-10-21 | decode fails | not found | unsupported |
+| 1.3.1.78 | EC5E0C65 | 22,957,432 | 2026-03-31 | 40/40 (144 distinct) | 106/106, 44/44 | works |
+| 1.3.4.95 | 752B1491 | 22,866,056 | 2026-08-31 | 40/40 (144 distinct) | 106/106, 44/44 | works |
+| 1.3.4.95 (one byte-patched variant of 752B1491, same size) | 5E1ACFFE | 22,866,056 | 2026-08-31 | 40/40 | 106/106, 44/44 | works |
+
+Why the 1.1 to 1.2 builds fail: they hold no zstd frames and no dictionaries (the 1.3 layout compresses the shader modules), no
+DXBC/DXIL container text at all, 42 MB of `.rdata` instead of 20 MB, and no multi-frame-generation strings; the model names are the
+`xefg_model_franky*` set (lite 6conv/8conv). They are 2x-only builds without the i0 model. Two other files named libxess_fg.dll on the PC
+are OptiScaler's own wrapper builds, not Intel's; they are rejected cleanly.
