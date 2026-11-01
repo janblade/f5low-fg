@@ -1,7 +1,10 @@
-// translate.h - turns a shader module of the player's own libxess_fg.dll into a PTX kernel, at run time.
+// translate.h - turns the disassembly of a DXIL shader module into a PTX kernel. NOT part of f5low.dll: the DLL translates
+// nothing (the pack built on the player's PC runs Intel's modules natively). It is a build-time tool (tools/xlate_tool.cpp
+// translates OUR OWN HLSL templates for the recipe's own_tpl kernels) and the oracle of tests/translate_test.cpp, which
+// translates Intel's modules from a libxess_fg.dll to prove the pipeline against the offline reference.
 //
-// Pipeline (all of it ours): the decoded module container (intel_modules) -> the disassembly text of Microsoft's
-// dxcompiler.dll (dxc_disasm.h; the player's PC gets the DLL next to f5low.dll, it is never part of this repo)
+// Pipeline (all of it ours): a module container (intel_modules, or our own template compiled by dxc.exe) -> the disassembly
+// text of Microsoft's dxcompiler.dll (dxc_disasm.h; the test loads one, it is never part of this repo)
 // -> Dxil2Ptx -> PTX text. Two recipe transforms work on the way: the reconstruction edit rewrites the module's
 // U-Net input stores before translation, and ClampVariant re-binds the accumulator clamp of a translated kernel.
 //

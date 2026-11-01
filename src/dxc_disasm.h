@@ -1,8 +1,7 @@
 // dxc_disasm.h - the disassembly text of a DXIL container, from Microsoft's DirectX Shader Compiler.
 //
-// f5low.dll loads dxcompiler.dll (the redistributable package of microsoft/DirectXShaderCompiler, pinned version in
-// docs/PACKLESS.md) from its own folder at run time. It is never part of this repo: the release packaging fetches
-// it. Only IDxcUtils::CreateBlobFromPinned and IDxcCompiler::Disassemble are used, declared here by hand (the
+// Test code only (tests/translate_test.cpp): f5low.dll does not link this and loads no dxcompiler.dll. The test loads
+// the redistributable package's dxcompiler.dll (pinned version in docs/PACKLESS.md); it is never part of this repo. Only IDxcUtils::CreateBlobFromPinned and IDxcCompiler::Disassemble are used, declared here by hand (the
 // interface layouts are the stable COM ABI of dxcapi.h), so building f5low needs no DXC header.
 #pragma once
 

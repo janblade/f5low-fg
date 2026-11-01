@@ -5,7 +5,7 @@ pluggable frame generators:
 
 | generator | makes the frames | GPUs |
 |---|---|---|
-| own (XeFG Tensor) | our CUDA/D3D12 kernels; Intel's modules and weights taken from the player's `libxess_fg.dll` | NVIDIA |
+| own (XeFG Tensor) | our kernels (D3D12 command lists + NVAPI cubins); Intel's native modules, weights and root constants read from the player's `libxess_fg.dll` on first use (no translation, no `dxcompiler.dll`) | NVIDIA |
 | intel | Intel's `libxess_fg.dll` | any |
 | dlssg | NVIDIA DLSS-G through Streamline | NVIDIA |
 | fsr | AMD FidelityFX frame generation | any |
@@ -34,8 +34,11 @@ SHA-256 only. The audit in
 `recipe/i0/` is our half of the own generator's pack: `manifest.tmpl` (the manifest, generated file names as
 `@name`) and `parts.json` (how each file is made; the nested `hdr/` pack alike). `tools/kernels/` holds our
 generators and HLSL templates. Intel modules appear only as SHA-256 of the decoded module, weights as upload
-ordinal + size + SHA-256. `tools/recipe/build_pack.py` recombines the recipe with the Intel parts of a local
-`libxess_fg.dll` and a weight capture (offline, for now); `compare_pack.py` checks a built pack against a reference;
+ordinal + size + SHA-256. At run time `f5low.dll` rebuilds the pack from the player's `libxess_fg.dll` (decode, find
+modules by hash, weights and root constants from the file) and caches it in `f5low_cache\` next to the DLL; the
+pack-less pack runs on the D3D12 path only (`docs/PACKLESS.md`). `tools/recipe/build_pack.py` recombines the recipe with
+the Intel parts of a local `libxess_fg.dll` and a weight capture offline (a dev pack with PTX twins, both paths);
+`compare_pack.py` checks a built pack against a reference (`--packless` for the runtime one);
 `classify.py` derives a recipe from a finished pack (dev tool, needs the old libxess-weights checkout). Built packs
 are Intel-derived and stay out of the repo.
 

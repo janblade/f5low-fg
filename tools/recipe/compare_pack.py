@@ -1,6 +1,6 @@
 """Compares a built graph pack with a reference pack (a nested pack too).
 
-  python tools/recipe/compare_pack.py <built> <reference> [--ignore-ptx-header] [--legacy-names names.json]
+  python tools/recipe/compare_pack.py <built> <reference> [--ignore-ptx-header] [--legacy-names names.json] [--packless]
 
 Every file the reference's manifest names (kernels, natives, data) must exist in the built pack and be byte-identical,
 and the manifests must be the same text. Not compared: the per-frame inputs a game fills (tools/pack_embed.py
@@ -54,6 +54,9 @@ def main():
     ap.add_argument("ref")
     ap.add_argument("--ignore-ptx-header", action="store_true")
     ap.add_argument("--legacy-names")
+    ap.add_argument("--packless", action="store_true",
+                    help="built is a pack f5low.dll made on a PC (pack_build.cpp): the PTX files of 'native' lines are left out "
+                         "(only the D3D12 path runs it) and the d3d12_only marker is extra; every other file must match")
     a = ap.parse_args()
     legacy = R.load_json(a.legacy_names)["packs"] if a.legacy_names else None
     skip = {os.path.normpath(p).lower() for p in capture_files(a.ref)}
@@ -64,6 +67,14 @@ def main():
             bad.append(f"{sub}: no pack built")
             continue
         names = referenced(rd)
+        if a.packless:
+            # the first word after `native` is the PTX twin
+            twins = set()
+            for l in R.read_manifest(os.path.join(rd, "manifest.txt")):
+                w = l.split("#")[0].split()
+                if len(w) >= 3 and w[0] == "native":
+                    twins.add(os.path.normpath(w[1]))
+            names -= twins
         inv = {}
         if legacy:
             leg = legacy["." if sub == "." else sub]

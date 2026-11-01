@@ -1,6 +1,5 @@
 // xlate_tool - build-time helper of build.ps1: turns the disassembly of one of OUR OWN HLSL templates (dxc output)
-// into PTX with the same translator f5low.dll runs on the player's PC (src/translate.cpp). It never sees an Intel
-// module: Intel's modules are translated only on the player's PC, never at build time.
+// into PTX with src/translate.cpp. It never sees an Intel module, and f5low.dll does not contain the translator.
 //
 //   xlate_tool <disassembly file> <out.ptx> <name in the PTX header> [fmt ...]
 #include <cstdio>
