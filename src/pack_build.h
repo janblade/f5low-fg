@@ -42,6 +42,8 @@ public:
     // BuildPack has already read the libxess_fg file: a source that reads it too may use these bytes (valid for the
     // whole build) instead of reading it again.
     virtual void UseLibraryBytes(const std::vector<uint8_t>*) {}
+    // Locates everything the data needs in the library now (otherwise on the first Upload). False says why in Problem().
+    virtual bool PrepareData() { return true; }
     // The weight upload with this ordinal (recipe `ordinal`), its exact bytes before padding.
     virtual bool Upload(int ordinal, std::vector<uint8_t>& out) = 0;
     // The root constants of dispatch `index` (recipe `capture_index`): little-endian dwords as bytes.
@@ -95,14 +97,19 @@ struct Report {
 // Builds the pack into `out` (cleared first). False with `error` naming what is missing or does not match (a module the build
 // does not know, a weight with the wrong SHA-256, ...), `out` empty then.
 // `libBytes`: the libxess_fg file when the caller has read it already (used instead of reading it again).
+// `verdict` (optional) is called ONCE, early: true when this libxess_fg works (decoded, every module the recipe names found, the
+// weights and root constants located), false with the reason when it does not; the assembly follows. A failure after a true
+// verdict (a blob that does not match its SHA-256) is still possible but not expected.
+using VerdictFn = std::function<void(bool ok, const std::string& why)>;
 bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSource& data, Files& out, Report& rep,
-               std::string* error, const std::vector<uint8_t>* libBytes = nullptr);
+               std::string* error, const std::vector<uint8_t>* libBytes = nullptr, const VerdictFn& verdict = nullptr);
 
 struct Request {
     std::wstring libxessPath;
     const Bundle* own = nullptr;
     IntelDataSource* data = nullptr;
     std::function<void(const std::string&)> log;
+    VerdictFn verdict;      // see BuildPack
 };
 
 // Reads the player's libxess_fg.dll, builds the pack in memory (BuildPack) and lets go of the file's bytes. False: `error`
@@ -113,6 +120,8 @@ bool BuildInMemory(const Request& req, std::shared_ptr<const Files>& out, std::s
 // (a "f5low_cache" folder, any format, plus stale unfinished build folders of that naming) - ONLY folders that carry our
 // marker or have the old build-folder name; anything else in `root` (the cubin cache, a user's files) stays. Returns how
 // many went.
+// A folder that cannot be deleted at once (a file in it is open) is renamed to <name>.f5low-del first; any *.f5low-del folder is
+// removed on the next call.
 int RemoveLegacyCaches(const std::wstring& root, const std::function<void(const std::string&)>& log = nullptr);
 
 }  // namespace packbuild

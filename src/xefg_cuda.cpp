@@ -321,7 +321,85 @@ int g_packState = kPackIdle;                    // under g_packMu
 std::atomic<int> g_packStateA { kPackIdle };    // the same, for polling
 std::string g_packFail;                         // why it failed (under g_packMu)
 LARGE_INTEGER g_packT0 {}, g_packT1 {};         // started / finished (under g_packMu)
-constexpr DWORD kCreateWaitMs = 50;             // the longest D3D12CreateContext waits for the pack (hard cap)
+constexpr DWORD kCreateWaitMs = 300;            // the longest D3D12CreateContext waits for the VERDICT on the libxess_fg (hard cap)
+// The early verdict of the build (pack_build.h BuildPack): 0 pending, 1 this libxess_fg works, 2 it does not (g_verdictWhy). Under
+// g_packMu, mirrored for polling. Always set before the pack thread ends.
+int g_verdict = 0;
+std::string g_verdictWhy;
+
+void SetVerdict(bool ok, const std::string& why)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_packMu);
+        if (g_verdict != 0)
+            return;
+        g_verdict = ok ? 1 : 2;
+        g_verdictWhy = why;
+    }
+    g_packCv.notify_all();
+}
+
+// Our recipe and kernels (resource 102), parsed once; read-only afterwards. Null with `err` when this DLL carries none.
+const packbuild::Bundle* SharedBundle(std::string* err)
+{
+    static std::once_flag once;
+    static packbuild::Bundle bundle;
+    static std::string fail;
+    static bool ok = false;
+    std::call_once(once, [] {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&SharedBundle), &self);
+        HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(102), MAKEINTRESOURCEW(10));
+        const uint8_t* bytes = res ? static_cast<const uint8_t*>(LockResource(LoadResource(self, res))) : nullptr;
+        const size_t size = res ? SizeofResource(self, res) : 0;
+        std::string why;
+        ok = bytes && packbuild::ParseBundle(bytes, size, bundle, &why);
+        if (!ok)
+            fail = "own generator unavailable: no pack found and this DLL carries no recipe (" + (why.empty() ? std::string("no resource") : why) + ")";
+    });
+    if (!ok && err)
+        *err = fail;
+    return ok ? &bundle : nullptr;
+}
+
+// The oldest GPU (sm_NN) the built pack runs on, from OUR kernels alone (the native modules are DXBC, no PTX): the highest
+// ".target sm_NN" over the kernels, each at its fallback's target where the manifest names one (an RTX 20: sm_75). 0 when it cannot
+// be told. Needs no libxess_fg, so CreateContext can decide a too old GPU without waiting for the pack.
+int BundleNeedSm()
+{
+    const packbuild::Bundle* b = SharedBundle(nullptr);
+    if (!b)
+        return 0;
+    int need = 0;
+    for (const char* pre : { "i0/", "i0/hdr/" })
+    {
+        const auto m = b->find(std::string(pre) + "manifest.tmpl");
+        if (m == b->end())
+            continue;
+        const std::string t(m->second.begin(), m->second.end());
+        std::map<int, std::string> file;       // kernel -> the file that runs on the oldest GPU
+        for (size_t at = 0; at < t.size();)
+        {
+            size_t eol = t.find('\n', at);
+            if (eol == std::string::npos)
+                eol = t.size();
+            char op[16] = {}, name[256] = {};
+            int idx = 0;
+            if (sscanf_s(t.substr(at, eol - at).c_str(), "%15s %d @%255s", op, 16, &idx, name, 256) == 3 &&
+                (!strcmp(op, "kernel") || !strcmp(op, "fallback")))
+                file[idx] = name;       // a fallback line follows its kernel line
+            at = eol + 1;
+        }
+        for (const auto& kv : file)
+        {
+            const auto f = b->find(std::string(pre) + kv.second);
+            if (f != b->end())
+                need = std::max(need, xefgpack::Pack::PtxSm(f->second));
+        }
+    }
+    return need;
+}
 
 double MsSinceStart(const LARGE_INTEGER& t)
 {
@@ -331,24 +409,24 @@ double MsSinceStart(const LARGE_INTEGER& t)
 // Builds the pack from the player's libxess_fg.dll; on the pack thread only. Logs the one failure line.
 bool RunBuiltPack(std::shared_ptr<const packbuild::Files>& files, std::string& err)
 {
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&RunBuiltPack), &self);
-    HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(102), MAKEINTRESOURCEW(10));
-    const uint8_t* bytes = res ? static_cast<const uint8_t*>(LockResource(LoadResource(self, res))) : nullptr;
-    const size_t bytesSize = res ? SizeofResource(self, res) : 0;
-    packbuild::Bundle bundle;
     std::string why;
-    if (!bytes || !packbuild::ParseBundle(bytes, bytesSize, bundle, &why))
+    const packbuild::Bundle* shared = SharedBundle(&why);
+    if (!shared)
     {
-        err = "own generator unavailable: no pack found and this DLL carries no recipe (" + (why.empty() ? std::string("no resource") : why) + ")";
+        err = why;
         Log("%s", err.c_str());
         return false;
     }
+    const packbuild::Bundle& bundle = *shared;
     const char* from = "";
     packbuild::Request req;
     req.libxessPath = RealLibraryPath(&from);
     req.own = &bundle;
+    req.verdict = [](bool ok, const std::string& w) {
+        SetVerdict(ok, ok ? std::string() : "own generator unavailable: " + w);
+        if (!ok)
+            Log("verdict: this libxess_fg.dll cannot be used: %s", w.c_str());
+    };
     wchar_t w[MAX_PATH] = {}, c[MAX_PATH] = {};
     // Weights and root constants: rebuilt from the player's libxess_fg.dll file (IntelFileSource). Development overrides only:
     // F5LOW_DEV_CAP (a PSO capture) replaces the derived root constants, and F5LOW_DEV_WEIGHTS (a weight dump folder, with
@@ -418,6 +496,7 @@ DWORD WINAPI PackBuildThread(void* mod)
         std::shared_ptr<const packbuild::Files> files;
         std::string err;
         const bool ok = RunBuiltPack(files, err);
+        SetVerdict(ok, err);        // a no-op when the build gave its verdict already
         if (ok)
             xefgpack::SetBuiltFiles(std::const_pointer_cast<const xefgpack::PackFiles>(files));
         files.reset();      // the loader's copy (BuiltFiles) is the one that stays
@@ -480,6 +559,16 @@ int PackPoll(std::string* why)
     return s == kPackReady ? 1 : s == kPackFailed ? 2 : 0;
 }
 
+// Waits for the build's verdict on the libxess_fg for at most `ms`; returns 0 pending, 1 works, 2 does not (`why` the reason).
+int VerdictWait(DWORD ms, std::string* why)
+{
+    std::unique_lock<std::mutex> l(g_packMu);
+    g_packCv.wait_for(l, std::chrono::milliseconds(ms), [] { return g_verdict != 0; });
+    if (g_verdict == 2 && why)
+        *why = g_verdictWhy;
+    return g_verdict;
+}
+
 // Waits for the build for at most `ms`; returns the state then.
 int PackWait(DWORD ms)
 {
@@ -535,6 +624,9 @@ PackRoute ResolvePack()
 // vendor's GPU). Never throws: it runs inside a C API entry point.
 int GpuSm(ID3D12Device* d)
 {
+    // F5LOW_TEST_GPU_SM=NN: pretends another GPU (tests only)
+    if (char t[16]; GetEnvironmentVariableA("F5LOW_TEST_GPU_SM", t, sizeof t))
+        return atoi(t);
     try
     {
         xefgpack::Cuda cu;
@@ -1089,40 +1181,50 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         fwdReason = "forwarding to Intel XeFG: XEFG_CUDA_FORWARD is set";
     else if (route.built() && d && ph)
     {
-        // The pack is built in memory on a thread of its own (started by the first API call, else here). The GPU check that
-        // needs no pack runs first, on this thread, meanwhile; then at most kCreateWaitMs for the pack, never longer.
+        // The pack is built in memory on a thread of its own (started by the first API call, else here). Two things are decided
+        // here, neither needing the finished pack:
+        //  - the GPU: no CUDA device behind the adapter, or older than our own kernels need (BundleNeedSm, from the DLL's own
+        //    PTX) -> Intel's library at once;
+        //  - the libxess_fg: the build's early VERDICT (decoded, every module found, the weights located: ~60-90 ms into the
+        //    build), waited for at most kCreateWaitMs counted from the start of this call. A no -> Intel's library.
+        // Only a verdict that has not come by then leaves us making our own context (the frames pass through until the pack is
+        // ready; a failure after that ends in status 3, the context being ours).
         StartPackBuild();
         have = GpuSm(d);
-        // the cap counts from the start of this call (the GPU check above has used part of it)
-        const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - callStart).count();
-        const int st = PackWait(used >= kCreateWaitMs ? 0 : static_cast<DWORD>(kCreateWaitMs - used));
+        need = BundleNeedSm();
         std::string misfit;
-        if (st == kPackFailed)
+        std::string vwhy;
+        int verdict = 0;
+        if (!have || (need && have < need))
         {
-            std::string why;
-            PackPoll(&why);
-            fwdReason = (why.empty() ? std::string("own generator unavailable: no pack") : why) + " - forwarding to Intel XeFG";
-            pack.clear();
-        }
-        else if (!have)
-        {
-            fwdReason = "forwarding to Intel XeFG: " + FitReason(have, 0);
-            Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", FitReason(have, 0).c_str());
-            pack.clear();
-        }
-        else if (st == kPackReady && !(misfit = FitReason(have, need = PackNeedSm(pack))).empty())
-        {
+            misfit = FitReason(have, need);
             fwdReason = "forwarding to Intel XeFG: " + misfit;
             Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", misfit.c_str());
             pack.clear();
         }
         else
         {
-            // Own from here: a pack still being made does not hold the call (the frames pass through until it is ready; a
-            // failure then ends in status 3, since the context is ours already). The first Build is deferred either way.
-            deferred = true;
-            if (st != kPackReady)
-                Log("D3D12CreateContext: the pack is still being built after %lu ms - the frames pass through until it is ready", kCreateWaitMs);
+            // the cap counts from the start of this call (the GPU check above has used part of it)
+            const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - callStart).count();
+            verdict = VerdictWait(used >= kCreateWaitMs ? 0 : static_cast<DWORD>(kCreateWaitMs - used), &vwhy);
+            const int st = g_packStateA.load(std::memory_order_acquire);
+            if (verdict == 2)
+            {
+                fwdReason = (vwhy.empty() ? std::string("own generator unavailable: no pack") : vwhy) + " - forwarding to Intel XeFG";
+                pack.clear();
+            }
+            else if (st == kPackReady && !(misfit = FitReason(have, need = PackNeedSm(pack))).empty())
+            {
+                fwdReason = "forwarding to Intel XeFG: " + misfit;
+                Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", misfit.c_str());
+                pack.clear();
+            }
+            else
+            {
+                deferred = true;
+                if (verdict == 0)
+                    Log("D3D12CreateContext: no verdict on the libxess_fg.dll after %lu ms - making our own context, the frames pass through until the pack is ready", kCreateWaitMs);
+            }
         }
     }
     else if (!pack.empty() && d && ph)
@@ -1173,7 +1275,9 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->gs.prof = prof != "0";
         o->gs.profDispatches = prof == "2";
         // Native= (XEFG_CUDA_NATIVE): 0 runs the pack's native modules (the reconstruction) as PTX on D3D12 too.
-        o->gs.native = Setting("XEFG_CUDA_NATIVE", "Native", "1") != "0";
+        // (the pack built on this PC runs Intel's native modules whatever Native= says: set here so the generator, which would
+        // otherwise write it on the build thread, never has to)
+        o->gs.native = route.built() || Setting("XEFG_CUDA_NATIVE", "Native", "1") != "0";
         *ph = reinterpret_cast<xefg_swapchain_handle_t>(o.get());
         {
             std::lock_guard<std::mutex> lk(g_ownLock);
@@ -1188,6 +1292,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 const std::string from = src;
                 o->packPoll = &PackPoll;
                 o->packFit = [have] { return FitReason(have, PackNeedSm(xefgpack::kBuiltDir)); };
+                o->onAbandoned = [serial] { SetStatusIf(serial, 0, "no context (destroyed before its generator was ready)"); };
                 o->deferredDone = [serial, from](bool ok, const std::string& why) {
                     if (ok)
                         Log("deferred first build: ready, generation can start");

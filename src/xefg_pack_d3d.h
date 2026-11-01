@@ -82,6 +82,9 @@ public:
     // by file name: two packs (SDR / HDR) may name different kernels alike. The PTX does not depend on the pack's size, so
     // a rebuild for another size needs no CUDA when every kernel is in here.
     std::map<std::string, std::vector<uint8_t>>* cubins = nullptr;
+    // Asked before each kernel (and cubin compile): true stops the build (Fail "cancelled"), so a context destroyed during its
+    // first build waits for one step, not the whole compile.
+    std::function<bool()> cancel;
     // Called before the first kernel that is not in `cubins` is compiled: the caller makes a CUDA context current (it
     // may have released its own after the first build). False: no CUDA, the build fails.
     std::function<bool()> needCuda;
@@ -924,6 +927,8 @@ private:
         natives.assign(pack.kernels.size(), {});
         for (size_t ki = 0; ki < pack.kernels.size(); ++ki)
         {
+            if (cancel && cancel())
+                return Fail("cancelled");
             const Kernel& k = pack.kernels[ki];
             if (auto it = native.find(k.file); it != native.end())
             {

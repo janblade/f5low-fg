@@ -51,6 +51,7 @@ public:
     // Reads the file and finds the weight blobs and the vector runs now (otherwise on the first Upload). False says why in
     // Problem(). Idempotent.
     bool Prepare();
+    bool PrepareData() override { return Prepare(); }
 
     struct Stats {
         double readMs = 0;     // file read

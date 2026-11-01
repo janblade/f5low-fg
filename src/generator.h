@@ -98,6 +98,7 @@ struct GenBuild
     uint32_t initFlags = 0;                         // XEFG_SWAPCHAIN_INIT_FLAG_*: pick the pack's module variants
     bool hdr = false;                               // the swap chain is R10G10B10A2 (HDR10)
     std::function<void()> releaseHostBuffers;       // the old pack is gone: the host lets go of what was sized by it
+    std::function<bool()> cancelled;                // true: the context is going away - stop at the next step (a build thread)
     std::function<bool()> packBuilt;                // the new pack is built: the host makes its staging; false fails the build
 };
 

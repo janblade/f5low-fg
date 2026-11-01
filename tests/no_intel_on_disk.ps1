@@ -27,6 +27,9 @@ if (Test-Path $Work) { Remove-Item $Work -Recurse -Force }
 New-Item -ItemType Directory -Force $Work | Out-Null
 $Work = (Resolve-Path $Work).Path
 $fail = 0
+$locks = @()
+# The pack_samples outputs hold Intel-derived hashes and bytes: deleted at the end, also when a check throws or fails.
+try {
 
 function Run-Repro([string]$dir, [string]$localAppData) {
     New-Item -ItemType Directory -Force $dir, $localAppData | Out-Null
@@ -102,6 +105,17 @@ foreach ($rt in $rootsB) {
     Set-Content -Path (Join-Path $rt 'cubins\x.cubin') -Value 'no marker, not a pack' -Encoding ascii
     Set-Content -Path (Join-Path $rt 'readme.txt') -Value 'a loose file' -Encoding ascii
 }
+# folders with a file held open: one that allows deleting while open (FileShare.Delete) and one that does not (FileShare.None)
+$locks = @()
+$lockedDirs = @()
+$shareDel = [System.IO.FileShare]([int][System.IO.FileShare]::ReadWrite -bor [int][System.IO.FileShare]::Delete)
+foreach ($spec in @(@('e', $shareDel), @('f', [System.IO.FileShare]::None))) {
+    $ld = Join-Path $rootsB[0] (($spec[0] * 30) + '00')
+    New-Item -ItemType Directory -Force (Join-Path $ld 'data') | Out-Null
+    Set-Content -Path (Join-Path $ld 'complete') -Value "f5low pack cache 3`nfiles 1`n10`tdata/R1.bin`n" -Encoding ascii
+    $locks += [System.IO.File]::Open((Join-Path $ld 'data\R1.bin'), [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, $spec[1])
+    $lockedDirs += $ld
+}
 $r2 = Run-Repro $b $bLocal
 Write-Host "run B: exit $($r2.Code)"
 Start-Sleep -Milliseconds 500
@@ -112,7 +126,23 @@ if ($left.Count) { Write-Host "FAIL: not removed: $($left -join ', ')"; $fail++ 
 $kept = 0
 foreach ($rt in $rootsB) { foreach ($k in 'not_ours\keep.txt', 'cubins\x.cubin', 'readme.txt') { if (Test-Path (Join-Path $rt $k)) { $kept++ } else { Write-Host "FAIL: $rt\$k was deleted"; $fail++ } } }
 Write-Host "things that are not ours and were kept: $kept of 6"
+# the locked ones after run 1: gone, renamed to .f5low-del, or (a lock that blocks the rename) emptied but for the held file
+foreach ($ld in $lockedDirs) {
+    $state = if (-not (Test-Path $ld) -and -not (Test-Path "$ld.f5low-del")) { 'gone' } elseif (Test-Path "$ld.f5low-del") { 'renamed to .f5low-del' } else { 'still there under its name (marker kept: ' + (Test-Path (Join-Path $ld 'complete')) + ')' }
+    Write-Host "locked $(Split-Path -Leaf $ld) after run 1: $state"
+}
+foreach ($l in $locks) { $l.Dispose() }
+$r3 = Run-Repro $b $bLocal
+Write-Host "run B2 (locks released): exit $($r3.Code)"
+Start-Sleep -Milliseconds 500
+foreach ($ld in $lockedDirs) { if ((Test-Path $ld) -or (Test-Path "$ld.f5low-del")) { Write-Host "FAIL: $ld survived the second run"; $fail++ } }
+$dels = @(Get-ChildItem $rootsB -Directory -Filter '*.f5low-del' -ErrorAction SilentlyContinue)
+if ($dels.Count) { Write-Host "FAIL: leftover .f5low-del folders: $($dels.Name -join ', ')"; $fail++ } else { Write-Host 'no .f5low-del folder left; locked folders removed after the release' }
 Select-String -Path (Join-Path $b 'f5low.log') -Pattern 'removed the old on-disk' | ForEach-Object { '  ' + $_.Line.Substring(0, [Math]::Min(170, $_.Line.Length)) }
 
 if ($fail) { Write-Host "no_intel_on_disk: FAIL ($fail)"; exit 1 }
 Write-Host 'no_intel_on_disk: PASS'
+} finally {
+    foreach ($l in $locks) { try { $l.Dispose() } catch {} }
+    Remove-Item (Join-Path $Work 'samples*.txt'), (Join-Path $Work 'planted') -Recurse -Force -ErrorAction SilentlyContinue
+}

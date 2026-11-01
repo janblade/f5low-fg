@@ -77,9 +77,13 @@ public:
         noPatch = GetEnvironmentVariableA("XEFG_CUDA_NOPATCH", env, sizeof(env)) != 0;
         if (GetEnvironmentVariableA("XEFG_CUDA_PROF", env, sizeof(env)) && env[0] == '0')
             cfg.prof = false;
+        if (gb.cancelled && gb.cancelled())
+            return Fail("cancelled");
         if (!io.Init(dev))
             return Fail("interop: " + io.error);
         io.cu.CtxPopCurrent(nullptr);         // Init left the context current on this thread
+        if (gb.cancelled && gb.cancelled())
+            return Fail("cancelled");
         // A pack built on this PC from libxess_fg.dll (pack-less) holds Intel's native modules only: it runs on the D3D12 path.
         d3dOnly = IsD3dOnlyPack(packDir);
         if (d3dOnly && !d3dPath)
@@ -815,6 +819,7 @@ private:
         {
             dpack = std::make_unique<D3DPack>(*pack, io.cu, nv);
             dpack->cubins = &cubins;
+            dpack->cancel = gb.cancelled;
             // a kernel not compiled yet (a variant a resize brings in) needs CUDA again for a moment, after the first build
             // released it; the cache is keyed by the PTX content, so only the compile decides
             dpack->needCuda = [&]() {
@@ -830,6 +835,7 @@ private:
             };
             dpack->packNatives = cfg.native;
             const bool built3d = dpack->Build(dev, setupQueue, false);
+            dpack->cancel = nullptr;           // it refers to the caller's state
             dpack->needCuda = nullptr;          // it refers to this call's locals
             if (tempCuda)
             {

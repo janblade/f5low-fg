@@ -304,6 +304,15 @@ int main(int argc, char** argv)
         printf("f5lowGetStatus %s: %d \"%s\"\n", when, st, reason);
         return st;
     };
+    // REPRO_PRE_VERSION=ms: the first API call (GetVersion, as OptiScaler makes it) and then that long a pause before CreateContext:
+    // the DLL's background build has its verdict by then (CreateContext takes next to nothing)
+    if (EnvInt("REPRO_PRE_VERSION", -1) >= 0)
+    {
+        LOADFN(dll, xefgSwapChainGetVersion);
+        xefg_swapchain_version_t ver {};
+        printf("GetVersion: %d\n", xefgSwapChainGetVersion ? xefgSwapChainGetVersion(&ver) : -1);
+        Sleep(static_cast<DWORD>(EnvInt("REPRO_PRE_VERSION", 0)));
+    }
     const int stBefore = printStatus("before CreateContext");
     xefg_swapchain_handle_t h = nullptr;
     LARGE_INTEGER qf, qa, qb;
@@ -359,15 +368,25 @@ int main(int argc, char** argv)
 
     // REPRO_INITFLAGS=n: other init flags (0 = depth not inverted: the pack's other flag-set modules run)
     const uint32_t initFlags = static_cast<uint32_t>(EnvInt("REPRO_INITFLAGS", XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH)); // the game's 0x1
+    // REPRO_OS_ORDER=1: OptiScaler's real order - CreateContext, SetLatencyReduction, InitFromSwapChainDesc, no BuildPipelines
+    // (the first build is the DLL's, started by InitFromSwapChainDesc), frames at once; the run does not wait for the generator
+    const bool osOrder = EnvInt("REPRO_OS_ORDER", 0) == 1;
+    if (osOrder)
+        printf("SetLatencyReduction (OptiScaler order): %d\n", xefgSwapChainSetLatencyReduction(h, xell));
     QueryPerformanceCounter(&qa);
-    printf("BuildPipelines: %d (took %.1f ms on this thread)\n", xefgSwapChainD3D12BuildPipelines(h, nullptr, 1, initFlags),
+    printf("BuildPipelines: %d (took %.1f ms on this thread)\n", osOrder ? -999 : xefgSwapChainD3D12BuildPipelines(h, nullptr, 1, initFlags),
            [&] { QueryPerformanceCounter(&qb); return 1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart); }());
     // REPRO_DESTROY_EARLY=1: the context is destroyed while the DLL is still building (the pack, then the first build), a second
     // one is made and must come up (status 1): destroying a context during the background build is clean
     if (EnvInt("REPRO_DESTROY_EARLY", 0) == 1)
     {
         Sleep(static_cast<DWORD>(EnvInt("REPRO_DESTROY_DELAY", 0)));       // REPRO_DESTROY_DELAY=ms: into the first build too
-        printf("destroy while building (after %d ms): %d\n", EnvInt("REPRO_DESTROY_DELAY", 0), xefgSwapChainDestroy(h));
+        LARGE_INTEGER d0, d1;
+        QueryPerformanceCounter(&d0);
+        const int drc = xefgSwapChainDestroy(h);
+        QueryPerformanceCounter(&d1);
+        printf("destroy while building (after %d ms): %d, Destroy took %.1f ms\n", EnvInt("REPRO_DESTROY_DELAY", 0), drc,
+               1000.0 * static_cast<double>(d1.QuadPart - d0.QuadPart) / static_cast<double>(qf.QuadPart));
         h = nullptr;
         printf("second CreateContext: %d\n", xefgSwapChainD3D12CreateContext(g_dev, &h));
         printf("second BuildPipelines: %d\n", xefgSwapChainD3D12BuildPipelines(h, nullptr, 1, initFlags));
@@ -389,7 +408,7 @@ int main(int argc, char** argv)
         int st = getStatus ? getStatus(reason, static_cast<int>(sizeof(reason))) : -1;
         printf("f5lowGetStatus after BuildPipelines: %d \"%s\"\n", st, reason);
         QueryPerformanceCounter(&qa);
-        while (st == 0 && EnvInt("REPRO_WAIT_READY", 1) == 1)
+        while (st == 0 && EnvInt("REPRO_WAIT_READY", osOrder ? 0 : 1) == 1)
         {
             QueryPerformanceCounter(&qb);
             if ((qb.QuadPart - qa.QuadPart) / qf.QuadPart > 30)
@@ -400,7 +419,7 @@ int main(int argc, char** argv)
         QueryPerformanceCounter(&qb);
         printf("f5lowGetStatus ready: %d \"%s\" (waited %.0f ms after BuildPipelines)\n", st, reason,
                1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart));
-        if (st == 0 && EnvInt("REPRO_WAIT_READY", 1) == 1)
+        if (st == 0 && EnvInt("REPRO_WAIT_READY", osOrder ? 0 : 1) == 1)
         {
             printf("f5lowGetStatus check FAILED: the own generator did not become ready\n");
             return 1;
@@ -603,6 +622,33 @@ int main(int argc, char** argv)
             const HRESULT rr = sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, sd.Flags);
             printf("frame %d: ResizeBuffers 0x%08lx, %.2f ms\n", frame, static_cast<unsigned long>(rr), ms(r0));
         }
+        // REPRO_RECREATE_AT=n: a swap chain recreate at frame n (destroy the context, make a new one the way a game's resolution or
+        // mode change does), while the first build may still be running
+        if (EnvInt("REPRO_RECREATE_AT", -1) == frame)
+        {
+            Idle();
+            LARGE_INTEGER c0, c1;
+            QueryPerformanceCounter(&c0);
+            sc->Release();
+            const int drc = xefgSwapChainDestroy(h);
+            QueryPerformanceCounter(&c1);
+            h = nullptr;
+            const int crc = xefgSwapChainD3D12CreateContext(g_dev, &h);
+            xefgSwapChainSetLatencyReduction(h, xell);
+            const int irc = xefgSwapChainD3D12InitFromSwapChainDesc(h, wnd, &sd, nullptr, g_q, fac, &ip);
+            sc = nullptr;
+            if (irc != 0 || xefgSwapChainD3D12GetSwapChainPtr(h, IID_PPV_ARGS(&sc)) != 0 || !sc)
+            {
+                printf("frame %d: recreate FAILED (%d %d)\n", frame, crc, irc);
+                return 1;
+            }
+            wait = sc->GetFrameLatencyWaitableObject();
+            xefgSwapChainSetEnabled(h, 1);
+            xefgSwapChainSetNumInterpolatedFrames(h, maxInterp);
+            printf("frame %d: swap chain recreated (Destroy %.1f ms)\n", frame,
+                   1000.0 * static_cast<double>(c1.QuadPart - c0.QuadPart) / static_cast<double>(qf.QuadPart));
+            (void)drc;
+        }
         if (!noIdle)
             Idle();
         const HRESULT removed = g_dev->GetDeviceRemovedReason();
@@ -641,6 +687,11 @@ int main(int argc, char** argv)
         }
     }
     printf("%d frames off, %d on: %s\n", framesOff, framesOn, failures ? "FAILED" : "no Present failure, device alive");
+    {
+        char reason[256] = {};
+        const int st = getStatus ? getStatus(reason, static_cast<int>(sizeof(reason))) : -1;
+        printf("f5lowGetStatus at the end: %d \"%s\"\n", st, reason);
+    }
 
     xefgSwapChainSetEnabled(h, 0);
     sc->Release();

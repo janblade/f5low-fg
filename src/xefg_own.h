@@ -624,19 +624,55 @@ public:
     std::function<std::string()> packFit;
     // The deferred build is over (ok: generation can start; else why not): the DLL's status.
     std::function<void(bool ok, const std::string& why)> deferredDone;
+    // The context was destroyed before its deferred build made it ready: the DLL takes back the status it announced (0, building).
+    std::function<void()> onAbandoned;
 
     // Under mu, from the first EnsureBuilt (before the presenter exists: SetQueue comes before Wrap). The build runs on a thread
     // of its own and publishes with `built`: until then no thread but that one touches the generator (the presenter skips its
     // GenScope while deferBusy, the application's threads leave everything of the pack alone while !built).
+    // Everything the thread reads that the application's threads can write (initFlags, the UI mode, the composition flag, the
+    // swap chain's format, the dump settings) is copied here, under mu, before it starts. The settings the generator reads
+    // (GenSettings gs: path, native, prof) are fixed before the context is returned; for the built pack CreateContext makes them
+    // what its pack needs (D3D12 path, native modules), so the generator never has to write them.
+    // The thread has a reference on the DLL of its own (FreeLibraryAndExitThread), like the pack thread.
     void StartDeferredBuild()
     {
         if (deferStarted)
             return;
         deferStarted = true;
         deferBusy = true;
+        ReadDumpEnv();
         GenBuild args = BuildArgs();        // initFlags and the swap chain's format as a build right here would have had them
         args.releaseHostBuffers = nullptr;  // the first build has nothing to release (the presenter's state is not touched)
-        deferThread = std::thread([this, args] { DeferredBuild(args); });
+        const BuildSnap snap { initFlags, static_cast<int>(initParams.uiMode), uiComposition.load() };
+        args.packBuilt = [this, snap] { return PackBuilt(&snap); };
+        args.cancelled = [this] { return deferQuit.load(); };
+        HMODULE self = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&Own::DeferredEntry), &self))
+            self = nullptr;
+        auto* ctx = new DeferCtx { this, args, self };
+        deferThread = CreateThread(nullptr, 0, &Own::DeferredEntry, ctx, 0, nullptr);
+        if (!deferThread)
+        {
+            if (self)
+                FreeLibrary(self);
+            delete ctx;
+            deferBusy = false;
+            failed = true;
+            XLog("deferred first build: the thread could not be started");
+        }
+    }
+
+    struct DeferCtx { Own* o; GenBuild args; HMODULE self; };
+    static DWORD WINAPI DeferredEntry(void* p)
+    {
+        std::unique_ptr<DeferCtx> c(static_cast<DeferCtx*>(p));
+        HMODULE self = c->self;
+        c->o->DeferredBuild(c->args);
+        c.reset();
+        if (self)
+            FreeLibraryAndExitThread(self, 0);
+        return 0;
     }
 
     void DeferredBuild(const GenBuild& args)
@@ -656,25 +692,40 @@ public:
             if (!misfit.empty())
                 why = misfit;
             else if (!(ok = Build(&args)))
-                why = "the pack did not build for D3D12 (see the log)";
+                why = deferQuit ? "context destroyed" : "the pack did not build for D3D12 (see the log)";
         }
+        // A window between the two stores: built is true while deferBusy still is, so an application thread may tag (copies into
+        // the staging buffers, under mu) and the presenter may pick the frame up usable, before this thread has left. That is
+        // harmless: from here this thread touches no generator state, only the flag and the callback.
         {
             std::lock_guard<std::mutex> lk(mu);
             failed = !ok;
-            built = ok;
+            built = ok && !deferQuit;
+            deferReady = ok && !deferQuit;
         }
         deferBusy = false;
         if (!deferQuit && deferredDone)
             deferredDone(ok, why);
+        deferFinished = true;
     }
 
-    // Before the generator goes: waits for a running deferred build (a build already compiling cannot be cancelled; one that waits
-    // for the pack stops at once).
+    // Before the generator goes: stops a running deferred build at its next step (the CUDA init, one kernel's compile, one pipeline)
+    // and waits for it - a context destroyed in its first second waits for one step, not the whole compile. A build that waits for
+    // the pack stops at once.
     void StopDeferred()
     {
         deferQuit = true;
-        if (deferThread.joinable())
-            deferThread.join();
+        if (deferThread)
+        {
+            WaitForSingleObject(deferThread, INFINITE);
+            CloseHandle(deferThread);
+            deferThread = nullptr;
+        }
+        if (deferStarted && !deferReady && onAbandoned)
+        {
+            onAbandoned();
+            onAbandoned = nullptr;
+        }
     }
 
     // The queue the real swap chain presents on, for InitFromSwapChainDesc: our own, high priority, so
@@ -3276,11 +3327,18 @@ private:
         b.initFlags = initFlags;
         b.hdr = IsHdr10(scDesc.Format);
         b.releaseHostBuffers = [this] { ReleaseForBuild(); };
-        b.packBuilt = [this] { return PackBuilt(); };
+        b.packBuilt = [this] { return PackBuilt(nullptr); };
         return b;
     }
 
     bool Build(const GenBuild* given = nullptr)
+    {
+        if (!given)
+            ReadDumpEnv();      // a deferred build read them before its thread started (StartDeferredBuild)
+        return generator->Build(given ? *given : BuildArgs());
+    }
+
+    void ReadDumpEnv()
     {
         char env[MAX_PATH];
         if (GetEnvironmentVariableA("XEFG_CUDA_DUMP", env, sizeof(env)))
@@ -3289,7 +3347,6 @@ private:
             dumpFrame = atoi(env);
         if (GetEnvironmentVariableA("XEFG_CUDA_DUMP_SHOWN", env, sizeof(env)))
             shownPath = env;
-        return generator->Build(given ? *given : BuildArgs());
     }
 
     // The old pack is gone: what was sized by it goes too (the generator's Build / Rebuild call this).
@@ -3312,7 +3369,10 @@ private:
     }
 
     // The new pack is built: the staging sets the application's tags land in, sized by its buffers.
-    bool PackBuilt()
+    // `snap`: the settings a deferred build took under mu when it started (the application's threads may change the live ones
+    // meanwhile); null for a build on the caller's own thread.
+    struct BuildSnap { uint32_t initFlags; int uiMode; bool uiComposition; };
+    bool PackBuilt(const BuildSnap* snap)
     {
         for (int s = 0; s < 2; ++s)
         {
@@ -3325,7 +3385,8 @@ private:
         const Sizes& z = pg->PackSize();
         XLog("built: pack %s%s, %zu dispatches, output %ux%u, render %ux%u (%s), flags 0x%x, UI mode %d composition %d%s, variant "
              "modules:%s", packDir.c_str(), pg->PackHdr() ? "\\hdr" : "", pg->DispatchCount(), z.OW, z.OH, z.RW, z.RH,
-             D3d() ? "D3D12" : "CUDA", initFlags, static_cast<int>(initParams.uiMode), uiComposition.load() ? 1 : 0,
+             D3d() ? "D3D12" : "CUDA", snap ? snap->initFlags : initFlags, snap ? snap->uiMode : static_cast<int>(initParams.uiMode),
+             (snap ? snap->uiComposition : uiComposition.load()) ? 1 : 0,
              !pg->HasUiInputs() ? " (pack without UI inputs)" : "", mods.empty() ? " none" : mods.c_str());
         return true;
     }
@@ -4031,7 +4092,9 @@ private:
     bool deferStarted = false;      // under mu: StartDeferredBuild ran
     std::atomic<bool> deferBusy { false };      // the deferred first build is pending or running (the presenter leaves the generator alone)
     std::atomic<bool> deferQuit { false };
-    std::thread deferThread;
+    HANDLE deferThread = nullptr;
+    std::atomic<bool> deferFinished { false };
+    std::atomic<bool> deferReady { false };     // the deferred build ended well and the context was not destroyed
 
     // Pacing and stats. interval is written by the application's thread, read by the presenter.
     int slowCalls = 0;

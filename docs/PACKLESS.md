@@ -45,8 +45,9 @@ PC runs on the D3D12 path only.
    file, the decoded modules, the weights being re-tiled).
    `kFormatVersion` (`pack_build.h`, logged with the pack) is the builder's pack layout: raise it on ANY change to the builder,
    `ResolveManifest`, the pack layout or the set of files. 4 = built in memory. Formats 2 and 3 kept the pack in
-   `<DLL dir>\f5low_cache\<key>\` (or `%LOCALAPPDATA%\f5low\f5low_cache\<key>\`) as plain files; `RemoveLegacyCaches` deletes
-   every such folder in both roots after the pack is ready (a folder with our `complete` marker of any format, or an unfinished
+   `<DLL dir>\f5low_cache\<key>\` (or `%LOCALAPPDATA%\f5low\f5low_cache\<key>\`) as plain files; `RemoveLegacyCaches` renames each such folder to `<name>.f5low-del` and deletes it (a `*.f5low-del` folder left by a
+   delete that failed, a file in use, is retried at every start; if the rename fails, everything but the marker goes first and
+   the marker stays while anything is left); it deletes every such folder in both roots after the pack is ready (a folder with our `complete` marker of any format, or an unfinished
    build folder named `<32 hex>.tmp<pid>_<tick>` untouched for an hour); anything without our marker (a user's folder, a loose
    file) is never touched, and a deletion that fails is ignored (the log says so).
 5. **Run.** A pack with the `d3d12_only` marker runs on the D3D12 path whatever `Path=` says (the context is made for the D3D12
@@ -59,39 +60,56 @@ PC runs on the D3D12 path only.
 
 ### Threads and states (the background build)
 
-Nothing of this runs on the game's thread except two quick calls, and nothing waits for the pack but `D3D12CreateContext`, for
-at most 50 ms in all (measured from the start of the call, the GPU check included).
+Nothing of this runs on the game's thread except two quick calls, and nothing waits for the build but `D3D12CreateContext`, for
+at most 300 ms in all (measured from the start of the call, the GPU check included), and only for the build's early verdict.
 
 - **Pack thread** (one per process, `PackBuildThread` in `xefg_cuda.cpp`): started by the first API call that finds no explicit
   pack (`xefgSwapChainGetVersion`, else `D3D12CreateContext`), never from `DllMain`. It holds a reference on the DLL
   (`FreeLibraryAndExitThread`), so an unload cannot run under it. States `Idle -> Building -> Ready | Failed`
-  (`g_packState` under `g_packMu`, mirrored in an atomic for polling). It builds the pack, publishes the file map, flips the
-  state, wakes `CreateContext`'s wait, then removes the old on-disk caches.
-- **`D3D12CreateContext`**: starts the build if nobody did, runs the GPU check that needs no pack (`GpuSm`: CUDA device behind the
-  adapter, ~25 ms) while the pack thread works, then waits for the pack for the rest of the 50 ms. `Failed`: the existing
-  forwarding logic (status 2 with the reason, or 3 without a `libxess_fg.dll`). `Ready`: the pack's `NeedSm` against the GPU,
-  forwarding when it does not fit. Not finished after the 50 ms: the context is ours (a short wait cannot decide the forwarding
-  of a pack that is not there yet) and its first build is deferred. A failure after that point cannot go back to Intel's
-  library, the context being ours: the frames pass through and the status is 3. That is the price of not blocking; the
-  failures that are cheap to find (no `libxess_fg.dll`, an unsupported build without the zstd dictionaries, ...) are found in
-  the first few ms, long before the 50 ms are up.
+  (`g_packState` under `g_packMu`, mirrored in an atomic for polling). It publishes an early **verdict**, builds the pack,
+  publishes the file map, flips the state, wakes the waiters, then removes the old on-disk caches.
+- **The verdict** (`BuildPack`'s `verdict` callback, `g_verdict`): "this libxess_fg works" (decoded, every module the recipe names
+  found by hash, the weights and root constants located) or "does not, and why". It comes ~60-100 ms into the build, before
+  the assembly. It is also set (as a failure) when the build fails any earlier or later way, so it always arrives.
+- **`D3D12CreateContext`** decides without the finished pack:
+  - the GPU: no CUDA device behind the adapter, or older than our own kernels need (`BundleNeedSm`: the highest `.target` of the
+    kernels in the DLL's own recipe, each at its fallback's target; sm_75) -> Intel's library at once, no waiting;
+  - the libxess_fg: it waits for the verdict (cap 300 ms from the start of the call; the pack thread usually started earlier, at
+    `GetVersion`). A "no" (an unknown or new build, a damaged file, no file) -> Intel's library (status 2, the reason); the
+    existing logic. A "yes", or no verdict yet at the cap: the context is ours and its first build is deferred. Only the
+    cap expiring without a verdict leaves the late-failure case: the context being ours, a failure after that point cannot go back
+    to Intel's library, the frames pass through and the status is 3.
 - **First build** (every context made for the built pack, `Own::StartDeferredBuild`): the CUDA context, the kernels' compile (the
   CUDA driver's own PTX->cubin cache makes this ~0.4 s; ~3 s with `CUDA_CACHE_DISABLE=1`), the pipelines and buffers run on
-  a thread of the context (`deferThread`), started by the first `EnsureBuilt` (`BuildPipelines` or `InitFromSwapChain`, which
-  return at once). It waits for the pack (polling `PackPoll`), then `packFit` (the pack's `NeedSm` against the GPU, when the
-  wait at `CreateContext` did not see the pack), then `Build`. It publishes with `built` (an atomic, under `mu`) and
+  a thread of the context, started by the first `EnsureBuilt` (`BuildPipelines` or `InitFromSwapChain`, which
+  return at once). The thread takes a reference on the DLL like the pack thread. It waits for the pack (polling `PackPoll`),
+  then `packFit` (the pack's `NeedSm` against the GPU), then `Build`. It publishes with `built` (an atomic, under `mu`) and
   `deferBusy = false`, then `deferredDone` sets the status (1, or 3 with the reason; only if no newer context decided since:
-  `SetStatusIf`).
+  `SetStatusIf`, and never for a destroyed context). Everything the thread reads that the application's threads can write
+  (init flags, UI mode and composition, the swap chain's format, the dump settings) is copied under `mu` before it starts. The
+  generator settings are fixed before CreateContext returns (the built pack always gets the D3D12 path and the native
+  modules), so the generator never writes them from the build thread. Between the two stores (`built`, then `deferBusy`) a
+  tag or a usable frame may already see the pack: harmless, the thread touches no generator state after `built`.
+- **`BuildPipelines(blocking=1)` and `GetPipelineBuildStatus`** return at once for the built pack (success; the build is not
+  done): a caller that treats them as "pipelines ready" simply gets frames passed through until `f5lowGetStatus` says 1.
 - **While it runs**: `f5lowGetStatus` returns 0 with the reason "building its frame generator in the background"; the
   application's threads see `built == false` and tag nothing (as after a resize); the presenter passes every frame through
   (`Job::usable` is false) and leaves the generator alone (`Present` makes no `GenScope` while `deferBusy`). The rule that
   makes it race-free: until `built` is published only the build thread touches the generator, the staging buffers and the
-  pack; `deferBusy` is set before the presenter exists (`SetQueue` comes before `Wrap`) and cleared after `built`. The first
-  build has nothing to release, so it does not touch the presenter's state (`releaseHostBuffers` is empty).
-- **Destroy / unload during a build**: `~Own` sets `deferQuit` and joins the thread. A build still waiting for the pack stops
-  at once; one already compiling cannot be cancelled and is waited for (up to ~0.5 s warm, ~3 s with a cold JIT cache; only
-  when the context dies in its first seconds). The pack thread belongs to the process, not to a context: it finishes, and
+  pack. The first build has nothing to release, so it does not touch the presenter's state (`releaseHostBuffers` is empty).
+- **Destroy / unload during a build**: `~Own` sets `deferQuit` and waits for the thread. The build asks `GenBuild::cancelled`
+  before the CUDA init, after it, before every kernel and every cubin compile, so Destroy waits for one step: worst measured
+  374 ms with a cold JIT cache (`CUDA_CACHE_DISABLE=1`, one big kernel's compile), ~60 ms warm. A build still waiting for the
+  pack stops at once. If the context never became ready the status goes back to 0 "no context (destroyed before its generator
+  was ready)" (only if it still owns the status). The pack thread belongs to the process, not to a context: it finishes, and
   the next context finds the pack ready.
+
+### What stays on disk, honestly
+
+f5low writes `f5low.log` (only with logging on) and nothing else. Not under our control, and the same as with Intel's own
+library: the GPU driver's shader caches (NVIDIA's DXCache for the DXBC modules handed to D3D12, the CUDA ComputeCache for our PTX),
+and crash dumps (OptiScaler's minidump, Windows Error Reporting) which may contain process memory, the in-memory pack included.
+Compiled kernels are not cached by f5low (the driver's cache does that from our PTX alone).
 
 ### What is embedded in f5low.dll (ours only)
 

@@ -124,6 +124,27 @@ struct Builder {
         return true;
     }
 
+    // The early verdict: every intel_native module the recipe names (this pack and the nested ones) is in the library.
+    bool CheckModules(const std::string& prefix) {
+        const auto pj = own.find(prefix + "parts.json");
+        if (pj == own.end()) return Fail("the embedded recipe " + prefix + " is missing (this f5low.dll was built without it)");
+        Json parts;
+        if (!ParseJson(pj->second, parts)) return Fail(prefix + "parts.json is not valid");
+        if (const Json* files = parts.Get("files"))
+            for (const auto& kv : files->obj)
+                if (kv.second.Str_("kind") == "intel_native") {
+                    const std::string mod = kv.second.Str_("module_sha256");
+                    if (!lib.FindHex(mod)) return Fail(kv.first + ": module " + Hex8(mod) + " not found in libxess_fg.dll");
+                }
+        for (const auto& kv : own) {
+            const std::string& k = kv.first;
+            if (k.size() > prefix.size() + 11 && k.compare(0, prefix.size(), prefix) == 0 &&
+                k.compare(k.size() - 11, 11, "/parts.json") == 0 && k.find('/', prefix.size()) == k.size() - 11)
+                if (!CheckModules(k.substr(0, k.size() - 10))) return false;
+        }
+        return true;
+    }
+
     // `at`: this pack's folder inside the pack ("" for the main one, "hdr/" for the nested one)
     bool BuildOne(const std::string& prefix, const std::string& at) {
         auto get = [&](const std::string& n) -> const std::vector<uint8_t>* {
@@ -329,7 +350,7 @@ bool DevCaptureSource::RootConstants(int index, std::vector<uint8_t>& out) {
 
 // ---- BuildPack ----------------------------------------------------------------------------------------------------
 bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSource& data, Files& out,
-               Report& rep, std::string* error, const std::vector<uint8_t>* libBytes) {
+               Report& rep, std::string* error, const std::vector<uint8_t>* libBytes, const VerdictFn& verdict) {
     const auto t0 = Clock::now();
     rep = Report();
     out.clear();
@@ -339,9 +360,23 @@ bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSour
     if (!(libBytes ? b.lib.OpenMemory(libBytes->data(), libBytes->size(), &why) : b.lib.Open(libxessPath, &why))) {
         if (error) *error = "libxess_fg.dll (" + Narrow(libxessPath) + ") cannot be used: " + why;
         out.clear();
+        if (verdict) verdict(false, error ? *error : why);
         return false;
     }
     rep.decodeMs = b.lib.GetStats().decodeMs;
+    {
+        const auto tw = Clock::now();
+        const bool good = b.CheckModules("i0/") && data.PrepareData();
+        rep.weightsMs += MsSince(tw);
+        if (!good) {
+            const std::string r = b.err.empty() ? "the weights: " + data.Problem() : b.err;
+            if (error) *error = r;
+            out.clear();
+            if (verdict) verdict(false, r);
+            return false;
+        }
+        if (verdict) verdict(true, std::string());
+    }
     bool ok = b.BuildOne("i0/", "");
     if (ok) {
         // the pack has no PTX twins of its native modules: it runs on the D3D12 path only
@@ -362,6 +397,7 @@ bool BuildInMemory(const Request& req, std::shared_ptr<const Files>& out, std::s
     try {
         if (!req.own || !req.data) {
             error = !req.own ? "this f5low.dll carries no recipe" : "no data source for the weights";
+            if (req.verdict) req.verdict(false, error);
             return false;
         }
         Report rep;
@@ -372,11 +408,12 @@ bool BuildInMemory(const Request& req, std::shared_ptr<const Files>& out, std::s
             std::vector<uint8_t> intel;
             if (!ReadAll(fs::path(longpath::ExtendIfLong(req.libxessPath)), intel) || intel.empty()) {
                 error = "libxess_fg.dll not found or not readable (" + Narrow(req.libxessPath) + ")";
+                if (req.verdict) req.verdict(false, error);
                 return false;
             }
             if (req.log) req.log("building the pack in memory from libxess_fg.dll (" + std::to_string(intel.size() >> 10) + " KiB)");
             std::string why;
-            if (!BuildPack(req.libxessPath, *req.own, *req.data, *files, rep, &why, &intel)) {
+            if (!BuildPack(req.libxessPath, *req.own, *req.data, *files, rep, &why, &intel, req.verdict)) {
                 error = why;
                 return false;
             }
@@ -434,12 +471,18 @@ int RemoveLegacyCaches(const std::wstring& root, const std::function<void(const 
         GetSystemTimeAsFileTime(&now);
         constexpr ULONGLONG kHour = 3600ull * 10000000ull;
         const ULONGLONG t = FileTimeU(now);
+        auto say = [&](const std::string& l) { if (log) log(l); };
+        std::vector<fs::path> dirs;
         for (fs::directory_iterator it(r, ec), end; !ec && it != end; it.increment(ec)) {
             std::error_code e1;
-            if (!it->is_directory(e1)) continue;
-            const std::wstring name = it->path().filename().wstring();
-            bool old = false;
-            if (IsOldTempName(name)) {
+            if (it->is_directory(e1)) dirs.push_back(it->path());
+        }
+        for (const fs::path& victim : dirs) {
+            std::error_code e1;
+            const std::wstring name = victim.filename().wstring();
+            const bool leftover = name.size() > 9 && name.compare(name.size() - 9, 9, L".f5low-del") == 0;   // ours by name
+            bool old = leftover;
+            if (!old && IsOldTempName(name)) {
                 // a build of an older f5low.dll that never finished (or is still running in another process: it writes
                 // constantly, so its newest file is recent): removed when nothing in it was written for an hour
                 ULONGLONG newest = 0;
@@ -448,22 +491,64 @@ int RemoveLegacyCaches(const std::wstring& root, const std::function<void(const 
                     if (GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d))
                         newest = std::max<ULONGLONG>(newest, FileTimeU(d.ftLastWriteTime));
                 };
-                stamp(it->path());
+                stamp(victim);
                 std::error_code e2;
-                for (fs::recursive_directory_iterator f(it->path(), e2), fend; !e2 && f != fend; f.increment(e2)) stamp(f->path());
+                for (fs::recursive_directory_iterator f(victim, e2), fend; !e2 && f != fend; f.increment(e2)) stamp(f->path());
                 old = newest && newest + kHour < t;
-            } else if (MarkerFormat(it->path()) > 0) {
+            } else if (!old && MarkerFormat(victim) > 0) {
                 old = true;     // carries our pack marker (any format): a pack of Intel-derived files, which are no longer kept
             }
             if (!old) continue;       // anything without our marker (the cubin cache, a user's folder) is never touched
-            const fs::path victim = it->path();
-            fs::remove_all(victim, e1);
-            const bool gone = !fs::exists(victim, e1);
-            if (gone)
-                ++removed;
-            if (log)
-                log(std::string(gone ? "removed" : "could not remove") + " the old on-disk pack cache " +
-                    Narrow(longpath::Plain(victim.wstring())) + (gone ? " (the pack is built in memory now)" : ""));
+            // Renamed away first (one step: the pack is gone from its name even if a file in it is open and the delete
+            // fails), then deleted; a *.f5low-del folder that survives is retried at the next start.
+            fs::path target = victim;
+            bool renameFailed = false;
+            if (!leftover) {
+                fs::path moved = victim;
+                moved += L".f5low-del";
+                std::error_code e3;
+                fs::remove_all(moved, e3);
+                fs::rename(victim, moved, e3);
+                if (!e3) target = moved;
+                else renameFailed = true;
+            }
+            if (renameFailed) {
+                // delete everything but the marker, then the marker last (a half-deleted pack stays recognisable)
+                std::error_code e4;
+                std::vector<fs::path> files;
+                for (fs::recursive_directory_iterator f(victim, e4), fend; !e4 && f != fend; f.increment(e4))
+                    if (f->is_regular_file(e4) && f->path().filename() != L"complete") files.push_back(f->path());
+                size_t left = 0;
+                for (const fs::path& f : files) {
+                    fs::remove(f, e4);
+                    if (e4) ++left;
+                }
+                std::vector<fs::path> subs;
+                for (fs::directory_iterator d(victim, e4), dend; !e4 && d != dend; d.increment(e4))
+                    if (d->is_directory(e4)) subs.push_back(d->path());
+                for (const fs::path& d : subs) {
+                    fs::remove_all(d, e4);
+                    if (fs::exists(d, e4)) ++left;      // a file in use (or one whose delete is still pending) keeps its folder
+                }
+                // what is left is asked of the file system by name (a delete that is only pending still counts as present: any
+                // answer but "not found" does)
+                auto present = [](const fs::path& q) {
+                    if (GetFileAttributesW(q.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+                    const DWORD e = GetLastError();
+                    return e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND;
+                };
+                left = 0;
+                for (const fs::path& f : files) left += present(f) ? 1 : 0;
+                for (const fs::path& d : subs) left += present(d) ? 1 : 0;
+                if (!left) fs::remove(victim / L"complete", e4);     // anything left keeps the marker: retried at the next start
+            }
+            if (renameFailed) fs::remove(target, e1);      // the folder itself, once empty (its marker is kept while anything is left)
+            else fs::remove_all(target, e1);
+            const bool gone = !fs::exists(target, e1);
+            const bool renamed = !gone && target != victim;
+            if (gone) ++removed;
+            say(std::string(gone ? "removed" : renamed ? "renamed away (a file in it is in use; deleted at the next start)" : "could not remove") +
+                " the old on-disk pack cache " + Narrow(longpath::Plain(victim.wstring())) + (gone ? " (the pack is built in memory now)" : ""));
         }
     } catch (...) {
     }
