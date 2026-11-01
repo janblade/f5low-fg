@@ -217,7 +217,7 @@ kernel 29 @k29_decoder_16.ptx 256 1 1
 fallback 29 @k29_decoder_16_sm75.ptx 256 1 1
 kernel 30 @k30_conv_c16.ptx 128 1 1
 fallback 30 @k30_conv_c16_sm75.ptx 128 1 1
-kernel 31 @k31_xefc1536e.ptx 8 8 1
+kernel 31 @k31_blend_hdr.ptx 8 8 1
 variant 19 @v_rbb0e28cd.ptx 8 16 1 ndc=1 jit=0 hires=1
 variant 19 @v_ra48c8c87.ptx 8 16 1 ndc=0 jit=0 hires=1
 variant 19 @v_rd4b7977d.ptx 8 16 1 ndc=0 jit=1 hires=1
@@ -233,7 +233,7 @@ variant 17 @v_xc0481f4f.ptx 8 8 1 inv=0 ndc=0
 variant 17 @v_x4847df5d.ptx 8 8 1 inv=1 ndc=1
 variant 17 @v_x903ffa0d.ptx 8 8 1 inv=0 ndc=1
 variant 18 @v_splat_t_invdepth.ptx 8 8 1 inv=0
-variant 31 @v_x47821c21.ptx 8 8 1 premul=0
+variant 31 @v_blend_hdr_straight.ptx 8 8 1 premul=0
 native @k19_r4ffe969e.ptx @k19_r4ffe969e.dxbc 32
 native @v_rbb0e28cd.ptx @v_rbb0e28cd.dxbc 32
 native @v_ra48c8c87.ptx @v_ra48c8c87.dxbc 32

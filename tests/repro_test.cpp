@@ -9,6 +9,7 @@
 //
 // Usage: repro_test.exe <xefg dll> [libxell.dll]     (Intel's XeFG wants XeLL; ours ignores it)
 //   REPRO_DEBUG=1   the D3D12 debug layer (its errors and warnings are printed; exit code 2)
+//   REPRO_HDR=1     an R10G10B10A2 swap chain (the own generator then uses the pack's hdr\ part)
 //   REPRO_INITFLAGS=n  XeFG init flags (default 1 = inverted depth; 0 runs the pack's non-inverted-depth module variants)
 //   REPRO_OFF=N     frames before frame generation is turned on (default 120)
 //   REPRO_ON=N      frames with it on (default 240)
@@ -341,7 +342,7 @@ int main(int argc, char** argv)
     DXGI_SWAP_CHAIN_DESC1 sd {};
     sd.Width = 1920;
     sd.Height = 1080;
-    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.Format = EnvInt("REPRO_HDR", 0) == 1 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 3;

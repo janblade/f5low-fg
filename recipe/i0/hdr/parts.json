@@ -250,11 +250,10 @@
    "generator": "gen_conv_ptx.py",
    "args": ["--layer", "c16", "--sm", "75"]
   },
-  "k31_xefc1536e.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "efc1536e7b04f1ea3a4a5deacabad372464e198b0a1ff6e1891b02ef6332cd54",
-   "transform": "plain",
-   "fmts": ["S0=x128", "S10=rgb10a2", "S11=rgb10a2", "S12=rgb10a2", "S1=rgb10a2", "S2=rgb10a2", "S3=rgb10a2", "S4=rgb10a2", "S8=rgb10a2", "S9=rgb10a2", "U0=rgb10a2"]
+  "k31_blend_hdr.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_blend_ptx.py",
+   "args": ["--hdr"]
   },
   "v_rbb0e28cd.ptx": {
    "kind": "intel_xlate",
@@ -345,11 +344,10 @@
    "generator": "gen_splat_t_ptx.py",
    "args": ["--invert-depth"]
   },
-  "v_x47821c21.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "47821c21deb6e99ff2eab4e2efd8297dae6dd49da81d1042e9f2ec3e55a8986d",
-   "transform": "plain",
-   "fmts": ["S0=x128", "S10=rgb10a2", "S11=rgb10a2", "S12=rgb10a2", "S1=rgb10a2", "S2=rgb10a2", "S3=rgb10a2", "S4=rgb10a2", "S8=rgb10a2", "S9=rgb10a2", "U0=rgb10a2"]
+  "v_blend_hdr_straight.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_blend_ptx.py",
+   "args": ["--hdr", "--premul", "0"]
   },
   "k19_r4ffe969e.dxbc": {
    "kind": "intel_native",
