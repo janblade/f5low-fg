@@ -1,0 +1,1 @@
+# <path>:<check>  <reason>   (findings the no-vendor-content rule allows anyway; keep this list short)
