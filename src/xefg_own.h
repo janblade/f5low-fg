@@ -39,9 +39,11 @@
 // a generated frame shows the application's frame around it, as Intel copies the borders in.
 #pragma once
 
+#include "generator.h"
+#include "generators/own.h"
+#include "generators/stubs.h"
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
-#include "xefg_pack_d3d.h"
 
 #include <dxgi1_6.h>
 
@@ -282,9 +284,6 @@ private:
     std::atomic<ULONG> refs { 1 };
 };
 
-// The most generated frames per app frame (6x). Only t differs between them.
-constexpr uint32_t kMaxInterp = 5;
-
 class Own : public std::enable_shared_from_this<Own>
 {
 public:
@@ -452,9 +451,7 @@ public:
     double maxLag = 0.5;                        // MaxLag= in f5low.ini: the schedule's lag at most, in app frames (paceLag)
     bool clockPacer = true;                     // Pacer= in f5low.ini: clock (ClockTarget) or schedule (PaceTarget), CUDA path
     double maxDelay = 1.5;                      // MaxDelay= in f5low.ini: the clock's delay at most, in app frames (clkTarget)
-    bool prof = false;                          // Prof=1 in f5low.ini (or XEFG_CUDA_PROF=1): per-run GPU timing (off by default)
-    bool profDispatches = false;                // Prof=2: per-dispatch sums too (D3D12 path)
-    bool native = true;                         // Native=0: the pack's native modules run as PTX (D3D12 path)
+    GenSettings gs;                             // Prof=1/2 (or XEFG_CUDA_PROF), Native=0 in f5low.ini: shared with the generator
     bool gate = false;                          // Gate= in f5low.ini: pace on the GPU (ShowGated / PresentGenGated), with the clock
     bool flipMetering = true;                   // FlipMetering=0 in f5low.ini: no NVIDIA driver flip metering (Meter)
     uint32_t flipLeadUs = 2500;                 // FlipLeadUs= in f5low.ini (0-8000): metered frames after the first go this early
@@ -464,69 +461,62 @@ public:
     // the generated frames came 22 ms later and the clock's delay followed (harness 6x at 30 fps).
     static constexpr UINT kGateBuffers = 8, kGateLatency = 16;
 
-    // path: "cuda" for the CUDA path, anything else the D3D12 one (see the top of this file).
-    static std::shared_ptr<Own> Create(ID3D12Device* dev, const std::string& packDir, const std::string& path)
+    // path: "cuda" for the CUDA path, anything else the D3D12 one (see the top of this file). generator: own, intel, dlssg or
+    // fsr (xefg_cuda.cpp GeneratorSetting); one that is not available yet logs one line and runs own.
+    static std::shared_ptr<Own> Create(ID3D12Device* dev, const std::string& packDir, const std::string& path,
+                                       const std::string& generator = "own")
     {
         auto o = std::make_shared<Own>();
         o->dev = dev;
         o->packDir = packDir;
-        o->d3dPath = path != "cuda";
+        std::unique_ptr<IGenerator> chosen = MakeStubGenerator(generator);
+        const char* id = "own";
+        if (chosen && !chosen->Caps().available)
+        {
+            XLog("f5low: generator %s not available yet, running own", generator.c_str());
+            chosen.reset();
+        }
+        if (chosen)
+        {
+            id = generator.c_str();
+            o->generator = std::move(chosen);
+        }
+        else
+            o->generator = std::make_unique<OwnGenerator>(dev, packDir, path != "cuda", o->gs);
+        GenHost h;
+        h.user = o.get();
+        h.stampDone = &Own::StampDone;
+        h.stampsWork = &Own::StampsWork;
+        h.waitingFor = &Own::WaitingFor;
+        o->generator->SetHost(h);
+        // The per-frame path drives the pack surface (own is the only generator that has one and runs).
+        o->pg = o->generator->AsPack();
+        if (!o->pg)
+        {
+            XLog("f5low: generator %s has no pack surface - the host cannot drive it, no context", id);
+            return nullptr;
+        }
+        XLog("f5low: generator %s (%s)", id, o->generator->Caps().name);
         return o;
     }
 
-    // CUDA path: cuGraphLaunch blocks for ~20 ms under game GPU load, so CUDA submission runs on its own
-    // thread. The D3D queue only waits on the fence, so it does not need the submission to have happened yet.
-    void Post(std::function<void()> job)
+    // The generator's CUDA host functions and diagnostics, back in the host: when the stream reached a fence value (ClockNeed).
+    static void StampDone(void* u, UINT64 v)
     {
-        std::lock_guard<std::mutex> l(wm);
-        if (!worker.joinable())
-            worker = std::thread([this] {
-                for (;;)
-                {
-                    std::function<void()> j;
-                    {
-                        std::unique_lock<std::mutex> l2(wm);
-                        wcv.wait(l2, [this] { return quitWorker || !jobs.empty(); });
-                        if (jobs.empty())
-                            return;
-                        j = std::move(jobs.front());
-                        jobs.pop_front();
-                    }
-                    {
-                        Scope s(*this);
-                        j();
-                    }
-                    {
-                        std::lock_guard<std::mutex> l2(wm);
-                        ++jobsDone;
-                    }
-                    wcv.notify_all();
-                }
-            });
-        jobs.push_back(std::move(job));
-        ++jobsPosted;
-        wcv.notify_all();
+        Own* o = static_cast<Own*>(u);
+        o->doneAt[v % kStamps].store(Now(), std::memory_order_relaxed);
+        o->doneVal[v % kStamps].store(v, std::memory_order_release);
     }
+    static void StampsWork(void* u) { static_cast<Own*>(u)->stampsWork = true; }
+    static UINT64 WaitingFor(void* u) { return static_cast<Own*>(u)->gWaitingFor.load(); }
 
-    void Drain()
-    {
-        std::unique_lock<std::mutex> l(wm);
-        wcv.wait(l, [this] { return jobsDone == jobsPosted; });
-    }
+    bool D3d() const { return pg->InCommandLists(); }
 
     ~Own()
     {
         XLog("context freed");  // Destroy plus the app's last Release of its swap chain: nothing of it is left
         StopPresenter();
-        if (worker.joinable())
-        {
-            {
-                std::lock_guard<std::mutex> l(wm);
-                quitWorker = true;
-            }
-            wcv.notify_all();
-            worker.join();
-        }
+        generator->Stop();
         ReleaseSwapChain();
         if (latencySem)
             CloseHandle(latencySem);
@@ -549,10 +539,9 @@ public:
                 u->Release();
         if (tagEvent)
             CloseHandle(tagEvent);
-        dpack.reset();
         ReleaseStaging();
         ReleaseRing();
-        for (IUnknown* u : std::initializer_list<IUnknown*> { setupQueue, stampHeap, stampRb, dispHeap, dispRb, appFence, consumedFence, idleFence, retireFence, tagBuf,
+        for (IUnknown* u : std::initializer_list<IUnknown*> { appFence, consumedFence, idleFence, retireFence, tagBuf,
                                                              genList, genFence, genQueue, convRs, convPso })
             if (u)
                 u->Release();
@@ -565,29 +554,7 @@ public:
             CloseHandle(retireEvent);
         if (gpuEvent)
             CloseHandle(gpuEvent);
-        if (io.ctx)
-        {
-            Scope s(*this);
-            if (gateSem)
-                io.cu.DestroyExternalSemaphore(gateSem);
-            // Prof's events (RunCuda creates them on first use)
-            for (CUevent e : { evW, evH })
-                if (e)
-                    io.cu.EventDestroy(e);
-            for (const CUevent* set : { evT, evG, evS })
-                for (size_t i = 0; i < kMaxInterp; ++i)
-                    if (set[i])
-                        io.cu.EventDestroy(set[i]);
-            if (stream)
-                io.cu.StreamDestroy(stream);
-            pack.reset();
-            ReleaseShared();
-        }
-        else
-        {
-            pack.reset();
-            ReleaseShared();
-        }
+        generator->Shutdown();
         if (list)
             list->Release();
         for (auto& a : alloc)
@@ -653,7 +620,7 @@ public:
         }
         if (!gate || !clockPacer)
             return queue;
-        if (d3dPath && genMode == "off")
+        if (D3d() && genMode == "off")
             genMode = "direct";             // the D3D12 path's passes must not wait at the gate (PresentGenGated)
         if (!pq && !CreatePresentLane())
         {
@@ -737,7 +704,7 @@ public:
         hostEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         retireEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         gpuEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (d3dPath && genMode != "off" && !CreateGenLane())
+        if (D3d() && genMode != "off" && !CreateGenLane())
             XLog("present: no generation queue (%s) - generating on the present queue", genMode.c_str());
         return true;
     }
@@ -874,10 +841,11 @@ public:
         const bool isMv = rd.type == XEFG_SWAPCHAIN_RES_MOTION_VECTOR;
         const uint32_t set = static_cast<uint32_t>(appFrame & 1);
         // A UI texture only counts with a pack that has the UI inputs (tools/pack_ui.py).
-        if (!built || !stMv[set] || (isColor && !EnsureStaging(stHud, cur.bytes)) || (isUi && (rUi < 0 || !EnsureStaging(stUi, uic.bytes))))
+        if (!built || !stMv[set] || (isColor && !EnsureStaging(stHud, pg->Buf(GenSlot::Cur).bytes)) ||
+            (isUi && (!pg->HasUiInputs() || !EnsureStaging(stUi, pg->Buf(GenSlot::Ui).bytes))))
             return;
         ID3D12Resource* dst = isColor ? stHud[set] : isUi ? stUi[set] : isMv ? stMv[set] : stDepth[set];
-        const Resource& pr = pack->res[isColor ? rCur : isUi ? rUi : isMv ? rMv : rDepth];
+        const Resource& pr = pg->InputRes(isColor ? GenSlot::Cur : isUi ? GenSlot::Ui : isMv ? GenSlot::Motion : GenSlot::Depth);
         if (CopyIn(g, rd, dst, pr, isColor ? "hudless" : isUi ? "ui" : isMv ? "motion" : "depth", set))
             (isColor ? hudless : isUi ? haveUi : isMv ? haveMv : haveDepth) = true;
     }
@@ -1050,14 +1018,14 @@ public:
             if (!real || appBufs.empty() || !list || !presenter.joinable())
                 return real ? real->Present(sync, flags) : DXGI_ERROR_INVALID_CALL;
             FlushTags();
-            const Resource* ox = built && pack ? &pack->res[rOut] : nullptr;
+            const Resource* ox = built && pg->HasPack() ? &pg->Output() : nullptr;
             const DXGI_FORMAT bf = scDesc.Format;
             const bool fmtKnown = bf == DXGI_FORMAT_R8G8B8A8_UNORM || bf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || IsBgra(bf) || IsHdr10(bf);
-            const bool fmtOk = ox && fmtKnown && IsHdr10(bf) == packHdr && scDesc.Width == ox->w && scDesc.Height == ox->h;
+            const bool fmtOk = ox && fmtKnown && IsHdr10(bf) == pg->PackHdr() && scDesc.Width == ox->w && scDesc.Height == ox->h;
             if (enabled && built && !fmtOk && !warnedSize)
             {
                 XLog("present: backbuffer %ux%u fmt=%d does not match the pack's %ux%u %s%s - passing through", scDesc.Width, scDesc.Height,
-                     static_cast<int>(bf), ox ? ox->w : 0, ox ? ox->h : 0, packHdr ? "R10G10B10A2" : "R8G8B8A8",
+                     static_cast<int>(bf), ox ? ox->w : 0, ox ? ox->h : 0, pg->PackHdr() ? "R10G10B10A2" : "R8G8B8A8",
                      !fmtKnown ? " (a format XeFG does not take)" : "");
                 warnedSize = true;
             }
@@ -1084,7 +1052,7 @@ public:
             j.mvs[0] = constants.motionVectorScaleX;
             j.mvs[1] = constants.motionVectorScaleY;
             j.nInterp = std::max(1u, std::min(numInterp, maxInterp));
-            j.passes = j.usable && pack->HasPassPatches();
+            j.passes = j.usable && pg->HasPassPatches();
             j.sync = sync;
             j.flags = flags;
             j.arrive = t0.QuadPart;
@@ -1267,13 +1235,6 @@ public:
 
     ID3D12Device* dev = nullptr;
     std::mutex mu;
-    std::thread worker;
-    std::mutex wm;
-    std::condition_variable wcv;
-    std::deque<std::function<void()>> jobs;
-    bool quitWorker = false;
-    unsigned long long jobsPosted = 0, jobsDone = 0;
-    std::atomic<bool> cudaFailed { false };
 
 private:
     // One application frame, as the presenter gets it.
@@ -1314,19 +1275,6 @@ private:
         bool handed = false;                // cur -> prev done (HandOff)
         bool held = false;                  // its own picture is in hold
         UINT64 heldAt = 0;                  // Gate=1: its own picture is in gateHeld[set] at hostFence heldAt (Submit)
-    };
-
-    // The CUDA context current on this thread for the scope (none once the D3D12 path released it).
-    struct Scope
-    {
-        Own& o;
-        bool pushed;
-        explicit Scope(Own& x) : o(x), pushed(x.io.ctx && x.io.cu.CtxPushCurrent(x.io.ctx) == 0) {}
-        ~Scope()
-        {
-            if (pushed)
-                o.io.cu.CtxPopCurrent(nullptr);
-        }
     };
 
     static long long Now()
@@ -1524,7 +1472,7 @@ private:
             return;
         warnedPresent = true;
         const HRESULT removed = dev ? dev->GetDeviceRemovedReason() : S_OK;
-        const Resource* ox = built && pack ? &pack->res[rOut] : nullptr;
+        const Resource* ox = built && pg->HasPack() ? &pg->Output() : nullptr;
         XLog("present: the real swap chain's Present failed: 0x%08x (device removed reason 0x%08x), frame %llu present %u of %u, %s, "
              "sync %u flags 0x%x, swap chain %ux%u fmt=%d buffers=%u, pack output %ux%u, render %ux%u, %s lane",
              static_cast<unsigned>(hr), static_cast<unsigned>(removed), static_cast<unsigned long long>(j.frame), k, n + 1,
@@ -1695,8 +1643,8 @@ private:
     // frame before it waited to be presented.
     void Present(const Job& j)
     {
-        Scope cuda(*this);
-        if (j.usable && pq && d3dPath && !genQueue)
+        GenScope cuda(*pg);
+        if (j.usable && pq && D3d() && !genQueue)
         {
             static bool warned = false;
             if (!warned)
@@ -1846,13 +1794,13 @@ private:
             // gateHeld[set] and ringC[set] are rewritten only once the lane read them two app frames ago (pqRead). After
             // Consumed: the application never waits for the display.
             queue->Wait(pqFence, pqRead[f.set]);
-            if (!gateHeld[f.set] && !(gateHeld[f.set] = PlainBuffer(cur.bytes)))
+            if (!gateHeld[f.set] && !(gateHeld[f.set] = PlainBuffer(pg->Buf(GenSlot::Cur).bytes)))
                 XLog("gate: no buffer for the frame's own picture - the present lane reads it in place");
             if (gateHeld[f.set])
             {
                 ID3D12GraphicsCommandList* g = Begin();
                 Out(g, f.realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                g->CopyBufferRegion(gateHeld[f.set], 0, f.realSrc, 0, cur.bytes);
+                g->CopyBufferRegion(gateHeld[f.set], 0, f.realSrc, 0, pg->Buf(GenSlot::Cur).bytes);
                 Back(g, f.realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 End();
             }
@@ -1860,7 +1808,7 @@ private:
         }
         const bool gen = hasPrev && !j.reset;
         f.nGen = !gen ? 0 : j.passes ? j.nInterp : 1;
-        if (f.nGen && !j.cut && !d3dPath && !EnsureRingC(f.set, f.nGen))
+        if (f.nGen && !j.cut && !D3d() && !pg->EnsureRing(f.set, f.nGen))
             f.nGen = 0;
         if (f.nGen != lastNGen)
         {
@@ -1877,20 +1825,21 @@ private:
         // GenSpread on the CUDA path (PresentGenGated has the why): pass k > 1 waits on the stream until the present spread
         // places before it is released; this frame's presents come after those of the frame being shown (gateFrameEnd: a
         // frame taken early is submitted in the middle of the last one's presents).
-        const uint32_t spread = gateSem && genSpread && !j.cut && !DisplayPaced(j) ? genSpread : 0;
+        const uint32_t spread = pg->HasGateFence() && genSpread && !j.cut && !DisplayPaced(j) ? genSpread : 0;
         f.spread = spread > 0;
-        SetClock(f, clockPacer && !d3dPath && f.nGen && !DisplayPaced(j));
+        SetClock(f, clockPacer && !D3d() && f.nGen && !DisplayPaced(j));
         // The game's motion-vector scale; the pack's own (captured) one if the game sends none.
         f.mvs[0] = j.mvs[0];
         f.mvs[1] = j.mvs[1];
         if (f.mvs[0] == 0 && f.mvs[1] == 0)
-            pack->MvScale(f.mvs[0], f.mvs[1]);
+            pg->MvScale(f.mvs[0], f.mvs[1]);
         f.jc[0] = j.jitter[0];
         f.jc[1] = j.jitter[1];
         f.jp[0] = prevJitter[0];
         f.jp[1] = prevJitter[1];
-        if (f.nGen && !j.cut && !d3dPath)
-            RunCuda(f.nGen, f.jc, f.jp, f.mvs, j.uiMode, ringC[f.set], f.done, spread ? std::max(gateFrameEnd, gateValue.load()) : 0, spread);
+        if (f.nGen && !j.cut && !D3d())
+            pg->Launch(queue, fv, IsBgra(scDesc.Format), clockPacer, f.set, f.nGen, f.jc, f.jp, f.mvs, j.uiMode, f.done,
+                        spread ? std::max(gateFrameEnd, gateValue.load()) : 0, spread);
         return f;
     }
 
@@ -1975,7 +1924,7 @@ private:
         const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
         HMODULE m = nullptr, owner = nullptr;
         NvQueryFn qi = nullptr;
-        if (io.sm <= 0)
+        if (pg->GpuSm() <= 0)
             why = "the game's adapter is not an NVIDIA GPU (no CUDA device behind it)";
         else if (!n || n >= MAX_PATH || !(m = LoadLibraryW((std::wstring(sys) + L"\\nvapi64.dll").c_str())))
             why = "no nvapi64.dll in the system folder";
@@ -2077,14 +2026,6 @@ private:
     double ClockMargin(long long cstep) const
     {
         return cstep > 0 ? std::min(kClkMargin, kClkMarginShare * static_cast<double>(cstep) * 1000.0 / freq()) : kClkMargin;
-    }
-
-    // A CUDA host function after a pass's fence signal: when the stream got there.
-    static void Stamp(void* p)
-    {
-        const HostStamp* h = static_cast<const HostStamp*>(p);
-        h->o->doneAt[h->v % kStamps].store(Now(), std::memory_order_relaxed);
-        h->o->doneVal[h->v % kStamps].store(h->v, std::memory_order_release);
     }
 
     // The rate the schedule spaces generated frames by (Pick): eased by 1/10, but when the game slows for good (two frames in a
@@ -2209,33 +2150,31 @@ private:
         const Job& j = f.j;
         const uint32_t nGen = f.nGen;
         long long firstRelease = 0;
-        const Resource& ox = pack->res[rOut];
+        const Resource& ox = pg->Output();
         for (uint32_t k = 1; k <= nGen; ++k)
         {
             // CUDA path: the next app frame starts as soon as it is done on the GPU and this one's passes have run.
-            if (!d3dPath && !f.handed && !DumpPending(j) && NextReady() && (j.cut || io.fence->GetCompletedValue() >= f.done[nGen - 1]) &&
-                (hold || (hold = PlainBuffer(cur.bytes)) != nullptr))
+            if (!D3d() && !f.handed && !DumpPending(j) && NextReady() && (j.cut || pg->DoneFence()->GetCompletedValue() >= f.done[nGen - 1]) &&
+                (hold || (hold = PlainBuffer(pg->Buf(GenSlot::Cur).bytes)) != nullptr))
             {
                 HandOff(f, true);
                 Early();
             }
             // A camera cut: the app's frame in this place, no network.
-            if (!j.cut && d3dPath)
+            if (!j.cut && D3d())
             {
                 // The constants are copied into the list as it is recorded (RecordPass, below).
-                if (!noPatch)
-                    SetJitter(f.jc, f.jp);
-                pack->SetPass(static_cast<float>(k) / static_cast<float>(nGen + 1), k - 1, f.mvs[0], f.mvs[1]);
+                pg->PreparePass(k, nGen, f.jc, f.jp, f.mvs);
             }
             else if (!j.cut)
-                queue->Wait(io.fence, f.done[k - 1]);
+                queue->Wait(pg->DoneFence(), f.done[k - 1]);
             ID3D12Resource* frame = f.held ? hold : f.realSrc;
             ID3D12Resource* rb = RealBuffer();
             ID3D12GraphicsCommandList* g = Begin();
-            if (d3dPath && !j.cut)
+            if (D3d() && !j.cut)
                 RecordPass(g, k, cur_i);
             Barrier(g, rb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-            ID3D12Resource* gsrc = j.cut ? frame : d3dPath ? out.res : ringC[f.set][k - 1].res;
+            ID3D12Resource* gsrc = j.cut ? frame : D3d() ? pg->Buf(GenSlot::Output).res : pg->RingFrame(f.set, k - 1);
             Out(g, gsrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
             if (j.cut)
                 Copy(g, rb, gsrc, ox, true);
@@ -2258,7 +2197,7 @@ private:
                     firstRelease = lastRelease;
                 statClkSlips += late > 0.5;
             }
-            else if (!d3dPath && late > 0.5)  // not a hair's breadth, which undid the fall below every frame
+            else if (!D3d() && late > 0.5)  // not a hair's breadth, which undid the fall below every frame
                 paceLag = std::min(std::max(paceLag, f.lag + late), readyInterval * maxLag);
             if (++genCount == 1 || genCount % 600 == 0)
                 XLog("present: %u frames generated", genCount);
@@ -2267,7 +2206,7 @@ private:
         // 3. The application's frame, and cur -> prev.
         {
             ID3D12Resource* rb = RealBuffer();
-            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut ? (d3dPath ? out.res : ringC[f.set][nGen - 1].res) : f.held ? hold : f.realSrc;
+            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut ? (D3d() ? pg->Buf(GenSlot::Output).res : pg->RingFrame(f.set, nGen - 1)) : f.held ? hold : f.realSrc;
             ID3D12GraphicsCommandList* g = Begin();
             Barrier(g, rb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
             Out(g, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2309,14 +2248,14 @@ private:
         const Job& j = f.j;
         const uint32_t nGen = f.nGen;
         gateFrameEnd = gateValue.load() + nGen + 1;     // its presents' values (the next frame's spread starts after them)
-        const Resource& ox = pack->res[rOut];
+        const Resource& ox = pg->Output();
         ID3D12Resource* frame = gateHeld[f.set] ? gateHeld[f.set] : f.realSrc;
         pq->Wait(hostFence, f.heldAt);
         for (uint32_t k = 1; k <= nGen; ++k)
         {
             // The next app frame starts as soon as it is done on the GPU and this one's passes have run (Show); its picture
             // goes to the other held set, so no hold copy.
-            if (!f.handed && !DumpPending(j) && NextReady() && (j.cut || io.fence->GetCompletedValue() >= f.done[nGen - 1]))
+            if (!f.handed && !DumpPending(j) && NextReady() && (j.cut || pg->DoneFence()->GetCompletedValue() >= f.done[nGen - 1]))
             {
                 HandOff(f, false);
                 Early();
@@ -2334,7 +2273,7 @@ private:
             else
             {
                 BeginLaneCopy(g, j.frame, k, true);
-                CopyGenerated(g, rb, ringC[f.set][k - 1].res, frame, ox);
+                CopyGenerated(g, rb, pg->RingFrame(f.set, k - 1), frame, ox);
             }
             EndLaneCopy(g);
             if (j.dbgTag)
@@ -2349,7 +2288,7 @@ private:
         }
         {
             ID3D12Resource* rb = RealBuffer();
-            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut ? ringC[f.set][nGen - 1].res : frame;
+            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut ? pg->RingFrame(f.set, nGen - 1) : frame;
             ID3D12GraphicsCommandList* g = BeginP();
             Barrier(g, rb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
             BeginLaneCopy(g, j.frame, nGen + 1, false);
@@ -2363,8 +2302,8 @@ private:
         // HandOff's GPU wait for the last pass only once that pass is done: a D3D12 wait still pending on the shared fence
         // while the stream queued its signals made nearly every app frame's cuSignalExternalSemaphoresAsync fail
         // (CUDA_ERROR_INVALID_VALUE, harness 6x at 30 fps); Show never got there before the passes were done.
-        if (!f.handed && nGen && !j.cut && io.fence->GetCompletedValue() < f.done[nGen - 1])
-            WaitGpu(io.fence, f.done[nGen - 1], 1000);
+        if (!f.handed && nGen && !j.cut && pg->DoneFence()->GetCompletedValue() < f.done[nGen - 1])
+            WaitGpu(pg->DoneFence(), f.done[nGen - 1], 1000);
         if (!f.handed)
             HandOff(f, false);
         Early();
@@ -2439,27 +2378,22 @@ private:
         if (!pq || gater.joinable())
             return;
         // CUDA path, GenSpread: the stream waits on the gate fence before each later pass (RunCuda).
-        if (!d3dPath && genSpread && io.ctx && !gateSem)
+        if (!D3d() && genSpread && pg->WantsGateFence())
         {
-            Scope cuda(*this);
             HANDLE fh = nullptr;
             if (SUCCEEDED(dev->CreateSharedHandle(gateFence, nullptr, GENERIC_ALL, nullptr, &fh)))
             {
-                ExtSemHandleDesc sd {};
-                sd.type = kExtSemD3D12Fence;
-                sd.handle.win32.handle = fh;
-                if (io.cu.ImportExternalSemaphore(&gateSem, &sd))
-                    gateSem = nullptr;
+                pg->ImportGateFence(fh);
                 CloseHandle(fh);
             }
-            XLog("gate: CUDA passes %s", gateSem ? "spread (the stream waits on the gate)" : "NOT spread: could not import the gate fence");
+            XLog("gate: CUDA passes %s", pg->HasGateFence() ? "spread (the stream waits on the gate)" : "NOT spread: could not import the gate fence");
         }
         gQuit = false;
         // The relay. CUDA path: io.fence's progress, waited for on the CPU, into contentFence for the lane's GPU waits
         // (GateWait). D3D12 path: genFence's progress as the clock's done times (ClockAfter; the CUDA path stamps them with
         // host functions on the stream).
-        ID3D12Fence* src = d3dPath ? genFence : io.fence;
-        if (d3dPath && src)
+        ID3D12Fence* src = D3d() ? genFence : pg->DoneFence();
+        if (D3d() && src)
             stampsWork = true;
         relay = std::thread([this, src] {
             if (!src)
@@ -2476,7 +2410,7 @@ private:
                 }
                 if (done > sent)
                 {
-                    if (d3dPath)
+                    if (D3d())
                     {
                         const long long now = Now();
                         for (UINT64 v = std::max(sent + 1, done > kStamps ? done - kStamps + 1 : 1); v <= done; ++v)
@@ -2665,7 +2599,7 @@ private:
 
     void InitLaneCopyProfiling()
     {
-        if (!prof || !pq)
+        if (!gs.prof || !pq)
             return;
         D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>(2 * kAllocs) };
         D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
@@ -2692,7 +2626,7 @@ private:
             XLog("prof: could not initialize present-lane copy timestamps (0x%08x)", static_cast<unsigned>(hr));
             return;
         }
-        XLog("prof: present-lane copy timestamps enabled (copy work only; Prof=%u)", profDispatches ? 2 : 1);
+        XLog("prof: present-lane copy timestamps enabled (copy work only; Prof=%u)", gs.profDispatches ? 2 : 1);
     }
 
     void BeginLaneCopy(ID3D12GraphicsCommandList* g, uint64_t frame, uint32_t k, bool generated)
@@ -2779,15 +2713,16 @@ private:
     // frames without generated ones included, so prev's colour and depth are always the same frame's.
     void CopyToPrev(ID3D12GraphicsCommandList* g)
     {
-        for (auto [dst, src] : { std::pair<SharedBuf*, SharedBuf*> { &prev, &cur }, { &depthPrev, &depth } })
+        for (auto [dstSlot, srcSlot] : { std::pair<GenSlot, GenSlot> { GenSlot::Prev, GenSlot::Cur }, { GenSlot::DepthPrev, GenSlot::Depth } })
         {
-            if (!dst->res)
+            const GenBuf dst = pg->Buf(dstSlot), src = pg->Buf(srcSlot);
+            if (!dst.res)
                 continue;
-            Out(g, dst->res, D3D12_RESOURCE_STATE_COPY_DEST);
-            Out(g, src->res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g->CopyBufferRegion(dst->res, 0, src->res, 0, dst->bytes);
-            Back(g, src->res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Back(g, dst->res, D3D12_RESOURCE_STATE_COPY_DEST);
+            Out(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
+            Out(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            g->CopyBufferRegion(dst.res, 0, src.res, 0, dst.bytes);
+            Back(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Back(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
         }
     }
 
@@ -2796,20 +2731,19 @@ private:
     void HandOff(Frame& f, bool keepFrame)
     {
         // CUDA path: after its last pass, which read cur and prev
-        if (!d3dPath && f.nGen && !f.j.cut)
-            queue->Wait(io.fence, f.done[f.nGen - 1]);
+        if (!D3d() && f.nGen && !f.j.cut)
+            queue->Wait(pg->DoneFence(), f.done[f.nGen - 1]);
         ID3D12GraphicsCommandList* g = Begin();
         if (keepFrame)
         {
             Out(g, f.realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g->CopyBufferRegion(hold, 0, f.realSrc, 0, cur.bytes);
+            g->CopyBufferRegion(hold, 0, f.realSrc, 0, pg->Buf(GenSlot::Cur).bytes);
             Back(g, f.realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
             f.held = true;
         }
         CopyToPrev(g);
         End();
-        prevSwapped = curSwapped;
-        curSwapped = false;
+        pg->FrameHandedOff();
         hasPrev = true;
         prevJitter[0] = f.j.jitter[0];
         prevJitter[1] = f.j.jitter[1];
@@ -2862,7 +2796,7 @@ private:
     // device removal: debug layer id 907, DXGI_ERROR_ACCESS_DENIED).
     void PresentGen(const Job& j, ID3D12Resource* bb)
     {
-        const Resource& ox = pack->res[rOut];
+        const Resource& ox = pg->Output();
         // The previous frame's copies on the present queue read cur, keep and the ring, which this one writes.
         genQueue->Wait(hostFence, hostValue);
         genQueue->Wait(appFence, j.frame + 1);
@@ -2884,18 +2818,15 @@ private:
         }
         float mvs[2] = { j.mvs[0], j.mvs[1] };
         if (mvs[0] == 0 && mvs[1] == 0)
-            pack->MvScale(mvs[0], mvs[1]);
+            pg->MvScale(mvs[0], mvs[1]);
         UINT64 ready[kMaxInterp + 1] {};
         for (uint32_t k = 1; k <= nGen && !j.cut; ++k)
         {
-            if (!ring[k - 1] && !(ring[k - 1] = PlainBuffer(out.bytes, true)))
+            if (!ring[k - 1] && !(ring[k - 1] = PlainBuffer(pg->Buf(GenSlot::Output).bytes, true)))
                 break;
-            const float tInterp = static_cast<float>(k) / static_cast<float>(nGen + 1);
             const float jc[2] = { j.jitter[0], j.jitter[1] };
             const float jp[2] = { prevJitter[0], prevJitter[1] };
-            if (!noPatch)
-                SetJitter(jc, jp);
-            pack->SetPass(tInterp, k - 1, mvs[0], mvs[1]);
+            pg->PreparePass(k, nGen, jc, jp, mvs);
             ID3D12GraphicsCommandList* g = BeginGen();
             RecordPassInto(g, k, ring[k - 1]);
             ready[k - 1] = EndGen();
@@ -2949,7 +2880,7 @@ private:
     // here); the relay stamps genFence's progress as the clock's done times (StartGate).
     void PresentGenGated(const Job& j, ID3D12Resource* bb)
     {
-        const Resource& ox = pack->res[rOut];
+        const Resource& ox = pg->Output();
         const uint32_t set = static_cast<uint32_t>(j.frame & 1);
         genQueue->Wait(appFence, j.frame + 1);
         ID3D12Resource* realSrc;
@@ -2960,14 +2891,14 @@ private:
         }
         Consumed(j, genQueue);
         genQueue->Wait(pqFence, pqRead[set]);
-        if (!gateHeld[set] && !(gateHeld[set] = PlainBuffer(cur.bytes)))
+        if (!gateHeld[set] && !(gateHeld[set] = PlainBuffer(pg->Buf(GenSlot::Cur).bytes)))
             XLog("gate: no buffer for the frame's own picture - the present lane reads it in place");
         ID3D12Resource* frame = gateHeld[set] ? gateHeld[set] : realSrc;
         if (gateHeld[set])
         {
             ID3D12GraphicsCommandList* g = BeginGen();
             Out(g, realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g->CopyBufferRegion(gateHeld[set], 0, realSrc, 0, cur.bytes);
+            g->CopyBufferRegion(gateHeld[set], 0, realSrc, 0, pg->Buf(GenSlot::Cur).bytes);
             Back(g, realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
             EndGen();
         }
@@ -2983,7 +2914,7 @@ private:
         }
         float mvs[2] = { j.mvs[0], j.mvs[1] };
         if (mvs[0] == 0 && mvs[1] == 0)
-            pack->MvScale(mvs[0], mvs[1]);
+            pg->MvScale(mvs[0], mvs[1]);
         Frame f;
         f.j = j;
         f.valid = true;
@@ -3002,19 +2933,16 @@ private:
         const uint32_t spread = DisplayPaced(j) ? 0 : genSpread;
         for (uint32_t k = 1; k <= nGen && !j.cut; ++k)
         {
-            if (!ringG[set][k - 1] && !(ringG[set][k - 1] = PlainBuffer(out.bytes, true)))
+            if (!ringG[set][k - 1] && !(ringG[set][k - 1] = PlainBuffer(pg->Buf(GenSlot::Output).bytes, true)))
             {
                 nGen = k - 1;               // as many as have a buffer
                 break;
             }
             if (spread && k > 1 && gateBase + k > spread)
                 genQueue->Wait(gateFence, gateBase + k - spread);
-            const float tInterp = static_cast<float>(k) / static_cast<float>(nGen + 1);
             const float jc[2] = { j.jitter[0], j.jitter[1] };
             const float jp[2] = { prevJitter[0], prevJitter[1] };
-            if (!noPatch)
-                SetJitter(jc, jp);
-            pack->SetPass(tInterp, k - 1, mvs[0], mvs[1]);
+            pg->PreparePass(k, nGen, jc, jp, mvs);
             ID3D12GraphicsCommandList* g = BeginGen();
             RecordPassInto(g, k, ringG[set][k - 1]);
             f.done[k - 1] = EndGen();
@@ -3142,175 +3070,6 @@ private:
             ReleaseSemaphore(latencySem, 1, nullptr);
     }
 
-    void SetJitter(const float jc[2], const float jp[2])
-    {
-        pack->SetPatch("jitter_cur_x", jc[0]);
-        pack->SetPatch("jitter_cur_y", jc[1]);
-        pack->SetPatch("jitter_prev_x", jp[0]);
-        pack->SetPatch("jitter_prev_y", jp[1]);
-    }
-
-    // CUDA path: all nGen generated frames of an app frame on the stream at once, each copied into its own ring
-    // buffer (ringC) and handed over with the shared fence at its own value (done[k - 1]); our queue waits for
-    // each, GPU side, just before its copy. Pass k + 1 runs while frame k waits for its present time, so a late
-    // present no longer holds back the passes after it.
-    // B8G8R8A8: the inputs turned to R8G8B8A8 on the stream before the first pass (as CopyFrame does on D3D12), the
-    // output back after each. prev is cur of the last frame: turned already unless that frame ran no pass (the first
-    // frame, a reset or a camera cut), then it is turned here too.
-    void RunCuda(uint32_t nGen, const float jc[2], const float jp[2], const float mvs[2], uint32_t uiMode, const SharedBuf (&into)[kMaxInterp],
-                 UINT64 done[], UINT64 gateBase = 0, uint32_t spread = 0)
-    {
-        const UINT64 toCuda = ++fv;
-        std::array<UINT64, kMaxInterp> sig {};
-        std::array<CUdeviceptr, kMaxInterp> dst {};
-        for (uint32_t k = 0; k < nGen; ++k)
-        {
-            done[k] = sig[k] = ++fv;
-            dst[k] = into[k].ptr;
-        }
-        queue->Signal(io.fence, toCuda);
-        const float c0 = jc[0], c1 = jc[1], p0 = jp[0], p1 = jp[1], m0 = mvs[0], m1 = mvs[1];
-        const bool bgra = IsBgra(scDesc.Format), swapPrev = bgra && !prevSwapped;
-        if (bgra)
-            curSwapped = true;
-        Post([this, toCuda, sig, dst, nGen, c0, c1, p0, p1, m0, m1, bgra, swapPrev, uiMode, gateBase, spread] {
-            if (rUi >= 0)
-                pack->SetPatchBits("ui_mode", uiMode);   // the pack's constants are this thread's on the CUDA path
-            bool w = io.CudaWait(stream, toCuda);
-            if (bgra)
-            {
-                // prev as well when the presenter saw no pass last frame, or when last frame's swap of cur did not run
-                // (a failed handoff): this thread knows the latter, the presenter only the former.
-                const bool doPrev = swapPrev || !lastCurSwapped;
-                const bool curOk = w && pack->SwapRB(stream, rCur);
-                lastCurSwapped = curOk;
-                w = curOk && (!doPrev || pack->SwapRB(stream, rPrev)) && (uiMode < 2 || pack->SwapRB(stream, rBb)) &&
-                    ((uiMode != 2 && uiMode != 3 && uiMode != 5) || pack->SwapRB(stream, rUi));
-            }
-            if (prof && !evW)
-            {
-                io.cu.EventCreate(&evW, 0);
-                io.cu.EventCreate(&evH, 0);
-                for (CUevent& e : evT)
-                    io.cu.EventCreate(&e, 0);
-                for (CUevent& e : evG)
-                    io.cu.EventCreate(&e, 0);
-                for (CUevent& e : evS)
-                    io.cu.EventCreate(&e, 0);
-            }
-            const bool timed = prof && w;
-            if (timed)
-                io.cu.EventRecord(evW, stream);
-            if (!noPatch)
-            {
-                const float a[2] = { c0, c1 }, b[2] = { p0, p1 };
-                SetJitter(a, b);
-            }
-            uint32_t ran = 0;
-            for (uint32_t k = 1; k <= nGen; ++k)
-            {
-                if (spread && k > 1 && gateBase + k > spread)
-                {
-                    ExtSemWaitParams gp {};
-                    gp.params.fence.value = gateBase + k - spread;
-                    w = w && io.cu.WaitExternalSemaphoresAsync(&gateSem, &gp, 1, stream) == 0;
-                }
-                const float tInterp = static_cast<float>(k) / static_cast<float>(nGen + 1);
-                pack->SetPass(tInterp, k - 1, m0, m1);
-                // The head (input preparation) depends only on the app's frames: once per app frame; the tail per generated frame.
-                LARGE_INTEGER cq0, cq1, cqf;
-                QueryPerformanceCounter(&cq0);
-                w = w && (!pack->CanSplit() ? pack->Launch(stream) : (((k > 1 || pack->LaunchHead(stream)) && (!timed || k > 1 || io.cu.EventRecord(evH, stream) == 0)) && pack->LaunchTail(stream)));
-                QueryPerformanceCounter(&cq1);
-                QueryPerformanceFrequency(&cqf);
-                if (timed)
-                    cpuLaunch += static_cast<double>(cq1.QuadPart - cq0.QuadPart) * 1000.0 / static_cast<double>(cqf.QuadPart);
-                else if (!prof)
-                    pack->tSetParams = pack->tGraphLaunch = 0, pack->lastDirty = 0;     // no prof line reads them
-                if (timed && w)
-                    io.cu.EventRecord(evG[k - 1], stream);
-                w = w && (!bgra || pack->SwapRB(stream, rOut));
-                if (timed && w)
-                    io.cu.EventRecord(evS[k - 1], stream);
-                w = w && io.cu.MemcpyDtoDAsync(dst[k - 1], out.ptr, out.bytes, stream) == 0;
-                if (timed && w)
-                    io.cu.EventRecord(evT[k - 1], stream);
-                w = w && io.CudaSignal(stream, sig[k - 1]);
-                if (w && clockPacer)
-                {
-                    // When the stream got here: the generated frame's done time for the clock (ClockNeed).
-                    HostStamp& h = hostStamp[sig[k - 1] % kStamps];
-                    h.o = this;
-                    h.v = sig[k - 1];
-                    if (io.cu.LaunchHostFunc(stream, &Stamp, &h) == 0)
-                        stampsWork = true;
-                }
-                ran += w;
-            }
-            if (ran < nGen)
-            {
-                // Release the D3D queue's waits so the app does not hang: once the stream is idle and our queue has
-                // signalled toCuda (it may still wait for the app's frame; the stream need not have waited for it, after a
-                // failed wait or a sticky error), so that no signal still to come can set the fence back below them.
-                io.cu.StreamSynchronize(stream);
-                if (io.fence->GetCompletedValue() < toCuda)
-                {
-                    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                    if (ev && SUCCEEDED(io.fence->SetEventOnCompletion(toCuda, ev)))
-                        WaitForSingleObject(ev, 2000);
-                    if (ev)
-                        CloseHandle(ev);
-                }
-                const UINT64 doneBefore = io.fence->GetCompletedValue();
-                io.fence->Signal(sig[nGen - 1]);
-                if (++failLogged <= 12)
-                    XLog("present: handoff failure %u: pass %u of %u, signal %llu (toCuda %llu), fence was %llu, release thread waiting for %llu: %s",
-                         failLogged, ran + 1, nGen, sig[ran < nGen ? ran : nGen - 1], toCuda, doneBefore, gWaitingFor.load(), io.error.c_str());
-                ++handoffFails;
-                if (!cudaFailed.exchange(true))
-                    XLog("present: CUDA handoff failed (pass %u of %u, toCuda=%llu, fence=%llu): %s %s", ran + 1, nGen, toCuda,
-                         io.fence->GetCompletedValue(), io.error.c_str(), pack->error.c_str());
-            }
-            if (timed && ran)
-            {
-                // GPU time of the head and each tail as the stream saw it (includes any time the GPU spent on the game).
-                io.cu.EventSynchronize(evT[ran - 1]);
-                const bool split = pack->CanSplit();
-                float a = 0;
-                if (split)
-                {
-                    io.cu.EventElapsedTime(&a, evW, evH);
-                    gpuHead += a;
-                    ++nHead;
-                }
-                for (uint32_t k = 0; k < ran; ++k)
-                {
-                    float b = 0;
-                    io.cu.EventElapsedTime(&b, k ? evT[k - 1] : split ? evH : evW, evT[k]);
-                    gpuTail += b;
-                    float g = 0, s = 0, c = 0;
-                    io.cu.EventElapsedTime(&g, k ? evT[k - 1] : split ? evH : evW, evG[k]);
-                    io.cu.EventElapsedTime(&s, evG[k], evS[k]);
-                    io.cu.EventElapsedTime(&c, evS[k], evT[k]);
-                    gpuGraph += g, gpuSwap += s, gpuCopy += c;
-                    ++nTail;
-                }
-                // after the whole run, so the window's launch times and its tails are the same runs'
-                if (nTail >= 240)
-                {
-                    XLog("prof: GPU per run, head %.2f ms (x%u), tail %.2f ms (x%u) [graph %.2f, swap %.2f, copy %.2f], CPU launch %.2f ms per pass (SetParams %.2f, GraphLaunch %.2f, %u nodes set per run)",
-                         nHead ? gpuHead / nHead : 0.0, nHead, gpuTail / nTail, nTail, gpuGraph / nTail, gpuSwap / nTail, gpuCopy / nTail,
-                         cpuLaunch / nTail, pack->tSetParams / (nTail + nHead), pack->tGraphLaunch / (nTail + nHead),
-                         pack->lastDirty / (nTail + nHead));
-                    pack->tSetParams = pack->tGraphLaunch = 0, pack->lastDirty = 0;
-                    gpuGraph = gpuSwap = gpuCopy = cpuLaunch = 0;
-                    gpuHead = gpuTail = 0;
-                    nHead = nTail = 0;
-                }
-            }
-        });
-    }
-
     // Debug (XEFG_CUDA_DUMP): the first generated frame, tightly packed, to compare with a pack's expectation.
     // XEFG_CUDA_DUMP_FRAME=N: the first generated frame of app frame N instead (a fixed frame to compare runs by).
     void DumpOnce(const Job& j, uint32_t k)
@@ -3320,26 +3079,16 @@ private:
         dumped = true;
         std::vector<uint8_t> px;
         WaitIdle();
-        auto download = [&](int r, std::vector<uint8_t>& v) {
-            if (d3dPath)
-                return dpack->Download(r, v);
-            Scope s(*this);
-            return pack->Download(r, v);
-        };
-        // the CUDA path's generated frame k is in its ring buffer (the pack's output holds the last pass)
-        const bool ok = d3dPath ? download(rOut, px) : [&] {
-            Scope s(*this);
-            return pack->Download(rOut, px, ringC[j.frame & 1][k - 1].ptr);
-        }();
+        const bool ok = pg->DownloadOutput(px, static_cast<uint32_t>(j.frame & 1), k);
         // and this frame's inputs next to it (<dump>.frame_cur.bin ...), for pack_run --inputs
-        for (const auto& [role, r] : { std::pair<const char*, int> { "frame_cur", rCur }, { "frame_prev", rPrev }, { "motion", rMv }, { "depth", rDepth },
-                                       { "depth_prev", rDepthPrev } })
+        for (const auto& [role, slot] : { std::pair<const char*, GenSlot> { "frame_cur", GenSlot::Cur }, { "frame_prev", GenSlot::Prev },
+                                          { "motion", GenSlot::Motion }, { "depth", GenSlot::Depth }, { "depth_prev", GenSlot::DepthPrev } })
         {
-            if (r < 0)
+            if (!pg->HasSlot(slot))
                 continue;
             std::vector<uint8_t> v;
             FILE* fi = nullptr;
-            if (download(r, v) && !fopen_s(&fi, (dumpPath + "." + role + ".bin").c_str(), "wb") && fi)
+            if (pg->DownloadInput(slot, v) && !fopen_s(&fi, (dumpPath + "." + role + ".bin").c_str(), "wb") && fi)
             {
                 fwrite(v.data(), 1, v.size(), fi);
                 fclose(fi);
@@ -3414,7 +3163,7 @@ private:
              "waiting for the presenter %.3f); presents every %.2f ms (sd %.2f, max %.2f; target %.2f), waited for our GPU work %.2f ms "
              "per present, %u frames started behind, %u taken early, schedule lag %.1f ms, %u CUDA handoff failures (avg of 120)",
              iv, 1000.0 / iv, readyInterval, j.sync, nGen, statAppCall / 120, statAppWait / 120, statGaps ? statGap / statGaps : 0.0, sd,
-             statGapMax, readyInterval / (nGen + 1), statGaps ? statGpuWait / statGaps : 0.0, statLate, statEarly, paceLag, handoffFails.exchange(0));
+             statGapMax, readyInterval / (nGen + 1), statGaps ? statGpuWait / statGaps : 0.0, statLate, statEarly, paceLag, pg->TakeHandoffFails());
         XLog("stats: ready stamp %.1f ms old when the presenter took the frame, presenter %.2f app frames behind, first generated "
              "frame %.1f ms after its target; from the app's Present call: taken %.1f ms, ready stamp %.1f ms (avg of 120)",
              statJobs ? statStampAge / statJobs : 0.0, statJobs ? statBehind / statJobs : 0.0, statFirstN ? statFirstLate / statFirstN : 0.0,
@@ -3446,90 +3195,32 @@ private:
 
     // ---- build ---------------------------------------------------------------------------------------
 
+    // The generator's build: the host's part of it runs at the points the generator names (GenBuild).
+    GenBuild BuildArgs()
+    {
+        GenBuild b;
+        b.initFlags = initFlags;
+        b.hdr = IsHdr10(scDesc.Format);
+        b.releaseHostBuffers = [this] { ReleaseForBuild(); };
+        b.packBuilt = [this] { return PackBuilt(); };
+        return b;
+    }
+
     bool Build()
     {
         char env[MAX_PATH];
-        noPatch = GetEnvironmentVariableA("XEFG_CUDA_NOPATCH", env, sizeof(env)) != 0;
-        if (GetEnvironmentVariableA("XEFG_CUDA_PROF", env, sizeof(env)) && env[0] == '0')
-            prof = false;
         if (GetEnvironmentVariableA("XEFG_CUDA_DUMP", env, sizeof(env)))
             dumpPath = env;
         if (GetEnvironmentVariableA("XEFG_CUDA_DUMP_FRAME", env, sizeof(env)))
             dumpFrame = atoi(env);
         if (GetEnvironmentVariableA("XEFG_CUDA_DUMP_SHOWN", env, sizeof(env)))
             shownPath = env;
-        if (!io.Init(dev))
-            return Fail("interop: " + io.error);
-        io.cu.CtxPopCurrent(nullptr);         // Init left the context current on this thread
-        if (d3dPath && !nv.Load())
-        {
-            XLog("build: NVAPI has no D3D12 cubin shaders here - using the CUDA path");
-            d3dPath = false;
-        }
-        if (d3dPath)
-        {
-            // Our own queue for the build's uploads: the application's one may not be known yet.
-            D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_DIRECT };
-            if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&setupQueue))))
-                d3dPath = false;
-        }
-        bool ok;
-        {
-            Scope cuda(*this);
-            ok = BuildPack(nullptr);
-            if (!ok && d3dPath)
-            {
-                XLog("build: the D3D12 path failed - using the CUDA path");
-                d3dPath = false;
-                ok = BuildPack(nullptr);
-            }
-            if (ok && !d3dPath)
-                io.cu.StreamCreate(&stream, 1);
-        }
-        if (ok && d3dPath)
-        {
-            // The kernels are compiled and cached for rebuilds at other sizes: nothing at run time needs CUDA.
-            io.Release();
-            XLog("build: running in our own command lists (D3D12 + NVAPI cubins); CUDA context released");
-        }
-        return ok;
+        return generator->Build(BuildArgs());
     }
 
-    // Loads the pack for `want` (a "pack 2" at any size; null: its captured size), creates the shared
-    // buffers, the staging sets and builds the graph. Replaces any pack built before, so nothing may still be
-    // using it (DrainPresenter, WaitIdle, WaitApp). Needs the CUDA context current.
-    // The pack's buffers: the CUDA path's shared ones are ours (CUDA context current), the D3D12 runner's go with it.
-    void ReleaseShared()
+    // The old pack is gone: what was sized by it goes too (the generator's Build / Rebuild call this).
+    void ReleaseForBuild()
     {
-        for (SharedBuf* b : { &cur, &prev, &mv, &depth, &depthPrev, &out, &uic, &bbc })
-            if (b->mem)
-                io.Destroy(*b);
-            else
-                *b = SharedBuf();
-        for (auto& set : ringC)
-            for (SharedBuf& b : set)
-                io.Destroy(b);
-    }
-    // CUDA path: ring buffers for nGen generated frames, the output's size; false (logged once) if one cannot be made.
-    bool EnsureRingC(uint32_t set, uint32_t nGen)
-    {
-        for (uint32_t k = 0; k < nGen; ++k)
-            if (!ringC[set][k].ptr && !io.CreateBuffer(out.bytes, ringC[set][k]))
-            {
-                io.Destroy(ringC[set][k]);
-                if (!warnedRing)
-                    XLog("present: no buffer for generated frame %u (%s) - presenting the app's frames only", k + 1, io.error.c_str());
-                warnedRing = true;
-                return false;
-            }
-        return true;
-    }
-
-    bool BuildPack(const Sizes* want)
-    {
-        dpack.reset();
-        pack.reset();
-        ReleaseShared();
         if (keep)
             keep->Release();
         if (hold)
@@ -3543,118 +3234,25 @@ private:
         }
         ReleaseStaging();
         ReleaseRing();
-        // Prof=2's per-dispatch stamps are laid out by the old pack's dispatch count (RecordPass makes them anew)
-        if (dispHeap)
-            dispHeap->Release();
-        if (dispRb)
-            dispRb->Release();
-        dispHeap = nullptr;
-        dispRb = nullptr;
-        dispMs.clear();
-        std::fill(std::begin(stamped), std::end(stamped), false);
         hasPrev = lastUsable = false;
-        pack = std::make_unique<Pack>(io.cu);
-        // Kernels newer than this GPU run their fallback (an RTX 20: our own kernels at sm_75). XEFG_CUDA_SM=NN pretends
-        // another GPU (testing).
-        {
-            char sm[16];
-            pack->deviceSm = GetEnvironmentVariableA("XEFG_CUDA_SM", sm, sizeof(sm)) ? atoi(sm) : io.sm;
-        }
-        // The init flags pick the pack's module variants (inverted depth, NDC / jittered motion vectors, UI
-        // texture premultiplied); the sizes pick high- or low-res motion vectors inside Load.
-        Variant var;
-        var.inv = (initFlags & XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH) != 0;
-        var.ndc = (initFlags & XEFG_SWAPCHAIN_INIT_FLAG_USE_NDC_VELOCITY) != 0;
-        var.jit = (initFlags & XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV) != 0;
-        var.premul = (initFlags & XEFG_SWAPCHAIN_INIT_FLAG_UITEXTURE_NOT_PREMUL_ALPHA) == 0;
-        // An HDR10 back buffer takes the pack's hdr\ part (its own frame formats and modules).
-        var.hdr = IsHdr10(scDesc.Format);
-        if (!pack->Load(var.hdr ? packDir + "\\hdr" : packDir, want, var))
-            return Fail(std::string("pack") + (var.hdr ? " (HDR10 part)" : "") + ": " + pack->error);
-        if (pack->fellBack)
-            XLog("build: this GPU is sm_%d - %d kernels run their fallback (their sm_75 version)", pack->deviceSm, pack->fellBack);
-        packHdr = var.hdr;
-        // A variant this run has not compiled yet (a resize to render = output size) needs CUDA again for a
-        // moment, after the first build released it.
-        bool tempCuda = false;
-        if (d3dPath && !io.ctx)
-            for (const Kernel& k : pack->kernels)
-                if (!cubins.count(k.file))
-                {
-                    if (!io.Init(dev))
-                        return Fail("interop (compiling a variant): " + io.error);
-                    tempCuda = true;
-                    break;
-                }
-        rCur = pack->Role("frame_cur");
-        rPrev = pack->Role("frame_prev");
-        rMv = pack->Role("motion");
-        rDepth = pack->Role("depth");
-        rOut = pack->Role("output");
-        rUi = pack->Role("ui");                 // the UI composition inputs, optional (tools/pack_ui.py)
-        rBb = pack->Role("backbuffer");
-        if (rUi < 0 || rBb < 0)
-            rUi = rBb = -1;
-        rDepthPrev = pack->Role("depth_prev");    // the previous app frame's depth, optional (the multi-frame model)
-        if (rCur < 0 || rPrev < 0 || rMv < 0 || rDepth < 0 || rOut < 0)
-            return Fail("pack lacks a frame_cur/frame_prev/motion/depth/output role");
-        if (rDepthPrev >= 0 && pack->res[rDepthPrev].bytes != pack->res[rDepth].bytes)
-            return Fail("pack's depth_prev and depth differ in size");
-        std::vector<std::pair<SharedBuf*, int>> map = { { &cur, rCur }, { &prev, rPrev }, { &mv, rMv }, { &depth, rDepth }, { &out, rOut } };
-        if (rDepthPrev >= 0)
-            map.push_back({ &depthPrev, rDepthPrev });
-        if (rUi >= 0)
-            map.insert(map.end(), { { &uic, rUi }, { &bbc, rBb } });
-        splitAt = pack->FindSplit();
-        if (d3dPath)
-        {
-            dpack = std::make_unique<D3DPack>(*pack, io.cu, nv);
-            dpack->cubins = &cubins;
-            dpack->packNatives = native;
-            const bool built3d = dpack->Build(dev, setupQueue, false);
-            if (tempCuda)
-            {
-                io.cu.CtxPopCurrent(nullptr);         // Init left the context current on this thread
-                io.Release();
-            }
-            if (!built3d)
-            {
-                const std::string e = dpack->error;
-                dpack.reset();
-                return Fail("pack build (D3D12): " + e);
-            }
-            for (const auto& [b, r] : map)
-            {
-                b->res = dpack->Buffer(r);
-                b->bytes = pack->res[r].bytes;
-            }
-        }
-        else
-        {
-            for (const auto& [b, r] : map)
-            {
-                if (!io.CreateBuffer(pack->res[r].bytes, *b))
-                    return Fail(pack->res[r].id + ": " + io.error);
-                pack->SetExternal(r, b->ptr);
-            }
-            if (!pack->Build(false))
-                return Fail("pack build: " + pack->error);
-        }
+    }
+
+    // The new pack is built: the staging sets the application's tags land in, sized by its buffers.
+    bool PackBuilt()
+    {
         for (int s = 0; s < 2; ++s)
         {
-            stMv[s] = PlainBuffer(mv.bytes, true);       // UAV: ConvertIn writes them
-            stDepth[s] = PlainBuffer(depth.bytes, true);
+            stMv[s] = PlainBuffer(pg->Buf(GenSlot::Motion).bytes, true);       // UAV: ConvertIn writes them
+            stDepth[s] = PlainBuffer(pg->Buf(GenSlot::Depth).bytes, true);
             if (!stMv[s] || !stDepth[s])
                 return Fail("staging buffers");
         }
-        std::string mods;
-        for (const Kernel& k : pack->kernels)
-            if (k.file.rfind("v_", 0) == 0)
-                mods += " " + k.module;
+        const std::string mods = pg->VariantModules();
+        const Sizes& z = pg->PackSize();
         XLog("built: pack %s%s, %zu dispatches, output %ux%u, render %ux%u (%s), flags 0x%x, UI mode %d composition %d%s, variant "
-             "modules:%s", packDir.c_str(), packHdr ? "\\hdr" : "", pack->disp.size(), pack->size.OW, pack->size.OH, pack->size.RW,
-             pack->size.RH, d3dPath ? "D3D12" : "CUDA", initFlags, static_cast<int>(initParams.uiMode), uiComposition.load() ? 1 : 0,
-             rUi < 0 ? " (pack without UI inputs)" : "", mods.empty() ? " none" : mods.c_str());
+             "modules:%s", packDir.c_str(), pg->PackHdr() ? "\\hdr" : "", pg->DispatchCount(), z.OW, z.OH, z.RW, z.RH,
+             D3d() ? "D3D12" : "CUDA", initFlags, static_cast<int>(initParams.uiMode), uiComposition.load() ? 1 : 0,
+             !pg->HasUiInputs() ? " (pack without UI inputs)" : "", mods.empty() ? " none" : mods.c_str());
         return true;
     }
 
@@ -3764,7 +3362,7 @@ private:
     // Waits until our queue has finished everything (and the CUDA worker everything posted).
     void WaitIdle()
     {
-        Drain();
+        generator->Drain();
         if (pq && pqFence)
         {
             GateFlush();
@@ -3811,7 +3409,7 @@ private:
     // depth region. Called on the first tag of a frame, before anything of that frame touches the buffers.
     void FollowSizes(const xefg_swapchain_d3d12_resource_data_t& rd)
     {
-        if (!pack || pack->version < 2)
+        if (!pg->HasPack() || pg->PackVersion() < 2)
             return;
         if (rd.type == XEFG_SWAPCHAIN_RES_MOTION_VECTOR || rd.type == XEFG_SWAPCHAIN_RES_DEPTH)
         {
@@ -3826,7 +3424,7 @@ private:
                             area[1] + static_cast<uint64_t>(area[3]) <= scDesc.Height;
         const Sizes want { scDesc.Width, scDesc.Height, renderSize[0], renderSize[1], inside ? area[0] : 0, inside ? area[1] : 0,
                            inside ? area[2] : 0, inside ? area[3] : 0 };
-        if ((want == pack->size && IsHdr10(scDesc.Format) == packHdr) || (want == failedSize && resizeFailed))
+        if ((want == pg->PackSize() && IsHdr10(scDesc.Format) == pg->PackHdr()) || (want == failedSize && resizeFailed))
             return;
         // As Intel, a tag never waits: the pack is set aside here and rebuilt on the presenter thread (Resize), the
         // frames passing through until then. Rebuilding in the tag call held the game's render thread ~190 ms in its
@@ -3847,11 +3445,7 @@ private:
         const Sizes want = resizeWant;
         const long long t0 = Now();
         WaitIdle();
-        bool ok;
-        {
-            Scope cuda(*this);
-            ok = BuildPack(&want);
-        }
+        const bool ok = generator->Rebuild(want, BuildArgs());
         resizeFailed = !ok;
         failedSize = want;
         resizePending = false;
@@ -3881,7 +3475,7 @@ private:
             warnedUi = true;
             return 0;
         }
-        if (m >= 2 && (rUi < 0 || rBb < 0))
+        if (m >= 2 && !pg->HasUiInputs())
         {
             if (!warnedUi)
                 XLog("present: UI mode %u, but the pack lacks the UI inputs (tools/pack_ui.py) - interpolating everything", m);
@@ -3896,33 +3490,33 @@ private:
     // (t9) for modes 2-5. Returns what to present as the application's own frame.
     ID3D12Resource* CopyFrame(ID3D12GraphicsCommandList* g, const Job& j, ID3D12Resource* bb)
     {
-        const Resource& ox = pack->res[rOut];
-        ID3D12Resource* realSrc = cur.res;
+        const Resource& ox = pg->Output();
+        ID3D12Resource* realSrc = pg->Buf(GenSlot::Cur).res;
         ConvertIn(g, j);
-        Out(g, mv.res, D3D12_RESOURCE_STATE_COPY_DEST);
-        Out(g, depth.res, D3D12_RESOURCE_STATE_COPY_DEST);
-        g->CopyBufferRegion(mv.res, 0, stMv[j.set], 0, mv.bytes);
-        g->CopyBufferRegion(depth.res, 0, stDepth[j.set], 0, depth.bytes);
-        Back(g, depth.res, D3D12_RESOURCE_STATE_COPY_DEST);
-        Back(g, mv.res, D3D12_RESOURCE_STATE_COPY_DEST);
+        Out(g, pg->Buf(GenSlot::Motion).res, D3D12_RESOURCE_STATE_COPY_DEST);
+        Out(g, pg->Buf(GenSlot::Depth).res, D3D12_RESOURCE_STATE_COPY_DEST);
+        g->CopyBufferRegion(pg->Buf(GenSlot::Motion).res, 0, stMv[j.set], 0, pg->Buf(GenSlot::Motion).bytes);
+        g->CopyBufferRegion(pg->Buf(GenSlot::Depth).res, 0, stDepth[j.set], 0, pg->Buf(GenSlot::Depth).bytes);
+        Back(g, pg->Buf(GenSlot::Depth).res, D3D12_RESOURCE_STATE_COPY_DEST);
+        Back(g, pg->Buf(GenSlot::Motion).res, D3D12_RESOURCE_STATE_COPY_DEST);
         Barrier(g, bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Out(g, cur.res, D3D12_RESOURCE_STATE_COPY_DEST);
+        Out(g, pg->Buf(GenSlot::Cur).res, D3D12_RESOURCE_STATE_COPY_DEST);
         const bool bgra = IsBgra(scDesc.Format);
         if (j.hudless)
-            g->CopyBufferRegion(cur.res, 0, stHud[j.set], 0, cur.bytes);
+            g->CopyBufferRegion(pg->Buf(GenSlot::Cur).res, 0, stHud[j.set], 0, pg->Buf(GenSlot::Cur).bytes);
         else
-            Copy(g, cur.res, bb, ox);
-        Back(g, cur.res, D3D12_RESOURCE_STATE_COPY_DEST);
+            Copy(g, pg->Buf(GenSlot::Cur).res, bb, ox);
+        Back(g, pg->Buf(GenSlot::Cur).res, D3D12_RESOURCE_STATE_COPY_DEST);
         if (j.uiMode >= 2)
         {
-            Out(g, bbc.res, D3D12_RESOURCE_STATE_COPY_DEST);
-            Copy(g, bbc.res, bb, ox);
-            Back(g, bbc.res, D3D12_RESOURCE_STATE_COPY_DEST);
+            Out(g, pg->Buf(GenSlot::BackBuffer).res, D3D12_RESOURCE_STATE_COPY_DEST);
+            Copy(g, pg->Buf(GenSlot::BackBuffer).res, bb, ox);
+            Back(g, pg->Buf(GenSlot::BackBuffer).res, D3D12_RESOURCE_STATE_COPY_DEST);
             if (j.uiMode != 4)
             {
-                Out(g, uic.res, D3D12_RESOURCE_STATE_COPY_DEST);
-                g->CopyBufferRegion(uic.res, 0, stUi[j.set], 0, uic.bytes);
-                Back(g, uic.res, D3D12_RESOURCE_STATE_COPY_DEST);
+                Out(g, pg->Buf(GenSlot::Ui).res, D3D12_RESOURCE_STATE_COPY_DEST);
+                g->CopyBufferRegion(pg->Buf(GenSlot::Ui).res, 0, stUi[j.set], 0, pg->Buf(GenSlot::Ui).bytes);
+                Back(g, pg->Buf(GenSlot::Ui).res, D3D12_RESOURCE_STATE_COPY_DEST);
             }
         }
         // The app's frame as it is, for its own present: cur unless cur took the HUD-less colour or is turned
@@ -3932,24 +3526,17 @@ private:
         if (bgra || j.hudless || lb)
         {
             if (j.hudless && !bgra && !lb)
-                realSrc = bbc.res;
+                realSrc = pg->Buf(GenSlot::BackBuffer).res;
             else
             {
                 Copy(g, keepRes(), bb, ox);
                 realSrc = keepRes();
             }
         }
-        if (bgra && dpack)          // the CUDA path turns them on its stream (RunCuda)
-        {
-            dpack->SwapRB(g, rCur);
-            if (j.uiMode >= 2)
-                dpack->SwapRB(g, rBb);
-            if (j.uiMode == 2 || j.uiMode == 3 || j.uiMode == 5)
-                dpack->SwapRB(g, rUi);
-        }
+        if (bgra)                   // the CUDA path turns them on its stream (Launch)
+            pg->SwapInputsBgra(g, j.uiMode);
         Barrier(g, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
-        if (rUi >= 0 && dpack)      // the CUDA path sets it on its own thread (RunCuda)
-            pack->SetPatchBits("ui_mode", j.uiMode);
+        pg->SetUiMode(j.uiMode);   // the CUDA path sets it on its own thread (Launch)
         return realSrc;
     }
 
@@ -3981,8 +3568,10 @@ private:
 
     bool Letterboxed() const
     {
-        return pack && pack->size.AW && pack->size.AH && pack->size.AX + static_cast<uint64_t>(pack->size.AW) <= pack->size.OW &&
-               pack->size.AY + static_cast<uint64_t>(pack->size.AH) <= pack->size.OH;
+        if (!pg->HasPack())
+            return false;
+        const Sizes& z = pg->PackSize();
+        return z.AW && z.AH && z.AX + static_cast<uint64_t>(z.AW) <= z.OW && z.AY + static_cast<uint64_t>(z.AH) <= z.OH;
     }
 
     // A generated frame (src, pack layout) into the swap chain buffer rb. Letterboxed, Intel's output outside
@@ -3996,7 +3585,7 @@ private:
             return;
         }
         Copy(g, rb, frame, ox, true);
-        const Sizes& z = pack->size;
+        const Sizes& z = pg->PackSize();
         D3D12_TEXTURE_COPY_LOCATION d { rb, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, s { src, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
         d.SubresourceIndex = 0;
         s.PlacedFootprint.Footprint = { scDesc.Format, ox.w, ox.h, 1, static_cast<UINT>(ox.pitch) };
@@ -4008,7 +3597,7 @@ private:
     ID3D12Resource* keepRes()
     {
         if (!keep)
-            keep = PlainBuffer(cur.bytes);
+            keep = PlainBuffer(pg->Buf(GenSlot::Cur).bytes);
         return keep;
     }
 
@@ -4036,15 +3625,7 @@ private:
     }
     static void Barrier(ID3D12GraphicsCommandList* g, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
     {
-        if (a == b)
-            return;
-        D3D12_RESOURCE_BARRIER br {};
-        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        br.Transition.pResource = r;
-        br.Transition.StateBefore = a;
-        br.Transition.StateAfter = b;
-        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g->ResourceBarrier(1, &br);
+        GenBarrier(g, r, a, b);
     }
 
     // XEFG_SWAPCHAIN_DEBUG_FEATURE_TAG_INTERPOLATED_FRAMES: a magenta quad in each corner of a generated frame.
@@ -4241,204 +3822,34 @@ private:
         }
     }
 
-    // D3D12 path: the pack's buffers rest in UNORDERED_ACCESS (xefg_pack_d3d.h), so a copy takes one out of it
+    // D3D12 path: the generator's buffers rest in UNORDERED_ACCESS (xefg_pack_d3d.h), so a copy takes one out of it
     // and back. The CUDA path's shared buffers rest in COMMON and are promoted implicitly: nothing to do.
-    bool PackBuf(ID3D12Resource* r) const
-    {
-        return d3dPath && r && (r == cur.res || r == prev.res || r == mv.res || r == depth.res || r == depthPrev.res || r == out.res || r == uic.res ||
-                                r == bbc.res);
-    }
-    void Out(ID3D12GraphicsCommandList* g, ID3D12Resource* r, D3D12_RESOURCE_STATES s)
-    {
-        if (PackBuf(r))
-            Barrier(g, r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, s);
-    }
-    void Back(ID3D12GraphicsCommandList* g, ID3D12Resource* r, D3D12_RESOURCE_STATES s)
-    {
-        if (PackBuf(r))
-            Barrier(g, r, s, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
+    void Out(ID3D12GraphicsCommandList* g, ID3D12Resource* r, D3D12_RESOURCE_STATES s) { pg->Out(g, r, s); }
+    void Back(ID3D12GraphicsCommandList* g, ID3D12Resource* r, D3D12_RESOURCE_STATES s) { pg->Back(g, r, s); }
 
-    // D3D12 path: one generated frame recorded on g, with this pass's constants. The head (input preparation)
-    // only on the first pass of an app frame, as on the CUDA path. GPU time by timestamps (prof) in stamp slot
-    // `slot`: the present lane's allocator index, or kAllocs + the generation lane's.
-    // A pass on the generation lane whose frame ends up in `dst` (a UAV-capable plain buffer, COMMON between lists): the
-    // blend writes it there itself (D3DPack::Redirect), which saves copying the 2560x1440 output into it every generated
-    // frame. With a dump pending the output stays in the pack's buffer (DumpOnce reads it) and is copied.
-    void RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst)
-    {
-        static bool warned = false;
-        if (!warned && dumpPath.empty() && !(dst->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-        {
-            XLog("present: ring buffer without UAV access - copying the output into it");
-            warned = true;
-        }
-        if (dumpPath.empty() && (dst->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && dpack->Redirect(rOut, dst))
-        {
-            Barrier(g, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            RecordPass(g, k, kAllocs + genCur);
-            dpack->Redirect(rOut, nullptr);
-            Barrier(g, dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-            return;
-        }
-        RecordPass(g, k, kAllocs + genCur);
-        Out(g, out.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        g->CopyBufferRegion(dst, 0, out.res, 0, out.bytes);
-        Back(g, out.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    }
-
+    // D3D12 path: one generated frame recorded on g by the generator (generators/own.h), with this pass's constants. GPU time
+    // by timestamps (Prof) in stamp slot `slot`: the present lane's allocator index, or kAllocs + the generation lane's;
+    // the queue g runs on says the timestamp frequency.
+    ID3D12CommandQueue* TsQueue(size_t slot) const { return slot >= kAllocs && genQueue ? genQueue : queue; }
     bool RecordPass(ID3D12GraphicsCommandList* g, uint32_t k, size_t slot)
     {
-        const size_t n = pack->disp.size();
-        const bool split = splitAt > 0 && splitAt < n;
-        const size_t from = split && k > 1 ? splitAt : 0;
-        if (prof && !stampHeap)
-        {
-            D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>(3 * kSlots) };
-            D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
-            D3D12_RESOURCE_DESC rd {};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = 24 * kSlots;
-            rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&stampHeap))) ||
-                FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&stampRb))))
-                prof = false;
-            (slot >= kAllocs && genQueue ? genQueue : queue)->GetTimestampFrequency(&tsFreq);
-        }
-        // Prof=2: also a timestamp after every dispatch (each then alone behind a UAV barrier), summed per dispatch
-        // as XeFGPsoCap sums Intel's - the like-for-like figure for MFG Unlocker's runs.
-        if (prof && profDispatches && !dispHeap)
-        {
-            D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>((n + 1) * kSlots) };
-            D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
-            D3D12_RESOURCE_DESC rd {};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = 8 * (n + 1) * kSlots;
-            rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&dispHeap))) ||
-                FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&dispRb))))
-                profDispatches = false;
-            dispMs.assign(n, 0.0);
-        }
-        ID3D12QueryHeap* ds = prof && profDispatches ? dispHeap : nullptr;
-        const UINT d0 = static_cast<UINT>((n + 1) * slot);
-        const UINT q0 = static_cast<UINT>(3 * slot);
-        if (prof)
-            g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0);
-        bool ok = dpack->Record(g, from, split && from == 0 ? splitAt : from, ds, d0);
-        if (prof)
-            g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 1);
-        ok = ok && dpack->Record(g, split && from == 0 ? splitAt : from, n, ds, d0);
-        if (prof)
-        {
-            g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 2);
-            g->ResolveQueryData(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0, 3, stampRb, 24 * slot);
-            if (ds)
-                g->ResolveQueryData(dispHeap, D3D12_QUERY_TYPE_TIMESTAMP, d0 + static_cast<UINT>(from), static_cast<UINT>(n - from + 1),
-                                    dispRb, 8 * (d0 + from));
-            stamped[slot] = true;
-            stampedHead[slot] = split && from == 0;
-            stampedFrom[slot] = from;
-        }
-        if (ok && IsBgra(scDesc.Format))
-            dpack->SwapRB(g, rOut);        // the generated frame back into the B8G8R8A8 byte order
-        if (!ok && !cudaFailed.exchange(true))
-            XLog("present: recording the pack failed: %s", dpack->error.c_str());
-        return ok;
+        return pg->RecordPass(g, k, slot, TsQueue(slot), IsBgra(scDesc.Format));
+    }
+    // A pass on the generation lane whose frame ends up in `dst` (a UAV-capable plain buffer, COMMON between lists). With a dump
+    // pending the output stays in the pack's buffer (DumpOnce reads it) and is copied.
+    void RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst)
+    {
+        const size_t slot = kAllocs + genCur;
+        pg->RecordPassInto(g, k, dst, slot, TsQueue(slot), IsBgra(scDesc.Format), !dumpPath.empty());
     }
     // The GPU time of a pass recorded with allocator i, once its list has finished (Begin waited for it).
-    void ReadStamps(size_t i)
-    {
-        if (!stamped[i])
-            return;
-        stamped[i] = false;
-        const D3D12_RANGE r { 24 * i, 24 * i + 24 }, none { 0, 0 };
-        UINT64* v = nullptr;
-        if (FAILED(stampRb->Map(0, &r, reinterpret_cast<void**>(&v))))
-            return;
-        const UINT64* s = reinterpret_cast<const UINT64*>(reinterpret_cast<const uint8_t*>(v) + 24 * i);
-        const double head = double(s[1] - s[0]) * 1000.0 / double(tsFreq), tail = double(s[2] - s[1]) * 1000.0 / double(tsFreq);
-        stampRb->Unmap(0, &none);
-        const size_t n = dispMs.size();
-        if (profDispatches && dispRb && n)
-        {
-            const size_t b0 = (n + 1) * i, from = stampedFrom[i];
-            const D3D12_RANGE dr { 8 * (b0 + from), 8 * (b0 + n + 1) };
-            UINT64* dv = nullptr;
-            if (SUCCEEDED(dispRb->Map(0, &dr, reinterpret_cast<void**>(&dv))))
-            {
-                const UINT64* t = reinterpret_cast<const UINT64*>(reinterpret_cast<const uint8_t*>(dv) + 8 * b0);
-                for (size_t k = from; k < n; ++k)
-                    dispMs[k] += double(t[k + 1] - t[k]) * 1000.0 / double(tsFreq);
-                dispRb->Unmap(0, &none);
-                if (from == 0)
-                    ++dispApp;
-            }
-        }
-        if (stampedHead[i])
-        {
-            gpuHead += head;
-            ++nHead;
-        }
-        gpuTail += tail;
-        if (++nTail % 240 == 0)
-        {
-            XLog("prof: GPU per run, head %.2f ms (x%u), tail %.2f ms (x%u) [d3d12]", nHead ? gpuHead / nHead : 0.0, nHead, gpuTail / nTail, nTail);
-            if (profDispatches && dispApp)
-            {
-                // Sums of each dispatch's own time (XeFGPsoCap's measure): per app frame, the head's, a tail's.
-                double all = 0, hd = 0;
-                for (size_t k = 0; k < n; ++k)
-                {
-                    all += dispMs[k];
-                    if (k < splitAt)
-                        hd += dispMs[k];
-                }
-                XLog("prof: dispatch sums %.3f ms per app frame: head %.3f, tail %.3f (x%.1f) over %u app frames [d3d12, a barrier "
-                     "after each dispatch]", all / dispApp, hd / dispApp, nTail ? (all - hd) / nTail : 0.0, double(nTail) / dispApp, dispApp);
-                for (size_t k = 0; k < n; ++k)
-                    XLog("prof:   %2zu %-26s %-24s %.4f ms per app frame", k, pack->disp[k].module.c_str(),
-                         pack->kernels[pack->disp[k].kernel].file.c_str(), dispMs[k] / dispApp);
-                dispMs.assign(n, 0.0);
-                dispApp = 0;
-            }
-            gpuHead = gpuTail = 0;
-            nHead = nTail = 0;
-        }
-    }
+    void ReadStamps(size_t i) { pg->ReadStamps(i); }
 
-    static constexpr size_t kAllocs = 16;
-    static constexpr size_t kSlots = 2 * kAllocs;       // timestamp slots: the present lane's, then the generation lane's
     uint32_t genCount = 0;
     uint32_t lastNGen = ~0u;
     std::string packDir;
-    Interop io;
-    bool d3dPath = true;
-    NvApi nv;
-    std::unique_ptr<D3DPack> dpack;     // D3D12 path: the runner (references *pack, so it goes first)
-    std::map<std::string, std::vector<uint8_t>> cubins;
-    ID3D12CommandQueue* setupQueue = nullptr;
-    size_t splitAt = 0;
-    ID3D12QueryHeap* stampHeap = nullptr;
-    ID3D12Resource* stampRb = nullptr;
-    UINT64 tsFreq = 1;
-    bool stamped[kSlots] {}, stampedHead[kSlots] {};
-    size_t stampedFrom[kSlots] {};
-    ID3D12QueryHeap* dispHeap = nullptr;        // Prof=2: a timestamp after each dispatch, n + 1 per slot
-    ID3D12Resource* dispRb = nullptr;
-    std::vector<double> dispMs;                 // per dispatch, summed since the last log
-    uint32_t dispApp = 0;                       // app frames (head runs) in those sums
-    std::unique_ptr<Pack> pack;
-    int rCur = -1, rPrev = -1, rMv = -1, rDepth = -1, rDepthPrev = -1, rOut = -1, rUi = -1, rBb = -1;
-    bool curSwapped = false, prevSwapped = false;   // CUDA path, B8G8R8A8: cur / prev already turned to R8G8B8A8 (RunCuda)
-    bool lastCurSwapped = true;                     // the CUDA worker's own: its last swap of cur ran
-    SharedBuf cur, prev, mv, depth, depthPrev, out;
-    SharedBuf uic, bbc;                     // the output layer's UI texture (t9) and back buffer (t10), modes 2-5
-    SharedBuf ringC[2][kMaxInterp];         // CUDA path: each generated frame of an app frame (RunCuda), by frame parity
+    IPackGenerator* pg = nullptr;       // generator->AsPack(): the pack surface the host drives (own is the only one that runs)
+    std::unique_ptr<IGenerator> generator;  // the frame generator (generators/own.h unless another is chosen and available)
     ID3D12Resource* hold = nullptr;         // an app frame's own picture once the next one rewrites cur / keep (HandOff)
     ID3D12Resource* keep = nullptr;
     ID3D12Resource* stMv[2] {};             // staging sets the application's tags land in, by frame parity
@@ -4454,7 +3865,6 @@ private:
     ID3D12PipelineState* convPso = nullptr;
     bool convFailed = false;
     bool rawFailed = false;                 // a raw-copy buffer could not be made: conversions stay off (logged once)
-    CUstream stream = nullptr;
 
     // Queues: ours presents (and runs the pack); the application's renders and tags.
     ID3D12CommandQueue* queue = nullptr;
@@ -4516,21 +3926,16 @@ private:
     // Set by the presenter thread after a rebuild (RebuildForSizes), read under mu by the application's threads.
     std::atomic<bool> built { false };
     bool failed = false, haveMv = false, haveDepth = false, hudless = false, haveUi = false, warnedSize = false,
-         warnedPresent = false, warnedUi = false, warnedRing = false;
-    bool packHdr = false;           // the pack built is the hdr part (R10G10B10A2 frames)
+         warnedPresent = false, warnedUi = false;
     bool inFullscreen = false;      // the real swap chain is in exclusive fullscreen: no generation
     bool hasPrev = false;                   // presenter: prev holds the previous app frame
     bool lastUsable = false;                // app thread: the previous frame could take part in generation
     bool warnedTag[8] {};
-    bool noPatch = false, dumped = false;
+    bool dumped = false;
     const Frame* showing = nullptr;         // presenter: the frame Show is presenting (Hitch)
     unsigned hitches = 0;                   // hitch lines in the second from hitchSecond (PresentReal)
     long long hitchSecond = 0;
     ID3D12Resource* tagBuf = nullptr;
-    CUevent evW = nullptr, evH = nullptr, evT[kMaxInterp] {}, evG[kMaxInterp] {}, evS[kMaxInterp] {};
-    double gpuGraph = 0, gpuSwap = 0, gpuCopy = 0, cpuLaunch = 0;
-    double gpuHead = 0, gpuTail = 0;
-    unsigned nHead = 0, nTail = 0;
     std::string dumpPath, shownPath;
     long long dumpFrame = -1;
     float prevJitter[2] {};
@@ -4631,29 +4036,20 @@ private:
     std::thread gater;
     std::thread relay;
     ID3D12Fence* contentFence = nullptr;    // io.fence's progress as the relay saw it (StartGate)
-    CUexternalSemaphore gateSem = nullptr;  // CUDA path, GenSpread: gateFence as the stream sees it (RunCuda)
     UINT64 gateFrameEnd = 0;                // the gate value of the last present of the frame being shown (ShowGated)
     std::atomic<UINT64> gWaitingFor { 0 };  // diagnostics: the content value the release thread waits for
     int slowCopyLogs = 0;                   // diagnostics: release-thread copy waits over 250 ms logged so far (30 at most)
     int slowPresentLogs = 0, slowIdleLogs = 0, slowGenLogs = 0;     // the same for the gate's other waits
-    unsigned failLogged = 0;
     double statRel = 0, statRel2 = 0, statRelMax = 0, statQueued = 0, statLaneBlock = 0;
     unsigned statRels = 0;
-    // CUDA path: when each fence value the stream signals was reached (a host function after the signal; ClockNeed).
-    struct HostStamp
-    {
-        Own* o = nullptr;
-        UINT64 v = 0;
-    };
-    static constexpr size_t kStamps = 64;
-    std::array<HostStamp, kStamps> hostStamp {};
+    // When each fence value the CUDA stream signals (or the generation lane's fence reaches, D3D12 path) was reached (StampDone,
+    // StartGate; ClockNeed).
     std::array<std::atomic<long long>, kStamps> doneAt {};
     std::array<std::atomic<UINT64>, kStamps> doneVal {};
     std::atomic<bool> stampsWork { false };
     double statGpuWait = 0, statStampAge = 0, statBehind = 0, statFirstLate = 0, statArriveToPick = 0, statArriveToReady = 0;
     unsigned statJobs = 0, statFirstN = 0;
     std::atomic<uint64_t> submitted { 0 };  // app frames handed over so far (appFrame, readable by the presenter)
-    std::atomic<unsigned> handoffFails { 0 };
     static constexpr size_t kReady = 64;
     std::thread watcher;
     std::atomic<bool> wQuit { false };
