@@ -314,6 +314,27 @@ std::string Setting(const char* env, const char* key, const char* def)
 }
 std::string PathSetting() { return Setting("XEFG_CUDA_PATH", "Path", "d3d12"); }
 
+// Which generator makes the in-between frames (generator.h, docs/GENERATORS.md): own (default), intel, dlssg or fsr, case
+// insensitive. F5LOW_GENERATOR, else XEFG_CUDA_GENERATOR, else Generator= in f5low.ini. Anything else runs own, with a log line;
+// so do the ones that are not built yet (xefg_own.h, Own::Create).
+std::string GeneratorSetting()
+{
+    char v[64] = {};
+    std::string s;
+    if (GetEnvironmentVariableA("F5LOW_GENERATOR", v, sizeof(v)) || GetEnvironmentVariableA("XEFG_CUDA_GENERATOR", v, sizeof(v)))
+        s = v;
+    else
+        s = Setting("F5LOW_GENERATOR", "Generator", "own");     // neither is set: the ini key
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+    for (char& c : s)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (s == "own" || s == "intel" || s == "dlssg" || s == "fsr")
+        return s;
+    Log("f5low: generator \"%s\" is unknown (own, intel, dlssg, fsr) - running own", s.c_str());
+    return "own";
+}
+
 // Where the D3D12 path generates (xefg_own.h, PresentGen): "off" (default: on the present queue, each frame
 // just before its present), "direct" (a second graphics queue of its own) or "compute" (async compute; under
 // a heavy pixel-shader load it gets few SMs and runs slower: harness 6x tail 4.2 -> 5.8 ms, every frame
@@ -766,7 +787,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     if (!pack.empty() && d && ph)
     {
         const std::string path = PathSetting();
-        auto o = xefgown::Own::Create(d, pack, path);
+        auto o = xefgown::Own::Create(d, pack, path, GeneratorSetting());
         o->genMode = GenQueueSetting();
         o->genPriority = GenPrioritySetting();
         o->genSpread = GenSpreadSetting();
@@ -788,10 +809,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             o->flipLeadUs = static_cast<uint32_t>(std::clamp(atoi(lead.c_str()), 0, 8000));
         // Prof= in f5low.ini (XEFG_CUDA_PROF): 0 no GPU timing (default), 1 per run, 2 per dispatch too.
         const std::string prof = Setting("XEFG_CUDA_PROF", "Prof", "0");
-        o->prof = prof != "0";
-        o->profDispatches = prof == "2";
+        o->gs.prof = prof != "0";
+        o->gs.profDispatches = prof == "2";
         // Native= (XEFG_CUDA_NATIVE): 0 runs the pack's native modules (the reconstruction) as PTX on D3D12 too.
-        o->native = Setting("XEFG_CUDA_NATIVE", "Native", "1") != "0";
+        o->gs.native = Setting("XEFG_CUDA_NATIVE", "Native", "1") != "0";
         *ph = reinterpret_cast<xefg_swapchain_handle_t>(o.get());
         std::lock_guard<std::mutex> lk(g_ownLock);
         g_own[*ph] = o;
