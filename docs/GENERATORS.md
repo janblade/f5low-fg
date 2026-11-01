@@ -6,8 +6,8 @@ shares: the swap chain the game sees, frame input staging, pacing, presentation,
 the UI/letterbox rules. A **generator** only makes the in-between frames.
 
 Today one generator runs: **own** (XeFG Tensor). `intel`, `dlssg` and `fsr` are registered and selectable, report
-"not available yet" in the log, and run `own`. This note is the paper check that the interface already fits them,
-so adding one later is a backend, not a host change.
+"not available yet" in the log, and run `own`. This note is the paper design for them; the host is not ready for any of them yet (see
+"What is ready").
 
 ## Choosing a generator
 
@@ -37,7 +37,7 @@ logged once at context creation: `f5low: generator own (XeFG Tensor)`.
 
 ## Two backend shapes
 
-Every library falls in one of two shapes. The interface carries both, so no backend needs a host change.
+Every library falls in one of two shapes. The code carries neither yet; "What is ready" says what each needs.
 
 **Frames only** (`own`, `fsr` through its dispatch): the host calls the generator once per app frame with the
 inputs and the interpolation points `t = k / (n + 1)`, and gets n frames back on the GPU. The host paces and
@@ -89,14 +89,29 @@ public:
 };
 ```
 
-The struct shape above was the target. The real interface is `src/generator.h` (`IGenerator`, `GenCaps`, `GenBuf`,
-`GenSlot`): it follows the code of `own` (`src/generators/own.h`, class `OwnGenerator`), the only generator that runs.
-The host (`Own` in `src/xefg_own.h`) reaches it only through that interface and owns it as a
-`std::unique_ptr<IGenerator>`. What the real interface adds to the sketch: the generator hands the host its input buffers
-(`Buf(GenSlot)`; the host copies the game's frame, motion and depth into them); a pass is either recorded into a command
-list of the host's (`PreparePass`, `RecordPass`, `RecordPassInto`: the D3D12 path) or started on a CUDA stream that
-signals a fence (`Launch`, `DoneFence`, `RingFrame`: the CUDA path); `Build` / `Rebuild` / `Shutdown` replace
-`Init` / `Resize`. `AttachSink` stays a default-returning-false virtual for the present-sink backends.
+The struct above is the early sketch, not the code. The code is `src/generator.h`, two classes:
+
+- `IGenerator`: the narrow contract every backend implements. `Caps()` (`GenCaps`: name, `available`, reason, max generated
+  frames, NVIDIA only or any GPU), `SetHost`, `AttachSink` (returns false unless a present-sink backend takes it),
+  `Build` / `Rebuild` / `Drain` / `Stop` / `Shutdown`, and `AsPack()`, which returns the pack surface or null.
+- `IPackGenerator`: the own generator's surface and only its (`src/generators/own.h`, class `OwnGenerator`, which
+  implements both). The host copies the game's frame, motion and depth into the pack's buffers (`Buf(GenSlot)`) and drives
+  passes: recorded into a command list of the host's (`PreparePass`, `RecordPass`, `RecordPassInto`: the D3D12 path) or
+  started on a CUDA stream that signals a fence (`Launch`, `DoneFence`, `RingFrame`: the CUDA path).
+
+The host (`Own` in `src/xefg_own.h`) owns a `std::unique_ptr<IGenerator>`, caches `AsPack()` once at `Create` and drives only
+that. A generator without a pack surface cannot be driven yet, so `Create` refuses it.
+
+## What is ready
+
+- Ready: `own` behind `IGenerator` / `IPackGenerator`; the selection (above); `intel`, `dlssg`, `fsr` registered as
+  "not available yet" (`GenCaps` only) and falling back to `own`.
+- Not ready: frames-only backends (`fsr`). The host only knows pack-layout buffers; a backend that takes and returns textures
+  needs a texture in/out path in `CopyFrame` / `Show` / `PresentGen` next to them, and a `Generate(GenInputs, t[], out[])`
+  entry on `IGenerator`.
+- Not ready: present-sink backends (`intel`, `dlssg`). They need the sink branch in the host (forwarding tags, constants and
+  frame ids to the library, turning the sink's Presents into pacer jobs) and forwarding entry points next to `AttachSink`.
+- Both are stories A2-A4 and will be shaped by the first real backend; expect host changes, not just a new class.
 
 ## Per backend, when it is built (stories A2-A4)
 
