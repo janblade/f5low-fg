@@ -37,13 +37,14 @@ using namespace xefgio;
 // without PTX twins, so it runs on the D3D12 path only. `dir` is UTF-8.
 inline bool IsD3dOnlyPack(const std::string& dir)
 {
+    if (std::string key; xefgpack::IsBuiltPath(dir + "\\" + packbuild::kD3d12OnlyMarker, &key))
+    {
+        const auto files = xefgpack::BuiltFiles();     // the pack built in memory
+        return files && files->count(key) != 0;
+    }
     return GetFileAttributesW(longpath::ExtendIfLong(longpath::WidenUtf8(dir + "\\" + packbuild::kD3d12OnlyMarker)).c_str()) !=
            INVALID_FILE_ATTRIBUTES;
 }
-
-// Set by the DLL: a pack built on this PC that was taken from the cache failed to load or to build for D3D12. Deletes that
-// cache folder, builds the pack again (once per process) and returns the new folder, or "" when it cannot or already did.
-inline std::string (*g_repairBuiltPack)(const std::string& badDir) = nullptr;
 
 class OwnGenerator : public IGenerator, public IPackGenerator
 {
@@ -114,17 +115,6 @@ public:
         {
             GenScope cuda(*this);
             ok = BuildPack(nullptr, gb);
-            if (!ok && d3dOnly && g_repairBuiltPack)
-            {
-                // a damaged cache folder (a file changed or cut after the marker was written): make the pack again, once
-                const std::string fresh = g_repairBuiltPack(packDir);
-                if (!fresh.empty())
-                {
-                    XLog("build: the cached pack failed to load - deleted, built again in %s", fresh.c_str());
-                    packDir = fresh;
-                    ok = BuildPack(nullptr, gb);
-                }
-            }
             if (!ok && d3dPath && !d3dOnly)
             {
                 XLog("build: the D3D12 path failed - using the CUDA path");

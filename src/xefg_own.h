@@ -57,6 +57,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #define XEFG_SWAPCHAIN_EXPORT_API
 #include <xefg_swapchain.h>
@@ -515,6 +516,7 @@ public:
     ~Own()
     {
         XLog("context freed");  // Destroy plus the app's last Release of its swap chain: nothing of it is left
+        StopDeferred();
         StopPresenter();
         generator->Stop();
         ReleaseSwapChain();
@@ -602,9 +604,77 @@ public:
                 return true;
             // Not at those sizes: the whole build, as a context built for the first time (its sizes followed later).
         }
+        if (packPoll)
+        {
+            // The pack is made in the background (xefg_cuda.cpp) and so is this first build, which compiles the kernels
+            // (about a second): not on the application's thread. The frames pass through until it is done.
+            StartDeferredBuild();
+            return true;
+        }
         built = Build();
         failed = !built;
         return built;
+    }
+
+    // ---- deferred first build (a pack made in the background: nothing waits for it) ----------------------------------
+    // Set by the DLL before the first EnsureBuilt; empty for a pack folder or the embedded pack, which build at once.
+    // packPoll: 0 the pack is still being made, 1 it is ready, 2 it failed (`why` says why).
+    std::function<int(std::string* why)> packPoll;
+    // With a ready pack: "" when this GPU runs it, else why not (checked here because the pack was not ready at CreateContext).
+    std::function<std::string()> packFit;
+    // The deferred build is over (ok: generation can start; else why not): the DLL's status.
+    std::function<void(bool ok, const std::string& why)> deferredDone;
+
+    // Under mu, from the first EnsureBuilt (before the presenter exists: SetQueue comes before Wrap). The build runs on a thread
+    // of its own and publishes with `built`: until then no thread but that one touches the generator (the presenter skips its
+    // GenScope while deferBusy, the application's threads leave everything of the pack alone while !built).
+    void StartDeferredBuild()
+    {
+        if (deferStarted)
+            return;
+        deferStarted = true;
+        deferBusy = true;
+        GenBuild args = BuildArgs();        // initFlags and the swap chain's format as a build right here would have had them
+        args.releaseHostBuffers = nullptr;  // the first build has nothing to release (the presenter's state is not touched)
+        deferThread = std::thread([this, args] { DeferredBuild(args); });
+    }
+
+    void DeferredBuild(const GenBuild& args)
+    {
+        std::string why;
+        int st;
+        while ((st = packPoll(&why)) == 0 && !deferQuit)
+            Sleep(2);
+        bool ok = false;
+        if (deferQuit)
+            why = "context destroyed";
+        else if (st != 1)
+            ;       // the pack could not be made: `why` is the DLL's reason
+        else
+        {
+            const std::string misfit = packFit ? packFit() : std::string();
+            if (!misfit.empty())
+                why = misfit;
+            else if (!(ok = Build(&args)))
+                why = "the pack did not build for D3D12 (see the log)";
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            failed = !ok;
+            built = ok;
+        }
+        deferBusy = false;
+        if (!deferQuit && deferredDone)
+            deferredDone(ok, why);
+    }
+
+    // Before the generator goes: waits for a running deferred build (a build already compiling cannot be cancelled; one that waits
+    // for the pack stops at once).
+    void StopDeferred()
+    {
+        deferQuit = true;
+        if (deferThread.joinable())
+            deferThread.join();
     }
 
     // The queue the real swap chain presents on, for InitFromSwapChainDesc: our own, high priority, so
@@ -1643,7 +1713,11 @@ private:
     // frame before it waited to be presented.
     void Present(const Job& j)
     {
-        GenScope cuda(*pg);
+        // While the deferred first build runs on its own thread the generator is not ours to touch (no frame is generated: the
+        // jobs are not usable); deferBusy is set before the presenter exists and cleared after `built` is published.
+        std::optional<GenScope> cuda;
+        if (!deferBusy.load(std::memory_order_acquire))
+            cuda.emplace(*pg);
         if (j.usable && pq && D3d() && !genQueue)
         {
             static bool warned = false;
@@ -3206,7 +3280,7 @@ private:
         return b;
     }
 
-    bool Build()
+    bool Build(const GenBuild* given = nullptr)
     {
         char env[MAX_PATH];
         if (GetEnvironmentVariableA("XEFG_CUDA_DUMP", env, sizeof(env)))
@@ -3215,7 +3289,7 @@ private:
             dumpFrame = atoi(env);
         if (GetEnvironmentVariableA("XEFG_CUDA_DUMP_SHOWN", env, sizeof(env)))
             shownPath = env;
-        return generator->Build(BuildArgs());
+        return generator->Build(given ? *given : BuildArgs());
     }
 
     // The old pack is gone: what was sized by it goes too (the generator's Build / Rebuild call this).
@@ -3954,6 +4028,10 @@ private:
     std::atomic<UINT64> resizeFrame { 0 };
     std::atomic<bool> resizePending { false };
     bool rebuildOnInit = false;     // under mu: a resize the stopped presenter did not get to
+    bool deferStarted = false;      // under mu: StartDeferredBuild ran
+    std::atomic<bool> deferBusy { false };      // the deferred first build is pending or running (the presenter leaves the generator alone)
+    std::atomic<bool> deferQuit { false };
+    std::thread deferThread;
 
     // Pacing and stats. interval is written by the application's thread, read by the presenter.
     int slowCalls = 0;

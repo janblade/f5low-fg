@@ -63,8 +63,8 @@ ${banner}f5low $version
 
 f5low.dll is the frame generation host behind OptiScaler-NR's F5Low FG output (our own pacer, gate and presenter, with
 our own XeFG-compatible generator for NVIDIA GPUs). On the first run it builds its working data from libxess_fg.dll
-on your PC (about half a second, once; cached in plugins\f5low_cache, or in %LOCALAPPDATA%\f5low\f5low_cache when the
-plugins folder is not writable), then runs on its own.
+on your PC at every start (about a tenth of a second, in memory, in the background; nothing of Intel's is written to
+disk), then runs on its own.
 
 Source: https://github.com/janblade/f5low-fg  (commit $commit)
 Licence: GPL-3.0 with a linking exception, see LICENSE. libxess_fg.dll is Intel's, unchanged and signed by Intel

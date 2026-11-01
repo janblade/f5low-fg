@@ -25,6 +25,8 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -275,24 +277,74 @@ inline std::map<std::string, std::vector<uint8_t>>& EmbeddedFiles()
     return files;
 }
 
+// The pack the DLL builds from the player's libxess_fg.dll lives ONLY in memory (pack_build.h): nothing Intel-derived is ever
+// written to disk. A pack loaded from kBuiltDir reads from here. The map is immutable once published (SetBuiltFiles) and
+// shared, so a reader keeps its copy alive across a replacement; files by lower-case relative path with '\' separators.
+inline const char* const kBuiltDir = "<built>";
+using PackFiles = std::map<std::string, std::vector<uint8_t>>;
+inline std::mutex& BuiltLock()
+{
+    static std::mutex m;
+    return m;
+}
+inline std::shared_ptr<const PackFiles>& BuiltFilesRef()
+{
+    static std::shared_ptr<const PackFiles> files;
+    return files;
+}
+inline std::shared_ptr<const PackFiles> BuiltFiles()
+{
+    std::lock_guard<std::mutex> l(BuiltLock());
+    return BuiltFilesRef();
+}
+inline void SetBuiltFiles(std::shared_ptr<const PackFiles> f)
+{
+    std::lock_guard<std::mutex> l(BuiltLock());
+    BuiltFilesRef() = std::move(f);
+}
+
+// A path inside a virtual pack (after the "<dir>\" prefix) as the map's key: lower case, '\' separators, ..\ resolved.
+inline std::string VirtualKey(std::string rel)
+{
+    for (char& c : rel)
+        c = c == '/' ? '\\' : static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    // a nested pack (hdr\) names the main pack's shared files as ..\data\...
+    for (size_t up; (up = rel.find("\\..\\")) != std::string::npos;)
+    {
+        const size_t sep = up ? rel.rfind('\\', up - 1) : std::string::npos;
+        const size_t from = sep == std::string::npos ? 0 : sep + 1;
+        rel.erase(from, up + 4 - from);
+    }
+    return rel;
+}
+
+// Whether `p` is a file of the pack built in memory (kBuiltDir): `key` its map key.
+inline bool IsBuiltPath(const std::string& p, std::string* key = nullptr)
+{
+    const std::string prefix = std::string(kBuiltDir) + "\\";
+    if (p.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    if (key)
+        *key = VirtualKey(p.substr(prefix.size()));
+    return true;
+}
+
 inline std::vector<uint8_t> Slurp(const std::string& p)
 {
     const std::string prefix = std::string(kEmbeddedDir) + "\\";
     if (p.compare(0, prefix.size(), prefix) == 0)
     {
-        std::string rel = p.substr(prefix.size());
-        for (char& c : rel)
-            c = c == '/' ? '\\' : static_cast<char>(tolower(static_cast<unsigned char>(c)));
-        // a nested pack (hdr\) names the main pack's shared files as ..\data\...
-        for (size_t up; (up = rel.find("\\..\\")) != std::string::npos;)
-        {
-            const size_t sep = up ? rel.rfind('\\', up - 1) : std::string::npos;
-            const size_t from = sep == std::string::npos ? 0 : sep + 1;
-            rel.erase(from, up + 4 - from);
-        }
         auto& files = EmbeddedFiles();
-        auto it = files.find(rel);
+        auto it = files.find(VirtualKey(p.substr(prefix.size())));
         return it == files.end() ? std::vector<uint8_t>() : it->second;
+    }
+    if (std::string key; IsBuiltPath(p, &key))
+    {
+        const auto files = BuiltFiles();
+        if (!files)
+            return {};
+        auto it = files->find(key);
+        return it == files->end() ? std::vector<uint8_t>() : it->second;
     }
     // `p` is UTF-8 (long_path.h): opened through the wide API, in the extended form when it passes MAX_PATH (the pack cache
     // in a deep install path)

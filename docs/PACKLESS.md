@@ -2,7 +2,8 @@
 
 The own generator (`Generator=` F5Low / xefg_cuda) needs, besides our kernels, Intel's weights and 16 of Intel's shader
 modules per pack (SDR and `hdr\`, the reconstruction input and the motion splat, run as they are). The release must not
-carry those, so f5low.dll gets them from the player's own `libxess_fg.dll` when it first needs them. Nothing is
+carry those, so f5low.dll gets them from the player's own `libxess_fg.dll` at every start, **in memory only: nothing
+Intel-derived is ever written to a file**. Nothing is
 translated and no `dxcompiler.dll` is needed: all eight slots that used to be translated (input prep, depth downscale,
 the four stems/strided convolutions, the per-t splat, the blend) are our own kernels, and a pack built on the player's
 PC runs on the D3D12 path only.
@@ -32,32 +33,65 @@ PC runs on the D3D12 path only.
 
    Nothing is translated on the player's PC. The recipe's 16 `intel_xlate` entries per pack (the PTX twins of the
    native modules, which only the CUDA path would run) are skipped by the builder.
-4. **Build and cache** (`src/pack_build.cpp`). `BuildPack` writes the pack folder: our kernels, the native containers,
-   the weights and root constants (checked against the recipe), the manifest, plus a marker file `d3d12_only`.
-   It equals `tools/recipe/build_pack.py`'s neutral-name output minus the PTX twins and plus the marker
-   (`tools/recipe/compare_pack.py --packless`). `EnsurePack` keeps it in `<DLL dir>\f5low_cache\<key>\`; when that folder cannot be written (Game Pass /
-   WindowsApps install, Program Files without user rights; detected by failing to create the temporary build folder) it
-   uses `%LOCALAPPDATA%\f5low\f5low_cache\<key>\` instead (a hit is looked for in both; the log says which folder and
-   why; one shared folder is safe for several games because the key includes the libxess_fg hash). `f5low.log` falls
-   back to `%LOCALAPPDATA%\f5low\f5low.log` the same way. The key is the
-   SHA-256 of (libxess_fg file, the embedded recipe + our kernels, `kFormat` = the version of the builder's pack layout;
-   not the data source, every blob is checked against the recipe's SHA-256 so any source builds the same pack).
-   **`kFormatVersion` (pack_build.cpp) must be raised on ANY change to the builder, `ResolveManifest`, the pack layout or the
-   set of files written**: otherwise a cache folder made by the old code is reused as it is. The pack is built in a
-   temporary folder next to it, a `complete` marker is written last (format number, file count, and the size of every file)
-   and the folder is renamed in one step; a folder whose marker does not match (killed build, a file cut or missing,
-   damaged) is replaced. If a cached pack still fails to load or to build for D3D12, its folder is deleted and the pack is
-   built again once per process. After a hit or a build, cache folders whose marker names an OLDER format and temporary
-   folders untouched for an hour are deleted (a folder of the current format is never touched; deletion failures are
-   ignored). Pack folders are held as UTF-8 strings and opened through the wide API, in the extended form
-   (`src/long_path.h`, `\\?\C:\...`) when long, so a DLL folder with characters outside the ANSI code page or of 200+
-   characters works (the deepest cache file is then over 300 characters).
-5. **Run.** A pack with the `d3d12_only` marker runs on the D3D12 path whatever `Path=` says (the log says so once: "the
-   pack built from libxess_fg.dll runs on the D3D12 path only - Path=cuda is not used"); if NVAPI has no D3D12 cubin
-   shaders, the own generator reports itself unavailable (one log line) and the DLL forwards to libxess_fg.dll. Explicit
-   packs (`XEFG_CUDA_PACK`, an `xefg_pack\` folder, the pack embedded as resource 101) have no marker and keep both paths.
+4. **Build, in memory** (`src/pack_build.cpp`). `BuildPack` assembles the pack as a map of files (relative path in lower case,
+   `\` separators -> bytes): our kernels, the native containers, the weights and root constants (checked against the
+   recipe), the manifest, plus a marker file `d3d12_only`. It equals `tools/recipe/build_pack.py`'s neutral-name output minus
+   the PTX twins and plus the marker. The map is published once (`xefgpack::SetBuiltFiles`, `xefg_pack.h`), immutable from
+   then on, and the loader reads it through the virtual folder `<built>` (`Slurp`; the same mechanism as the pack embedded
+   in the DLL, `<embedded>`). **No file is written**: not the modules (Intel's DXBC containers), not the weights, not the
+   root constants, and no cache of any of them. It is built again at every start of the process (about 0.13-0.18 s on a
+   background thread, below), the player's `libxess_fg.dll` is read into memory for the build and let go of afterwards.
+   About 10 MB (282 files) stay in memory; the build itself peaks some 55-75 MB above the process for ~0.15 s (the
+   file, the decoded modules, the weights being re-tiled).
+   `kFormatVersion` (`pack_build.h`, logged with the pack) is the builder's pack layout: raise it on ANY change to the builder,
+   `ResolveManifest`, the pack layout or the set of files. 4 = built in memory. Formats 2 and 3 kept the pack in
+   `<DLL dir>\f5low_cache\<key>\` (or `%LOCALAPPDATA%\f5low\f5low_cache\<key>\`) as plain files; `RemoveLegacyCaches` deletes
+   every such folder in both roots after the pack is ready (a folder with our `complete` marker of any format, or an unfinished
+   build folder named `<32 hex>.tmp<pid>_<tick>` untouched for an hour); anything without our marker (a user's folder, a loose
+   file) is never touched, and a deletion that fails is ignored (the log says so).
+5. **Run.** A pack with the `d3d12_only` marker runs on the D3D12 path whatever `Path=` says (the context is made for the D3D12
+   path at once; the log says so once: "the pack built from libxess_fg.dll runs on the D3D12 path only - Path=cuda is not
+   used"); if NVAPI has no D3D12 cubin shaders, the own generator reports itself unavailable (one log line). Explicit packs
+   (`XEFG_CUDA_PACK`, an `xefg_pack\` folder, the pack embedded as resource 101) have no marker, are read from disk / the
+   resource as before and keep both paths and the synchronous first build.
    The compiled-kernel cache of the D3D12 runner is keyed by the content of the PTX that is compiled
    (`D3DPack::CubinKey`, SHA-256), not by file name: the SDR and `hdr\` packs name kernels alike.
+
+### Threads and states (the background build)
+
+Nothing of this runs on the game's thread except two quick calls, and nothing waits for the pack but `D3D12CreateContext`, for
+at most 50 ms in all (measured from the start of the call, the GPU check included).
+
+- **Pack thread** (one per process, `PackBuildThread` in `xefg_cuda.cpp`): started by the first API call that finds no explicit
+  pack (`xefgSwapChainGetVersion`, else `D3D12CreateContext`), never from `DllMain`. It holds a reference on the DLL
+  (`FreeLibraryAndExitThread`), so an unload cannot run under it. States `Idle -> Building -> Ready | Failed`
+  (`g_packState` under `g_packMu`, mirrored in an atomic for polling). It builds the pack, publishes the file map, flips the
+  state, wakes `CreateContext`'s wait, then removes the old on-disk caches.
+- **`D3D12CreateContext`**: starts the build if nobody did, runs the GPU check that needs no pack (`GpuSm`: CUDA device behind the
+  adapter, ~25 ms) while the pack thread works, then waits for the pack for the rest of the 50 ms. `Failed`: the existing
+  forwarding logic (status 2 with the reason, or 3 without a `libxess_fg.dll`). `Ready`: the pack's `NeedSm` against the GPU,
+  forwarding when it does not fit. Not finished after the 50 ms: the context is ours (a short wait cannot decide the forwarding
+  of a pack that is not there yet) and its first build is deferred. A failure after that point cannot go back to Intel's
+  library, the context being ours: the frames pass through and the status is 3. That is the price of not blocking; the
+  failures that are cheap to find (no `libxess_fg.dll`, an unsupported build without the zstd dictionaries, ...) are found in
+  the first few ms, long before the 50 ms are up.
+- **First build** (every context made for the built pack, `Own::StartDeferredBuild`): the CUDA context, the kernels' compile (the
+  CUDA driver's own PTX->cubin cache makes this ~0.4 s; ~3 s with `CUDA_CACHE_DISABLE=1`), the pipelines and buffers run on
+  a thread of the context (`deferThread`), started by the first `EnsureBuilt` (`BuildPipelines` or `InitFromSwapChain`, which
+  return at once). It waits for the pack (polling `PackPoll`), then `packFit` (the pack's `NeedSm` against the GPU, when the
+  wait at `CreateContext` did not see the pack), then `Build`. It publishes with `built` (an atomic, under `mu`) and
+  `deferBusy = false`, then `deferredDone` sets the status (1, or 3 with the reason; only if no newer context decided since:
+  `SetStatusIf`).
+- **While it runs**: `f5lowGetStatus` returns 0 with the reason "building its frame generator in the background"; the
+  application's threads see `built == false` and tag nothing (as after a resize); the presenter passes every frame through
+  (`Job::usable` is false) and leaves the generator alone (`Present` makes no `GenScope` while `deferBusy`). The rule that
+  makes it race-free: until `built` is published only the build thread touches the generator, the staging buffers and the
+  pack; `deferBusy` is set before the presenter exists (`SetQueue` comes before `Wrap`) and cleared after `built`. The first
+  build has nothing to release, so it does not touch the presenter's state (`releaseHostBuffers` is empty).
+- **Destroy / unload during a build**: `~Own` sets `deferQuit` and joins the thread. A build still waiting for the pack stops
+  at once; one already compiling cannot be cancelled and is waited for (up to ~0.5 s warm, ~3 s with a cold JIT cache; only
+  when the context dies in its first seconds). The pack thread belongs to the process, not to a context: it finishes, and
+  the next context finds the pack ready.
 
 ### What is embedded in f5low.dll (ours only)
 
@@ -69,10 +103,10 @@ finds the container inside the DLL by its structure and fails any file not liste
 fails unless it is one of the two hand-written utility kernels. So Intel-translated PTX can never ride along. Build needs `dxc.exe` (`-Dxc`, `XEFG_DXC`, the WinGet DirectX.ShaderCompiler package or the Windows SDK) and
 Python with numpy.
 
-### Loading order (`src/xefg_cuda.cpp`, `PackDir`)
+### Loading order (`src/xefg_cuda.cpp`, `ResolvePack`)
 
 `XEFG_CUDA_PACK` / `xefg_pack\` next to the DLL, then a pack embedded in the DLL (personal builds, resource 101),
-then the cache, then a build now. A build needs the player's `libxess_fg.dll` (`XEFG_CUDA_INTEL_LIBRARY` or the usual
+then the pack built in memory (`<built>`). A build needs the player's `libxess_fg.dll` (`XEFG_CUDA_INTEL_LIBRARY` or the usual
 lookup) and a data source (`IntelDataSource`, `pack_build.h`); no `dxcompiler.dll`, no other file:
 the 106 weight uploads and the 44 root-constant blocks come from `IntelFileSource` (next section), no environment
 variable needed. Development overrides only: `F5LOW_DEV_CAP` (a PSO capture log) replaces the derived root constants,
@@ -80,13 +114,14 @@ variable needed. Development overrides only: `F5LOW_DEV_CAP` (a PSO capture log)
 recipe's SHA-256. If anything is missing the log says so in ONE line ("own generator
 unavailable: ...") and the DLL forwards to libxess_fg.dll as before.
 
-The build runs synchronously at the first `PackDir()` call (the first `xefgSwapChainGetVersion` /
-`D3D12CreateContext` on the game's thread): about 0.4 s once (measured 2026-11-01 on the development PC, a fresh cache,
-three runs per libxess_fg build: decode 45-51 ms, weights + root constants 26-30 ms, write 233-256 ms, 375-391 ms in
-all, 282 files, for 1.3.4.95 and for 1.3.1.78 alike; one run in six had a slow disk, write 2.7 s). That is the whole
-cost of translating gone (it was 2.1 s). The D3D12 runner then compiles the kernels for the GPU once per process (cubins,
-about 0.7 s, not part of the pack build). A background build while Intel's library serves the first seconds is not
-needed at this size. Stale `*.tmp*` folders of killed builds are removed at the start of the next build.
+The build runs on the pack thread (above), started by the first API call: about 0.4 s of the old design (a write of 282 files
+= 233-256 ms of it) is gone, the rest is 120-180 ms from the first API call to "pack ready" (measured 2026-11-02, RTX 5070
+Ti, warm file cache: decode 55-63 ms, weights + root constants 27-40 ms, assembly 6-9 ms, for 1.3.4.95 and 1.3.1.78
+alike). It needs the player's `libxess_fg.dll` (`XEFG_CUDA_INTEL_LIBRARY` or the usual lookup) and a data source
+(`IntelDataSource`, `pack_build.h`); no `dxcompiler.dll`, no other file. The D3D12 runner's first build (cubins, pipelines,
+buffers) follows on the context's thread, ~0.4 s warm; neither blocks the game's thread. Compiled kernels are NOT cached by
+f5low: the CUDA driver keeps the PTX->cubin results in its own compute cache (outside our control, derived from our PTX only),
+and that already takes the compile from ~3 s to ~0.4 s; a cache of ours would only add a file format to trust.
 
 ### The weights (`src/intel_file_source.h/.cpp`, story B3 step 2)
 

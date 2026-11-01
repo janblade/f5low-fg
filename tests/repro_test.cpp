@@ -306,9 +306,15 @@ int main(int argc, char** argv)
     };
     const int stBefore = printStatus("before CreateContext");
     xefg_swapchain_handle_t h = nullptr;
-    printf("CreateContext: %d\n", xefgSwapChainD3D12CreateContext(g_dev, &h));
+    LARGE_INTEGER qf, qa, qb;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&qa);
+    const int createRc = xefgSwapChainD3D12CreateContext(g_dev, &h);
+    QueryPerformanceCounter(&qb);
+    printf("CreateContext: %d (took %.1f ms on this thread)\n", createRc, 1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart));
     const int stAfter = printStatus("after CreateContext");
-    if (stBefore != 0 || stAfter < 1 || stAfter > 3)
+    // 0 is right while the DLL builds its frame generator in the background; 1 .. 3 the decision (own, forwarding, unavailable)
+    if (stBefore != 0 || stAfter < 0 || stAfter > 3)
     {
         printf("f5lowGetStatus check FAILED\n");
         return 1;
@@ -353,7 +359,53 @@ int main(int argc, char** argv)
 
     // REPRO_INITFLAGS=n: other init flags (0 = depth not inverted: the pack's other flag-set modules run)
     const uint32_t initFlags = static_cast<uint32_t>(EnvInt("REPRO_INITFLAGS", XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH)); // the game's 0x1
-    printf("BuildPipelines: %d\n", xefgSwapChainD3D12BuildPipelines(h, nullptr, 1, initFlags));
+    QueryPerformanceCounter(&qa);
+    printf("BuildPipelines: %d (took %.1f ms on this thread)\n", xefgSwapChainD3D12BuildPipelines(h, nullptr, 1, initFlags),
+           [&] { QueryPerformanceCounter(&qb); return 1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart); }());
+    // REPRO_DESTROY_EARLY=1: the context is destroyed while the DLL is still building (the pack, then the first build), a second
+    // one is made and must come up (status 1): destroying a context during the background build is clean
+    if (EnvInt("REPRO_DESTROY_EARLY", 0) == 1)
+    {
+        Sleep(static_cast<DWORD>(EnvInt("REPRO_DESTROY_DELAY", 0)));       // REPRO_DESTROY_DELAY=ms: into the first build too
+        printf("destroy while building (after %d ms): %d\n", EnvInt("REPRO_DESTROY_DELAY", 0), xefgSwapChainDestroy(h));
+        h = nullptr;
+        printf("second CreateContext: %d\n", xefgSwapChainD3D12CreateContext(g_dev, &h));
+        printf("second BuildPipelines: %d\n", xefgSwapChainD3D12BuildPipelines(h, nullptr, 1, initFlags));
+        char reason[256] = {};
+        int st = getStatus(reason, static_cast<int>(sizeof(reason)));
+        for (int i = 0; i < 6000 && st == 0; ++i)
+        {
+            Sleep(5);
+            st = getStatus(reason, static_cast<int>(sizeof(reason)));
+        }
+        printf("f5lowGetStatus after the second context: %d \"%s\"\n", st, reason);
+        printf("destroy: %d\n", xefgSwapChainDestroy(h));
+        return st == 1 ? 0 : 1;
+    }
+    // The DLL builds its frame generator in the background (status 0, then 1): REPRO_WAIT_READY=0 starts at once, the frames pass
+    // through until it is ready; the default waits, so the pictures compared do not depend on the machine's speed.
+    {
+        char reason[256] = {};
+        int st = getStatus ? getStatus(reason, static_cast<int>(sizeof(reason))) : -1;
+        printf("f5lowGetStatus after BuildPipelines: %d \"%s\"\n", st, reason);
+        QueryPerformanceCounter(&qa);
+        while (st == 0 && EnvInt("REPRO_WAIT_READY", 1) == 1)
+        {
+            QueryPerformanceCounter(&qb);
+            if ((qb.QuadPart - qa.QuadPart) / qf.QuadPart > 30)
+                break;
+            Sleep(5);
+            st = getStatus ? getStatus(reason, static_cast<int>(sizeof(reason))) : -1;
+        }
+        QueryPerformanceCounter(&qb);
+        printf("f5lowGetStatus ready: %d \"%s\" (waited %.0f ms after BuildPipelines)\n", st, reason,
+               1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart));
+        if (st == 0 && EnvInt("REPRO_WAIT_READY", 1) == 1)
+        {
+            printf("f5lowGetStatus check FAILED: the own generator did not become ready\n");
+            return 1;
+        }
+    }
 
     WNDCLASSA wc {};
     wc.lpfnWndProc = DefWindowProcA;

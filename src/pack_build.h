@@ -7,11 +7,13 @@
 //     the 16 modules per pack that run natively on D3D12 are copied as DXBC; weights and root constants come from an
 //     IntelDataSource (below). Nothing is translated: the pack is for the D3D12 path only (the PTX twins of the native
 //     modules, which only the CUDA path would run, are left out; see kD3d12OnlyMarker).
-// What comes out: a pack folder in the layout xefg_pack.h reads (manifest.txt, kernels, data\), written like
-// tools/recipe/build_pack.py does in its neutral-name mode, minus the PTX twins and plus the marker file.
+// What comes out: the files of a pack in the layout xefg_pack.h reads (manifest.txt, kernels, data\), as
+// tools/recipe/build_pack.py writes them in its neutral-name mode, minus the PTX twins and plus the marker file - held IN
+// MEMORY (Files), never on disk: nothing Intel-derived (their modules, the weights) is written to any file by f5low.dll.
+// The loader reads it through xefg_pack.h's kBuiltDir. It is built again at every start of the process (about 0.1 s, on a
+// background thread).
 //
-// Nothing Intel-derived is ever part of f5low.dll or the repo; the built pack lives in the cache folder
-// (<DLL dir>\f5low_cache\<key>\) on the player's PC only.
+// Nothing Intel-derived is ever part of f5low.dll or the repo, and nothing of it is kept between runs.
 #pragma once
 
 #include <cstdint>
@@ -72,44 +74,45 @@ private:
 using Bundle = std::map<std::string, std::vector<uint8_t>>;
 bool ParseBundle(const uint8_t* data, size_t size, Bundle& out, std::string* error);
 
+// The builder's pack layout: logged with the pack. Raise it on ANY change to the builder, to ResolveManifest, to the pack layout
+// or to which files the pack holds. (4: the pack is built in memory, no folder is made at all.)
+inline constexpr int kFormatVersion = 4;
+
+// The pack's files by lower-case relative path with '\' separators ("manifest.txt", "data\r7.bin", "hdr\manifest.txt").
+// Same type as xefgpack::PackFiles (xefg_pack.h).
+using Files = std::map<std::string, std::vector<uint8_t>>;
+
 struct Report {
     double decodeMs = 0;      // libxess_fg: read, hash, decode its modules
-    double weightsMs = 0;     // weights and root constants from the data source (derived, hash-checked, written)
-    double writeMs = 0;       // everything else: our kernels, native modules, manifests, files on disk
+    double weightsMs = 0;     // weights and root constants from the data source (derived, hash-checked)
+    double writeMs = 0;       // everything else: our kernels, native modules, manifests, assembling the files
     size_t native = 0;        // intel_native modules copied
     size_t skipped = 0;       // intel_xlate entries (PTX twins of native modules) left out
-    size_t files = 0;         // files written
-    std::string intelSha256;  // of the libxess_fg file
+    size_t files = 0;         // files in the pack
+    size_t bytes = 0;         // their size together
 };
 
-// Builds the pack into `outDir` (created; existing files are overwritten). False with `error` naming what is missing
-// or does not match (a module the build does not know, a weight with the wrong SHA-256, ...).
+// Builds the pack into `out` (cleared first). False with `error` naming what is missing or does not match (a module the build
+// does not know, a weight with the wrong SHA-256, ...), `out` empty then.
 // `libBytes`: the libxess_fg file when the caller has read it already (used instead of reading it again).
-bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSource& data, const std::wstring& outDir,
-               Report& rep, std::string* error, const std::vector<uint8_t>* libBytes = nullptr);
+bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSource& data, Files& out, Report& rep,
+               std::string* error, const std::vector<uint8_t>* libBytes = nullptr);
 
-// The cache: `<cacheRoot>\<key>\` holds a finished pack and a `complete` marker.
 struct Request {
     std::wstring libxessPath;
-    std::wstring cacheRoot;                 // <DLL dir>\f5low_cache
-    std::wstring fallbackRoot;              // optional: used when cacheRoot cannot be written (%LOCALAPPDATA%\f5low\f5low_cache)
     const Bundle* own = nullptr;
-    const uint8_t* bundleBytes = nullptr;   // the embedded bundle as it is (cache key)
-    size_t bundleSize = 0;
     IntelDataSource* data = nullptr;
     std::function<void(const std::string&)> log;
 };
 
-enum class Outcome { Cached, Built, Failed };
+// Reads the player's libxess_fg.dll, builds the pack in memory (BuildPack) and lets go of the file's bytes. False: `error`
+// says what is missing.
+bool BuildInMemory(const Request& req, std::shared_ptr<const Files>& out, std::string& error, Report* rep = nullptr);
 
-// Returns Cached (folder reused, no work), Built (made now) or Failed (`error` says what is missing). `dir` is the
-// pack folder on success (an ordinary path, not the \\?\ form). The key is the SHA-256 of the libxess_fg file, the bundle
-// (recipe + our kernels) and kFormatVersion (pack_build.cpp; raise it on any builder change), the version of how this builder lays a pack out. Every file operation works on
-// paths longer than MAX_PATH. Stale ".tmp" folders of killed builds are removed before a build.
-Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Report* rep = nullptr);
-
-// Deletes a cache folder that EnsurePack handed out (it failed to load later). Only a folder inside a "f5low_cache" folder
-// that carries our `complete` marker is deleted. False when it was not deleted.
-bool DiscardPack(const std::wstring& dir);
+// Until format 3 the pack was kept on disk (<root>\<32 hex>\ with a `complete` marker). Deletes every such folder of `root`
+// (a "f5low_cache" folder, any format, plus stale unfinished build folders of that naming) - ONLY folders that carry our
+// marker or have the old build-folder name; anything else in `root` (the cubin cache, a user's files) stays. Returns how
+// many went.
+int RemoveLegacyCaches(const std::wstring& root, const std::function<void(const std::string&)>& log = nullptr);
 
 }  // namespace packbuild

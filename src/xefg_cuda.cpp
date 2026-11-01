@@ -13,7 +13,10 @@
 #include <windows.h>
 
 #include <compressapi.h>
+#include <psapi.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -209,20 +212,26 @@ std::mutex g_ownLock;
 // Intel's libxess_fg, 3 unavailable. Own lock: callable from any thread, also before any context.
 int g_statusState = 0;
 std::string g_statusReason;
-std::string g_builtFailReason;      // why RunBuiltPack made no pack (under g_statusLock)
 std::mutex g_statusLock;
 
-void SetStatus(int state, const std::string& reason)
+// Each SetStatus is a new decision (the most recent context's): the serial lets a context that decides later (its deferred first
+// build) tell whether a newer context has decided since.
+uint64_t g_statusSerial = 0;
+uint64_t SetStatus(int state, const std::string& reason)
 {
     std::lock_guard<std::mutex> lk(g_statusLock);
     g_statusState = state;
     g_statusReason = reason;
+    return ++g_statusSerial;
 }
 
-void SetBuiltFail(const std::string& reason)
+void SetStatusIf(uint64_t serial, int state, const std::string& reason)
 {
     std::lock_guard<std::mutex> lk(g_statusLock);
-    g_builtFailReason = reason;
+    if (g_statusSerial != serial)
+        return;
+    g_statusState = state;
+    g_statusReason = reason;
 }
 
 // The pack built into this DLL (build.ps1 -EmbedPack): resource 101 (RCDATA), compressed with the Compression API
@@ -294,139 +303,196 @@ bool LoadEmbeddedPack()
 
 std::wstring RealLibraryPath(const char** from);
 
-// The pack-less route (story B2): our recipe and kernels are built into this DLL (resource 102, tools/recipe/build_own.py),
-// the Intel parts come from the player's libxess_fg.dll on first use and the finished pack is cached in
-// <DLL dir>\f5low_cache\<key>\. Nothing is translated and no dxcompiler.dll is needed: the pack holds Intel's native
-// modules as they are and runs on the D3D12 path only (pack_build.h). The weights and root constants are rebuilt from the
-// libxess_fg.dll file (intel_file_source); F5LOW_DEV_CAP (PSO capture log) replaces the derived root constants (development).
-// Runs once, at the first PackDir() call that finds no other pack; the result is kept.
-// The folder is UTF-8 (long_path.h). `fromCache`: EnsurePack found it finished (a damaged one is deleted and made again,
-// RepairBuiltPack). All callers hold g_builtLock.
-std::mutex g_builtLock;
-std::string g_builtDir;
-bool g_builtFromCache = false;
-bool g_builtRan = false;
+// The pack-less route: our recipe and kernels are built into this DLL (resource 102, tools/recipe/build_own.py), the Intel parts
+// come from the player's libxess_fg.dll. The pack is made IN MEMORY, on a background thread, at every start of the process
+// (src/pack_build.cpp): nothing Intel-derived is written to any file. Nothing is translated and no dxcompiler.dll is needed:
+// the pack holds Intel's native modules as they are and runs on the D3D12 path only (pack_build.h). The weights and root
+// constants are rebuilt from the libxess_fg.dll file (intel_file_source); F5LOW_DEV_CAP (PSO capture log) replaces the derived
+// root constants (development).
+//
+// States (g_packState, under g_packMu; g_packStateA mirrors it for polling):
+//   Idle -> Building (StartPackBuild: the first API call that finds no other pack) -> Ready | Failed.
+// Nothing waits for the build except xefgSwapChainD3D12CreateContext, for at most kCreateWaitMs; a context made while the pack is
+// still being built has its first Build deferred (xefg_own.h, Own::StartDeferredBuild) and passes the frames through until then.
+enum PackState { kPackIdle = 0, kPackBuilding, kPackReady, kPackFailed };
+std::mutex g_packMu;
+std::condition_variable g_packCv;
+int g_packState = kPackIdle;                    // under g_packMu
+std::atomic<int> g_packStateA { kPackIdle };    // the same, for polling
+std::string g_packFail;                         // why it failed (under g_packMu)
+LARGE_INTEGER g_packT0 {}, g_packT1 {};         // started / finished (under g_packMu)
+constexpr DWORD kCreateWaitMs = 50;             // the longest D3D12CreateContext waits for the pack (hard cap)
 
-void RunBuiltPack()
+double MsSinceStart(const LARGE_INTEGER& t)
 {
-    std::string& result = g_builtDir;
+    return 1000.0 * static_cast<double>(t.QuadPart - g_packT0.QuadPart) / static_cast<double>(g_freq.QuadPart);
+}
+
+// Builds the pack from the player's libxess_fg.dll; on the pack thread only. Logs the one failure line.
+bool RunBuiltPack(std::shared_ptr<const packbuild::Files>& files, std::string& err)
+{
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&RunBuiltPack), &self);
+    HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(102), MAKEINTRESOURCEW(10));
+    const uint8_t* bytes = res ? static_cast<const uint8_t*>(LockResource(LoadResource(self, res))) : nullptr;
+    const size_t bytesSize = res ? SizeofResource(self, res) : 0;
+    packbuild::Bundle bundle;
+    std::string why;
+    if (!bytes || !packbuild::ParseBundle(bytes, bytesSize, bundle, &why))
     {
-        HMODULE self = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&RunBuiltPack), &self);
-        HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(102), MAKEINTRESOURCEW(10));
-        const uint8_t* bytes = res ? static_cast<const uint8_t*>(LockResource(LoadResource(self, res))) : nullptr;
-        const size_t bytesSize = res ? SizeofResource(self, res) : 0;
-        static packbuild::Bundle bundle;
-        bundle.clear();
-        std::string err;
-        if (!bytes || !packbuild::ParseBundle(bytes, bytesSize, bundle, &err))
+        err = "own generator unavailable: no pack found and this DLL carries no recipe (" + (why.empty() ? std::string("no resource") : why) + ")";
+        Log("%s", err.c_str());
+        return false;
+    }
+    const char* from = "";
+    packbuild::Request req;
+    req.libxessPath = RealLibraryPath(&from);
+    req.own = &bundle;
+    wchar_t w[MAX_PATH] = {}, c[MAX_PATH] = {};
+    // Weights and root constants: rebuilt from the player's libxess_fg.dll file (IntelFileSource). Development overrides only:
+    // F5LOW_DEV_CAP (a PSO capture) replaces the derived root constants, and F5LOW_DEV_WEIGHTS (a weight dump folder, with
+    // F5LOW_DEV_CAP) replaces everything.
+    std::unique_ptr<packbuild::IntelDataSource> source;
+    std::unique_ptr<packbuild::DevCaptureSource> capSource;
+    packbuild::IntelFileSource* fileSource = nullptr;
+    const bool haveCap = GetEnvironmentVariableW(L"F5LOW_DEV_CAP", c, MAX_PATH) != 0;
+    if (haveCap && GetEnvironmentVariableW(L"F5LOW_DEV_WEIGHTS", w, MAX_PATH))
+        source = std::make_unique<packbuild::DevCaptureSource>(w, c);
+    else
+    {
+        const auto it = bundle.find("i0/parts.json");
+        const auto mt = bundle.find("i0/manifest.tmpl");
+        if (it != bundle.end() && mt != bundle.end())
         {
-            Log("own generator unavailable: no pack found and this DLL carries no recipe (%s)", err.empty() ? "no resource" : err.c_str());
-            SetBuiltFail("own generator unavailable: no pack found and this DLL carries no recipe (" + (err.empty() ? std::string("no resource") : err) + ")");
-            return;
-        }
-        const std::wstring dir(g_dir);
-        const char* from = "";
-        packbuild::Request req;
-        req.libxessPath = RealLibraryPath(&from);
-        req.cacheRoot = dir + L"\\f5low_cache";
-        // not writable: %LOCALAPPDATA%\f5low\f5low_cache (the folder name stays: DiscardPack checks it)
-        if (const std::wstring fb = FallbackDir(); !fb.empty())
-            req.fallbackRoot = fb + L"\\f5low_cache";
-        req.own = &bundle;
-        req.bundleBytes = bytes;
-        req.bundleSize = bytesSize;
-        wchar_t w[MAX_PATH] = {}, c[MAX_PATH] = {};
-        // Weights and root constants: rebuilt from the player's libxess_fg.dll file (IntelFileSource). Development
-        // overrides only: F5LOW_DEV_CAP (a PSO capture) replaces the derived root constants, and F5LOW_DEV_WEIGHTS (a weight
-        // dump folder, with F5LOW_DEV_CAP) replaces everything.
-        std::unique_ptr<packbuild::IntelDataSource> source;
-        std::unique_ptr<packbuild::DevCaptureSource> capSource;
-        packbuild::IntelFileSource* fileSource = nullptr;
-        const bool haveCap = GetEnvironmentVariableW(L"F5LOW_DEV_CAP", c, MAX_PATH) != 0;
-        if (haveCap && GetEnvironmentVariableW(L"F5LOW_DEV_WEIGHTS", w, MAX_PATH))
-            source = std::make_unique<packbuild::DevCaptureSource>(w, c);
-        else
-        {
-            const auto it = bundle.find("i0/parts.json");
-            const auto mt = bundle.find("i0/manifest.tmpl");
-            if (it != bundle.end() && mt != bundle.end())
+            auto file = std::make_unique<packbuild::IntelFileSource>(req.libxessPath, it->second, mt->second);
+            fileSource = file.get();
+            if (haveCap)
             {
-                auto file = std::make_unique<packbuild::IntelFileSource>(req.libxessPath, it->second, mt->second);
-                fileSource = file.get();
-                if (haveCap)
-                {
-                    capSource = std::make_unique<packbuild::DevCaptureSource>(std::wstring(c));
-                    file->SetRootConstantSource(capSource.get());
-                }
-                source = std::move(file);
+                capSource = std::make_unique<packbuild::DevCaptureSource>(std::wstring(c));
+                file->SetRootConstantSource(capSource.get());
             }
+            source = std::move(file);
         }
-        req.data = source.get();
-        std::vector<std::string> lines;
-        req.log = [&](const std::string& l) { lines.push_back(l); };
-        const ULONGLONG t0 = GetTickCount64();
-        std::wstring packDir;
-        const packbuild::Outcome o = packbuild::EnsurePack(req, packDir, err);
-        if (o == packbuild::Outcome::Failed)
-        {
-            Log("own generator unavailable: %s", err.c_str());      // the one line: what is missing
-            SetBuiltFail("own generator unavailable: " + err);
-            return;
-        }
-        for (const std::string& l : lines)
-            Log("%s", l.c_str());
-        if (o == packbuild::Outcome::Built && fileSource)
-        {
-            const auto& st = fileSource->GetStats();
-            Log("weights from libxess_fg.dll: %zu uploads rebuilt and hash-checked (read %.0f ms, %zu weight blobs located %.0f ms, %zu vector runs %.0f ms, decode %.0f ms); root constants: %zu blocks derived and hash-checked (%.0f ms)",
-                st.uploads, st.readMs, st.blobs, st.blobsMs, st.runs, st.runsMs, st.decodeMs, st.rcBlocks, st.rcMs);
-        }
-        if (o == packbuild::Outcome::Built)
-            Log("pack build took %llu ms on the calling thread (one-time; later runs use the cache)", GetTickCount64() - t0);
-        g_builtFromCache = o == packbuild::Outcome::Cached;
-        result = longpath::ToUtf8(packDir);
     }
-}
-
-std::string BuiltPackDir()
-{
-    std::lock_guard<std::mutex> lk(g_builtLock);
-    if (!g_builtRan)
+    req.data = source.get();
+    std::vector<std::string> lines;
+    req.log = [&](const std::string& l) { lines.push_back(l); };
+    packbuild::Report rep;
+    PROCESS_MEMORY_COUNTERS_EX before {};
+    K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&before), sizeof before);
+    const LARGE_INTEGER t0 = [] { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t; }();
+    if (!packbuild::BuildInMemory(req, files, why, &rep))
     {
-        g_builtRan = true;
-        RunBuiltPack();
+        err = "own generator unavailable: " + why;
+        Log("%s", err.c_str());      // the one line: what is missing
+        return false;
     }
-    return g_builtDir;
+    PROCESS_MEMORY_COUNTERS_EX after {};
+    K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&after), sizeof after);
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    for (const std::string& l : lines)
+        Log("%s", l.c_str());
+    Log("pack built in memory (nothing written to disk, format %d): %zu files, %.1f MB kept; decode %.0f ms, weights + root "
+        "constants %.0f ms, assembly %.0f ms, %.0f ms in all on the pack thread",
+        packbuild::kFormatVersion, rep.files, static_cast<double>(rep.bytes) / 1e6, rep.decodeMs, rep.weightsMs, rep.writeMs,
+        1000.0 * static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(g_freq.QuadPart));
+    if (fileSource)
+    {
+        const auto& st = fileSource->GetStats();
+        Log("weights from libxess_fg.dll: %zu uploads rebuilt and hash-checked (read %.0f ms, %zu weight blobs located %.0f ms, %zu vector runs %.0f ms, decode %.0f ms); root constants: %zu blocks derived and hash-checked (%.0f ms)",
+            st.uploads, st.readMs, st.blobs, st.blobsMs, st.runs, st.runsMs, st.decodeMs, st.rcBlocks, st.rcMs);
+    }
+    Log("memory: the pack thread's peak was %.1f MB above where the process stood (peak commit %.1f MB, now %.1f MB, pack kept %.1f MB)",
+        after.PeakPagefileUsage > before.PrivateUsage ? static_cast<double>(after.PeakPagefileUsage - before.PrivateUsage) / 1e6 : 0.0,
+        static_cast<double>(after.PeakPagefileUsage) / 1e6, static_cast<double>(after.PrivateUsage) / 1e6, static_cast<double>(rep.bytes) / 1e6);
+    return true;
 }
 
-// A pack taken from the cache that failed to load or to build for D3D12 (a file changed or cut after the marker was
-// written): its folder is deleted and the pack made again, once per process. Returns the new folder ("" when it is not the
-// cached pack, was repaired before, or cannot be made).
-std::string RepairBuiltPack(const std::string& bad)
+// The pack thread: builds, publishes the files (xefgpack::SetBuiltFiles, immutable from then on), flips the state, then removes the
+// old on-disk caches of earlier versions. It holds a reference on this DLL, so it never runs after an unload.
+DWORD WINAPI PackBuildThread(void* mod)
 {
-    std::lock_guard<std::mutex> lk(g_builtLock);
-    static bool tried = false;
-    if (tried || !g_builtFromCache || bad != g_builtDir)
-        return {};
-    tried = true;
-    Log("the cached pack %s failed - deleting it and building the pack again", bad.c_str());
-    packbuild::DiscardPack(longpath::WidenUtf8(bad));
-    g_builtDir.clear();
-    g_builtFromCache = false;
-    RunBuiltPack();
-    return g_builtDir;
+    {
+        std::shared_ptr<const packbuild::Files> files;
+        std::string err;
+        const bool ok = RunBuiltPack(files, err);
+        if (ok)
+            xefgpack::SetBuiltFiles(std::const_pointer_cast<const xefgpack::PackFiles>(files));
+        files.reset();      // the loader's copy (BuiltFiles) is the one that stays
+        {
+            std::lock_guard<std::mutex> lk(g_packMu);
+            QueryPerformanceCounter(&g_packT1);
+            g_packFail = err;
+            g_packState = ok ? kPackReady : kPackFailed;
+            g_packStateA.store(g_packState, std::memory_order_release);
+        }
+        g_packCv.notify_all();
+        Log("pack %s %.1f ms after the first API call", ok ? "ready" : "FAILED", [] { std::lock_guard<std::mutex> lk(g_packMu); return MsSinceStart(g_packT1); }());
+        // The pack used to be kept on disk (Intel's modules and weights as plain files): delete what an earlier version left.
+        std::vector<std::wstring> roots { g_dir + L"\\f5low_cache" };
+        if (const std::wstring fb = FallbackDir(); !fb.empty())
+            roots.push_back(fb + L"\\f5low_cache");
+        for (const std::wstring& r : roots)
+            packbuild::RemoveLegacyCaches(r, [](const std::string& l) { Log("%s", l.c_str()); });
+    }
+    FreeLibraryAndExitThread(static_cast<HMODULE>(mod), 0);
 }
 
-// Where the pack comes from, first that exists: a pack folder next to this DLL (or XEFG_CUDA_PACK) - so a new pack can be
-// tried without rebuilding - then the pack embedded in this DLL (personal builds), then the cache / a build from the
-// player's libxess_fg.dll (BuiltPackDir).
-std::string PackDir()
+// Starts the build once (idempotent). Never blocks; nothing is read on the caller's thread.
+void StartPackBuild()
 {
-    char env[MAX_PATH];
-    if (GetEnvironmentVariableA("XEFG_CUDA_FORWARD", env, sizeof(env)))
-        return {};
+    std::lock_guard<std::mutex> lk(g_packMu);
+    if (g_packState != kPackIdle)
+        return;
+    g_packState = kPackBuilding;
+    g_packStateA.store(kPackBuilding, std::memory_order_release);
+    QueryPerformanceCounter(&g_packT0);
+    HMODULE self = nullptr;
+    HANDLE t = nullptr;
+    // a reference on this DLL for the thread (released by FreeLibraryAndExitThread)
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&StartPackBuild), &self))
+        t = CreateThread(nullptr, 0, PackBuildThread, self, 0, nullptr);
+    if (!t)
+    {
+        if (self)
+            FreeLibrary(self);
+        g_packFail = "own generator unavailable: the pack thread could not be started";
+        g_packState = kPackFailed;
+        g_packStateA.store(kPackFailed, std::memory_order_release);
+        Log("%s", g_packFail.c_str());
+        return;
+    }
+    CloseHandle(t);
+    Log("pack: building in the background");
+}
+
+// The pack's state now, as Own::packPoll wants it: 0 still being built, 1 ready, 2 failed (`why` the reason of the failure).
+int PackPoll(std::string* why)
+{
+    const int s = g_packStateA.load(std::memory_order_acquire);
+    if (s == kPackFailed && why)
+    {
+        std::lock_guard<std::mutex> lk(g_packMu);
+        *why = g_packFail;
+    }
+    return s == kPackReady ? 1 : s == kPackFailed ? 2 : 0;
+}
+
+// Waits for the build for at most `ms`; returns the state then.
+int PackWait(DWORD ms)
+{
+    std::unique_lock<std::mutex> l(g_packMu);
+    g_packCv.wait_for(l, std::chrono::milliseconds(ms), [] { return g_packState != kPackBuilding; });
+    return g_packState;
+}
+
+// Where an explicit pack comes from, first that exists: a pack folder next to this DLL (or XEFG_CUDA_PACK) - so a new pack can be
+// tried without rebuilding - then the pack embedded in this DLL (personal builds). Those are read from disk / the resource
+// as they are. Empty: none; the pack is then built from the player's libxess_fg.dll (kBuiltDir).
+std::string ExplicitPackDir()
+{
     // UTF-8 from here on (long_path.h): the environment and the DLL's folder are read as wide strings
     std::wstring wdir;
     if (const DWORD n = GetEnvironmentVariableW(L"XEFG_CUDA_PACK", nullptr, 0))
@@ -436,35 +502,78 @@ std::string PackDir()
     }
     else
         wdir = std::wstring(g_dir) + L"\\xefg_pack";
-    std::string dir = longpath::ToUtf8(wdir);
     if (GetFileAttributesW(longpath::ExtendIfLong(wdir + L"\\manifest.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
-        return dir;
+        return longpath::ToUtf8(wdir);
     if (LoadEmbeddedPack())
         return std::string(xefgpack::kEmbeddedDir);
-    return BuiltPackDir();
+    return {};
 }
 
-// Whether the pack runs on the GPU behind a D3D12 device: `have` its compute capability as sm_NN (0: no CUDA driver,
-// or no CUDA device behind that adapter - another vendor's GPU), `need` the oldest one the pack runs on, fallbacks
-// taken (Pack::NeedSm; Pack::kNoSm when it does not load). Never throws: it runs inside a C API entry point.
-void PackFit(ID3D12Device* d, const std::string& pack, int& need, int& have)
+// Which pack this process uses.
+struct PackRoute
 {
-    need = have = 0;
+    bool forward = false;       // XEFG_CUDA_FORWARD: Intel's library does everything
+    std::string dir;            // an explicit pack (folder / embedded), else kBuiltDir
+    bool built() const { return !forward && dir == xefgpack::kBuiltDir; }
+};
+PackRoute ResolvePack()
+{
+    PackRoute r;
+    char env[MAX_PATH];
+    if (GetEnvironmentVariableA("XEFG_CUDA_FORWARD", env, sizeof(env)))
+    {
+        r.forward = true;
+        return r;
+    }
+    r.dir = ExplicitPackDir();
+    if (r.dir.empty())
+        r.dir = xefgpack::kBuiltDir;
+    return r;
+}
+
+// The GPU behind `d`: its compute capability as sm_NN (0: no CUDA driver, or no CUDA device behind that adapter - another
+// vendor's GPU). Never throws: it runs inside a C API entry point.
+int GpuSm(ID3D12Device* d)
+{
     try
     {
         xefgpack::Cuda cu;
         if (!cu.Load() || cu.Init(0))
-            return;
+            return 0;
         const xefgpack::CUdevice dv = xefgio::Interop::FindDevice(cu, d);
-        if (dv < 0)
-            return;
-        have = xefgio::Interop::DeviceSm(cu, dv);
-        need = xefgpack::Pack::NeedSm(cu, pack, xefgown::IsD3dOnlyPack(pack));
+        return dv < 0 ? 0 : xefgio::Interop::DeviceSm(cu, dv);
     }
     catch (...)
     {
-        need = xefgpack::Pack::kNoSm;
+        return 0;
     }
+}
+
+// The oldest GPU the pack runs on, sm_NN (Pack::NeedSm; Pack::kNoSm when it does not load). Reads the pack's manifests and PTX only
+// (no CUDA calls). Never throws.
+int PackNeedSm(const std::string& pack)
+{
+    try
+    {
+        xefgpack::Cuda cu;      // not loaded: NeedSm makes no CUDA call
+        return xefgpack::Pack::NeedSm(cu, pack, xefgown::IsD3dOnlyPack(pack));
+    }
+    catch (...)
+    {
+        return xefgpack::Pack::kNoSm;
+    }
+}
+
+// "" when a GPU of `have` (sm_NN) runs the pack, else why not (the text of the log and the status).
+std::string FitReason(int have, int need)
+{
+    if (!have)
+        return "no CUDA device behind this adapter";
+    if (need == xefgpack::Pack::kNoSm)
+        return "the pack does not load";
+    if (have < need)
+        return "this GPU is sm_" + std::to_string(have) + ", the pack's kernels need sm_" + std::to_string(need);
+    return {};
 }
 
 // How the pack runs (xefg_own.h): "d3d12" (default) or "cuda". The CUDA kernels cost ~30% less GPU per
@@ -695,7 +804,12 @@ struct SlowApi
 
 xefg_swapchain_result_t xefgSwapChainGetVersion(xefg_swapchain_version_t* v)
 {
-    if (!PackDir().empty())
+    // The first API call starts the pack's build in the background (it never waits for it). Ours answers unless the build has
+    // failed already; Intel's library then answers.
+    const PackRoute route = ResolvePack();
+    if (route.built())
+        StartPackBuild();
+    if (!route.forward && !(route.built() && g_packStateA.load(std::memory_order_acquire) == kPackFailed))
     {
         if (!v)
             return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
@@ -860,7 +974,7 @@ extern "C" __declspec(dllexport) int __cdecl f5lowGetStatus(char* reason, int re
     std::lock_guard<std::mutex> lk(g_statusLock);
     if (reason && reasonSize > 0)
     {
-        std::string t = g_statusState == 0 ? "not decided yet (no context created)" : g_statusReason;
+        std::string t = g_statusState == 0 && g_statusReason.empty() ? "not decided yet (no context created)" : g_statusReason;
         size_t n = std::min(t.size(), static_cast<size_t>(reasonSize - 1));
         // do not cut a UTF-8 sequence in the middle
         while (n > 0 && n < t.size() && (static_cast<unsigned char>(t[n]) & 0xC0) == 0x80)
@@ -965,54 +1079,70 @@ xefg_swapchain_result_t xefgSwapChainEnableDebugFeature(xefg_swapchain_handle_t 
 // ---- D3D12 -----------------------------------------------------------------------------------------
 xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_swapchain_handle_t* ph)
 {
-    std::string pack = PackDir();
+    const auto callStart = std::chrono::steady_clock::now();
+    const PackRoute route = ResolvePack();
+    std::string pack = route.forward ? std::string() : route.dir;
     std::string fwdReason;      // why this context forwards (f5lowGetStatus)
+    int need = 0, have = 0;
+    bool deferred = false;      // the pack is made in the background and so is this context's first build (xefg_own.h)
+    if (route.forward)
+        fwdReason = "forwarding to Intel XeFG: XEFG_CUDA_FORWARD is set";
+    else if (route.built() && d && ph)
     {
-        char fenv[8];
-        if (pack.empty())
+        // The pack is built in memory on a thread of its own (started by the first API call, else here). The GPU check that
+        // needs no pack runs first, on this thread, meanwhile; then at most kCreateWaitMs for the pack, never longer.
+        StartPackBuild();
+        have = GpuSm(d);
+        // the cap counts from the start of this call (the GPU check above has used part of it)
+        const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - callStart).count();
+        const int st = PackWait(used >= kCreateWaitMs ? 0 : static_cast<DWORD>(kCreateWaitMs - used));
+        std::string misfit;
+        if (st == kPackFailed)
         {
-            if (GetEnvironmentVariableA("XEFG_CUDA_FORWARD", fenv, sizeof(fenv)))
-                fwdReason = "forwarding to Intel XeFG: XEFG_CUDA_FORWARD is set";
-            else
-            {
-                std::lock_guard<std::mutex> lk(g_statusLock);
-                fwdReason = g_builtFailReason.empty() ? "own generator unavailable: no pack" : g_builtFailReason;
-                fwdReason += " - forwarding to Intel XeFG";
-            }
+            std::string why;
+            PackPoll(&why);
+            fwdReason = (why.empty() ? std::string("own generator unavailable: no pack") : why) + " - forwarding to Intel XeFG";
+            pack.clear();
+        }
+        else if (!have)
+        {
+            fwdReason = "forwarding to Intel XeFG: " + FitReason(have, 0);
+            Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", FitReason(have, 0).c_str());
+            pack.clear();
+        }
+        else if (st == kPackReady && !(misfit = FitReason(have, need = PackNeedSm(pack))).empty())
+        {
+            fwdReason = "forwarding to Intel XeFG: " + misfit;
+            Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", misfit.c_str());
+            pack.clear();
+        }
+        else
+        {
+            // Own from here: a pack still being made does not hold the call (the frames pass through until it is ready; a
+            // failure then ends in status 3, since the context is ours already). The first Build is deferred either way.
+            deferred = true;
+            if (st != kPackReady)
+                Log("D3D12CreateContext: the pack is still being built after %lu ms - the frames pass through until it is ready", kCreateWaitMs);
         }
     }
-    int need = 0, have = 0;
-    if (!pack.empty() && d && ph)
+    else if (!pack.empty() && d && ph)
     {
-        // A GPU the pack's kernels cannot run on (an older architecture, or not NVIDIA) gets Intel's library from the start:
-        // found only at the build, the pack's failure left frame generation off on our own swap chain.
-        PackFit(d, pack, need, have);
-        if (need == xefgpack::Pack::kNoSm)
+        // An explicit pack (folder, embedded): a GPU its kernels cannot run on (an older architecture, or not NVIDIA) gets
+        // Intel's library from the start: found only at the build, the pack's failure left frame generation off on our own
+        // swap chain.
+        need = PackNeedSm(pack);
+        have = GpuSm(d);
+        if (const std::string misfit = FitReason(have, need); !misfit.empty())
         {
-            // a cached pack that does not load: make it again (once) and look again
-            const std::string fresh = RepairBuiltPack(pack);
-            if (!fresh.empty())
-            {
-                pack = fresh;
-                PackFit(d, pack, need, have);
-            }
-        }
-        if (have < need || !have)
-        {
-            Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", !have ? "no CUDA device behind this adapter"
-                : need == xefgpack::Pack::kNoSm ? "the pack does not load"
-                : ("this GPU is sm_" + std::to_string(have) + ", the pack's kernels need sm_" + std::to_string(need)).c_str());
-            fwdReason = std::string("forwarding to Intel XeFG: ") +
-                        (!have ? "no CUDA device behind this adapter"
-                         : need == xefgpack::Pack::kNoSm ? "the pack does not load"
-                         : "this GPU is sm_" + std::to_string(have) + ", the pack's kernels need sm_" + std::to_string(need));
+            Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", misfit.c_str());
+            fwdReason = "forwarding to Intel XeFG: " + misfit;
             pack.clear();
         }
     }
     if (!pack.empty() && d && ph)
     {
-        const std::string path = PathSetting();
-        xefgown::g_repairBuiltPack = &RepairBuiltPack;
+        // a pack built on this PC runs on the D3D12 path only (the generator says so once, at its build)
+        const std::string path = route.built() ? std::string("d3d12") : PathSetting();
         auto o = xefgown::Own::Create(d, pack, path, GeneratorSetting());
         if (!o)
         {
@@ -1050,13 +1180,27 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             g_own[*ph] = o;
         }
         {
-            bool cached;
+            const char* src = pack == xefgpack::kEmbeddedDir ? "embedded pack" : pack == xefgpack::kBuiltDir ? "pack built in memory" : "pack folder";
+            if (deferred)
             {
-                std::lock_guard<std::mutex> bl(g_builtLock);
-                cached = g_builtFromCache;
+                // status 0 until the first build is done on its own thread; then 1 (or 3: a late failure, no way back to Intel's)
+                const uint64_t serial = SetStatus(0, "building its frame generator in the background");
+                const std::string from = src;
+                o->packPoll = &PackPoll;
+                o->packFit = [have] { return FitReason(have, PackNeedSm(xefgpack::kBuiltDir)); };
+                o->deferredDone = [serial, from](bool ok, const std::string& why) {
+                    if (ok)
+                        Log("deferred first build: ready, generation can start");
+                    else
+                        Log("deferred first build: FAILED - passing frames through: %s", why.c_str());
+                    if (ok)
+                        SetStatusIf(serial, 1, "own generator (" + from + "), D3D12");
+                    else
+                        SetStatusIf(serial, 3, why.compare(0, 25, "own generator unavailable") == 0 ? why : "own generator unavailable: " + why);
+                };
             }
-            const char* src = pack == xefgpack::kEmbeddedDir ? "embedded pack" : g_builtDir == pack ? (cached ? "pack built on this PC, cache hit" : "pack built on this PC") : "pack folder";
-            SetStatus(1, std::string("own generator (") + src + "), D3D12");
+            else
+                SetStatus(1, std::string("own generator (") + src + "), D3D12");
         }
         Log("D3D12CreateContext device=%p -> own h=%p, pack %s (needs sm_%d, GPU sm_%d), path %s, early %d, pacer %s%s (CUDA path), max lag "
             "%.2f, max delay %.2f app frames",

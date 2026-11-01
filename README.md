@@ -5,7 +5,7 @@ pluggable frame generators:
 
 | generator | makes the frames | GPUs |
 |---|---|---|
-| own (XeFG Tensor) | our kernels (D3D12 command lists + NVAPI cubins); Intel's native modules, weights and root constants read from the player's `libxess_fg.dll` on first use (no translation, no `dxcompiler.dll`) | NVIDIA |
+| own (XeFG Tensor) | our kernels (D3D12 command lists + NVAPI cubins); Intel's native modules, weights and root constants read from the player's `libxess_fg.dll` into memory at every start (nothing written to disk; no translation, no `dxcompiler.dll`) | NVIDIA |
 | intel | Intel's `libxess_fg.dll` | any |
 | dlssg | NVIDIA DLSS-G through Streamline | NVIDIA |
 | fsr | AMD FidelityFX frame generation | any |
@@ -35,8 +35,10 @@ SHA-256 only. The audit in
 `@name`) and `parts.json` (how each file is made; the nested `hdr/` pack alike). `tools/kernels/` holds our
 generators and HLSL templates. Intel modules appear only as SHA-256 of the decoded module, weights as upload
 ordinal + size + SHA-256. At run time `f5low.dll` rebuilds the pack from the player's `libxess_fg.dll` (decode, find
-modules by hash, weights and root constants from the file) and caches it in `f5low_cache\` next to the DLL (`%LOCALAPPDATA%\f5low\f5low_cache\` when that folder is not writable); the
-pack-less pack runs on the D3D12 path only (`docs/PACKLESS.md`). `tools/recipe/build_pack.py` recombines the recipe with
+modules by hash, weights and root constants from the file) in memory, on a background thread, at every start: nothing
+Intel-derived is ever written to disk, and the game's thread does not wait for it (`f5lowGetStatus` says 0, "building its frame
+generator in the background", while the frames pass through). The pack-less pack runs on the D3D12 path only
+(`docs/PACKLESS.md`). `tools/recipe/build_pack.py` recombines the recipe with
 the Intel parts of a local `libxess_fg.dll` and a weight capture offline (a dev pack with PTX twins, both paths);
 `compare_pack.py` checks a built pack against a reference (`--packless` for the runtime one);
 `classify.py` derives a recipe from a finished pack (dev tool, needs the old libxess-weights checkout). Built packs
