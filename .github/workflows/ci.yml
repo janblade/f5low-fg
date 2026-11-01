@@ -8,12 +8,12 @@ jobs:
   audit-and-build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0   # build number = commit count
 
       # Intel's public XeSS SDK, headers only (the version OptiScaler pins). Read at build time, never copied in.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: intel/xess
           ref: v3.0.2
