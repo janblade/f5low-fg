@@ -4,11 +4,12 @@
 // presenter thread, pacing, the gate, XeLL reporting, presentation. A generator makes the in-between frames. Today one
 // runs (generators/own.h, "XeFG Tensor"); generators/stubs.h registers intel, dlssg and fsr as "not available yet".
 //
-// The interface follows the code as it is: the own generator hands the host its input buffers (the host copies the
-// game's frame, motion and depth into them), makes a generated frame either inside a command list of the host's
-// (InCommandLists: the D3D12 path) or on a CUDA stream that signals a fence (the CUDA path: Launch, DoneFence,
-// RingFrame). A present-sink backend (AttachSink) would instead be handed a swap chain proxy and present itself.
-// Virtual calls are per app frame or per pass; nothing inside the pack runners is virtual.
+// Two classes. IGenerator is the narrow contract every backend implements: what it is (Caps), whether the host can use
+// it, build / rebuild / stop. IPackGenerator is the own generator's surface and only its: the host copies the game's frame,
+// motion and depth into the pack's buffers (Buf) and drives passes, recorded into a command list of the host's (the D3D12
+// path) or started on a CUDA stream that signals a fence (the CUDA path: Launch, DoneFence, RingFrame). The host reaches it
+// through IGenerator::AsPack(). A frames-only (fsr) or present-sink (intel, dlssg) backend needs host work first
+// (docs/GENERATORS.md). Virtual calls are per app frame or per pass; nothing inside the pack runners is virtual.
 #pragma once
 
 #include "xefg_pack.h"
@@ -100,20 +101,33 @@ struct GenBuild
     std::function<bool()> packBuilt;                // the new pack is built: the host makes its staging; false fails the build
 };
 
+class IPackGenerator;
+
+// The contract every backend implements.
 class IGenerator
 {
 public:
     virtual ~IGenerator() = default;
     virtual GenCaps Caps() const = 0;
+    // The host's callbacks (CUDA host functions, diagnostics); set once, before the first Build.
+    virtual void SetHost(const GenHost& h) { (void)h; }
     // Present-sink backends: handed the host's sink factory instead of the real one; frames come back through the sink.
     virtual bool AttachSink(IDXGIFactory* sinkFactory) { (void)sinkFactory; return false; }
+    // The pack surface (below) if this generator has one; null otherwise. Only the own generator has it today.
+    virtual IPackGenerator* AsPack() { return nullptr; }
 
-    // ---- life cycle -------------------------------------------------------------------------------------
-    virtual bool Build(const GenBuild& b) = 0;                          // the first build
+    virtual bool Build(const GenBuild& b) = 0;                                  // the first build
     virtual bool Rebuild(const xefgpack::Sizes& want, const GenBuild& b) = 0;   // other sizes; nothing may be using the old one
-    virtual void Drain() = 0;                                           // all submission posted so far has run
-    virtual void Stop() = 0;                                            // no more submission (before the host lets go of its queues)
-    virtual void Shutdown() = 0;                                        // release everything
+    virtual void Drain() = 0;                                                   // all submission posted so far has run
+    virtual void Stop() = 0;                                                    // no more submission (before the host lets go of its queues)
+    virtual void Shutdown() = 0;                                                // release everything
+};
+
+// The own generator's pack surface: input buffers the host copies into, passes the host drives.
+class IPackGenerator
+{
+public:
+    virtual ~IPackGenerator() = default;
     // The generator's thread-bound state (the CUDA context) current on this thread for a GenScope.
     virtual bool PushContext() = 0;
     virtual void PopContext() = 0;
@@ -177,7 +191,7 @@ public:
 class GenScope
 {
 public:
-    explicit GenScope(IGenerator& g) : gen(g), pushed(g.PushContext()) {}
+    explicit GenScope(IPackGenerator& g) : gen(g), pushed(g.PushContext()) {}
     ~GenScope()
     {
         if (pushed)
@@ -187,7 +201,7 @@ public:
     GenScope& operator=(const GenScope&) = delete;
 
 private:
-    IGenerator& gen;
+    IPackGenerator& gen;
     bool pushed;
 };
 

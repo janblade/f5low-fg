@@ -788,6 +788,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     {
         const std::string path = PathSetting();
         auto o = xefgown::Own::Create(d, pack, path, GeneratorSetting());
+        if (!o)
+            return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
         o->genMode = GenQueueSetting();
         o->genPriority = GenPrioritySetting();
         o->genSpread = GenSpreadSetting();

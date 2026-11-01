@@ -31,14 +31,17 @@ namespace xefgown
 {
 using namespace xefgio;
 
-class OwnGenerator : public IGenerator
+class OwnGenerator : public IGenerator, public IPackGenerator
 {
 public:
-    OwnGenerator(ID3D12Device* d, std::string dir, bool d3d, GenSettings& s, const GenHost& h)
-        : dev(d), packDir(std::move(dir)), d3dPath(d3d), prof(s.prof), profDispatches(s.profDispatches), native(s.native), host(h)
+    OwnGenerator(ID3D12Device* d, std::string dir, bool d3d, GenSettings& s)
+        : dev(d), packDir(std::move(dir)), d3dPath(d3d), cfg(s)
     {
     }
     ~OwnGenerator() override { Shutdown(); }
+
+    IPackGenerator* AsPack() override { return this; }
+    void SetHost(const GenHost& h) override { host = h; }
 
     GenCaps Caps() const override
     {
@@ -58,7 +61,7 @@ public:
         char env[MAX_PATH];
         noPatch = GetEnvironmentVariableA("XEFG_CUDA_NOPATCH", env, sizeof(env)) != 0;
         if (GetEnvironmentVariableA("XEFG_CUDA_PROF", env, sizeof(env)) && env[0] == '0')
-            prof = false;
+            cfg.prof = false;
         if (!io.Init(dev))
             return Fail("interop: " + io.error);
         io.cu.CtxPopCurrent(nullptr);         // Init left the context current on this thread
@@ -152,7 +155,10 @@ public:
                     if (set[i])
                         io.cu.EventDestroy(set[i]);
             if (stream)
+            {
+                io.cu.StreamSynchronize(stream);    // a queued host function (Stamp) must not run after we are gone
                 io.cu.StreamDestroy(stream);
+            }
             pack.reset();
             ReleaseShared();
         }
@@ -313,7 +319,7 @@ public:
                 w = curOk && (!doPrev || pack->SwapRB(stream, rPrev)) && (uiMode < 2 || pack->SwapRB(stream, rBb)) &&
                     ((uiMode != 2 && uiMode != 3 && uiMode != 5) || pack->SwapRB(stream, rUi));
             }
-            if (prof && !evW)
+            if (cfg.prof && !evW)
             {
                 io.cu.EventCreate(&evW, 0);
                 io.cu.EventCreate(&evH, 0);
@@ -324,7 +330,7 @@ public:
                 for (CUevent& e : evS)
                     io.cu.EventCreate(&e, 0);
             }
-            const bool timed = prof && w;
+            const bool timed = cfg.prof && w;
             if (timed)
                 io.cu.EventRecord(evW, stream);
             if (!noPatch)
@@ -351,7 +357,7 @@ public:
                 QueryPerformanceFrequency(&cqf);
                 if (timed)
                     cpuLaunch += static_cast<double>(cq1.QuadPart - cq0.QuadPart) * 1000.0 / static_cast<double>(cqf.QuadPart);
-                else if (!prof)
+                else if (!cfg.prof)
                     pack->tSetParams = pack->tGraphLaunch = 0, pack->lastDirty = 0;     // no prof line reads them
                 if (timed && w)
                     io.cu.EventRecord(evG[k - 1], stream);
@@ -473,7 +479,7 @@ public:
         const size_t n = pack->disp.size();
         const bool split = splitAt > 0 && splitAt < n;
         const size_t from = split && k > 1 ? splitAt : 0;
-        if (prof && !stampHeap)
+        if (cfg.prof && !stampHeap)
         {
             D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>(3 * kSlots) };
             D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
@@ -485,12 +491,12 @@ public:
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&stampHeap))) ||
                 FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&stampRb))))
-                prof = false;
+                cfg.prof = false;
             tsQueue->GetTimestampFrequency(&tsFreq);
         }
         // Prof=2: also a timestamp after every dispatch (each then alone behind a UAV barrier), summed per dispatch
         // as XeFGPsoCap sums Intel's - the like-for-like figure for MFG Unlocker's runs.
-        if (prof && profDispatches && !dispHeap)
+        if (cfg.prof && cfg.profDispatches && !dispHeap)
         {
             D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>((n + 1) * kSlots) };
             D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
@@ -502,19 +508,19 @@ public:
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&dispHeap))) ||
                 FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&dispRb))))
-                profDispatches = false;
+                cfg.profDispatches = false;
             dispMs.assign(n, 0.0);
         }
-        ID3D12QueryHeap* ds = prof && profDispatches ? dispHeap : nullptr;
+        ID3D12QueryHeap* ds = cfg.prof && cfg.profDispatches ? dispHeap : nullptr;
         const UINT d0 = static_cast<UINT>((n + 1) * slot);
         const UINT q0 = static_cast<UINT>(3 * slot);
-        if (prof)
+        if (cfg.prof)
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0);
         bool ok = dpack->Record(g, from, split && from == 0 ? splitAt : from, ds, d0);
-        if (prof)
+        if (cfg.prof)
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 1);
         ok = ok && dpack->Record(g, split && from == 0 ? splitAt : from, n, ds, d0);
-        if (prof)
+        if (cfg.prof)
         {
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 2);
             g->ResolveQueryData(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0, 3, stampRb, 24 * slot);
@@ -545,7 +551,7 @@ public:
         const double head = double(s[1] - s[0]) * 1000.0 / double(tsFreq), tail = double(s[2] - s[1]) * 1000.0 / double(tsFreq);
         stampRb->Unmap(0, &none);
         const size_t n = dispMs.size();
-        if (profDispatches && dispRb && n)
+        if (cfg.profDispatches && dispRb && n)
         {
             const size_t b0 = (n + 1) * i, from = stampedFrom[i];
             const D3D12_RANGE dr { 8 * (b0 + from), 8 * (b0 + n + 1) };
@@ -569,7 +575,7 @@ public:
         if (++nTail % 240 == 0)
         {
             XLog("prof: GPU per run, head %.2f ms (x%u), tail %.2f ms (x%u) [d3d12]", nHead ? gpuHead / nHead : 0.0, nHead, gpuTail / nTail, nTail);
-            if (profDispatches && dispApp)
+            if (cfg.profDispatches && dispApp)
             {
                 // Sums of each dispatch's own time (XeFGPsoCap's measure): per app frame, the head's, a tail's.
                 double all = 0, hd = 0;
@@ -783,7 +789,7 @@ private:
         {
             dpack = std::make_unique<D3DPack>(*pack, io.cu, nv);
             dpack->cubins = &cubins;
-            dpack->packNatives = native;
+            dpack->packNatives = cfg.native;
             const bool built3d = dpack->Build(dev, setupQueue, false);
             if (tempCuda)
             {
@@ -823,9 +829,7 @@ private:
     std::string packDir;
     Interop io;
     bool d3dPath = true;
-    bool& prof;                         // Prof=1 in f5low.ini (or XEFG_CUDA_PROF=1): per-run GPU timing (off by default)
-    bool& profDispatches;               // Prof=2: per-dispatch sums too (D3D12 path)
-    bool& native;                       // Native=0: the pack's native modules run as PTX (D3D12 path)
+    GenSettings& cfg;                   // Prof= (or XEFG_CUDA_PROF), Native= in f5low.ini, shared with the host
     GenHost host;
     bool shutDone = false;
     NvApi nv;
