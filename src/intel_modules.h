@@ -21,6 +21,7 @@ namespace intel_modules {
 
 using Sha256 = std::array<uint8_t, 32>;
 
+bool HashBytes(const void* data, size_t n, Sha256& out);  // SHA-256 (Windows CNG)
 std::string ToHex(const Sha256& h);
 bool ParseHex(const std::string& hex, Sha256& out);  // 64 hex digits, either case
 
