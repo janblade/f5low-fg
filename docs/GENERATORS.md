@@ -11,10 +11,16 @@ so adding one later is a backend, not a host change.
 
 ## Choosing a generator
 
-`F5LOW_GENERATOR` (env, set by OptiScaler before each `xefgSwapChainD3D12CreateContext`; the old name
-`XEFG_CUDA_GENERATOR` is still read), else `Generator=` in f5low.ini. Values: `own` (default), `intel`, `dlssg`,
-`fsr`. A generator that cannot start (library missing, unknown version, init failure, wrong GPU) logs one line with
-the reason and the host runs `own` (or, on a GPU `own` cannot run on, no frame generation).
+`F5LOW_GENERATOR` (env, set by OptiScaler before each `xefgSwapChainD3D12CreateContext`), else the old name
+`XEFG_CUDA_GENERATOR` (env), else `Generator=` in f5low.ini (`GeneratorSetting()` in `src/xefg_cuda.cpp`, next to the
+other settings). Values, case insensitive: `own` (default), `intel`, `dlssg`, `fsr`; anything else logs
+`f5low: generator "<value>" is unknown (own, intel, dlssg, fsr) - running own` and runs `own`.
+
+A generator that is not available logs one line, `f5low: generator <name> not available yet, running own`, and the host
+runs `own`. Today that is `intel`, `dlssg` and `fsr` (`src/generators/stubs.h`, `GenCaps::available = false`). Once they
+exist the same line, with the reason, also covers a generator that cannot start (library missing, unknown version, init
+failure, wrong GPU); on a GPU `own` cannot run on, the host then offers no frame generation. The generator that runs is
+logged once at context creation: `f5low: generator own (XeFG Tensor)`.
 
 ## What each vendor library owns
 
@@ -83,7 +89,14 @@ public:
 };
 ```
 
-The struct shape above is the target for step 4 of A1; the real one follows the code (`own` decides the details).
+The struct shape above was the target. The real interface is `src/generator.h` (`IGenerator`, `GenCaps`, `GenBuf`,
+`GenSlot`): it follows the code of `own` (`src/generators/own.h`, class `OwnGenerator`), the only generator that runs.
+The host (`Own` in `src/xefg_own.h`) reaches it only through that interface and owns it as a
+`std::unique_ptr<IGenerator>`. What the real interface adds to the sketch: the generator hands the host its input buffers
+(`Buf(GenSlot)`; the host copies the game's frame, motion and depth into them); a pass is either recorded into a command
+list of the host's (`PreparePass`, `RecordPass`, `RecordPassInto`: the D3D12 path) or started on a CUDA stream that
+signals a fence (`Launch`, `DoneFence`, `RingFrame`: the CUDA path); `Build` / `Rebuild` / `Shutdown` replace
+`Init` / `Resize`. `AttachSink` stays a default-returning-false virtual for the present-sink backends.
 
 ## Per backend, when it is built (stories A2-A4)
 
