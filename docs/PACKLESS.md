@@ -75,8 +75,18 @@ later improvement. Stale `*.tmp*` folders of killed builds are removed at the st
   form: as is (float32 or int32), 16-bit widened to int32, a stem vector widened and zero-padded to 512 bytes, or a
   folded bias `float32(aux * 128 * scale + bias)` where `aux` is the sum of the layer's int8 weights.
 - **Check.** Every rebuilt upload is compared with the SHA-256 the recipe lists for it before it is used; a mismatch
-  names the upload. A libxess_fg whose blobs are not in the recipe fails with the first missing blob. Nothing Intel's
-  is stored in the recipe: no address, offset into the image or struct layout, only our shapes and hashes.
+  names the upload. A libxess_fg whose blobs are not in the recipe fails with the first missing blob.
+- **What is and is not in the repo.** No Intel bytes (not even a few: the recipe holds lengths, SHA-256 and a hash tag
+  of 8 probe bytes), and no address, RVA or file offset. The code does embed interoperability facts, all of them
+  about how the data is laid out, none copied from the binary as bytes:
+  the number and order of a layer descriptor's words (12; kind, cout, cin, clamp bits, sn, sp, mulPos, then 7, 1, 1, 1);
+  the call-argument window of the builder's frame they are stored in (displacements 0x30 to 0x98, word order = highest
+  first); the function-size filter of the layer-table scan (over 40000 bytes); that the model's table is the one with
+  36 layers whose first layer has 2 input channels; which root-constant dwords the layer words go to (conv blocks:
+  channel chunk, mulPos, `(sn<<8)|sp`; head blocks: mulPos, sp) and the plain numbers in `decode.rc` (each with a
+  short meaning); the weight tilings; the fold gain 128; and the generic x86 encodings the scans recognise
+  (`mov byte [rsp+disp32], imm8`, `mov dword [rsp+disp], imm32`, `lea reg,[rip+disp32]`, `call`). The layer
+  "i<digits>" strings are only used as a delimiter by the scan; blocks refer to a layer by its position in the table.
 - **Cost and test.** About 30 ms to read the file, find the 36 blobs and the 219 runs, 10 ms to decode all 106
   uploads. `tests/intel_file_test.cpp` (`tests/build_intel_file_test.ps1`) rebuilds and hash-checks all 106 from a
   libxess_fg.dll: 106/106 on 1.3.4.95 and on 1.3.1.78.
@@ -89,7 +99,8 @@ later improvement. Stale `*.tmp*` folders of killed builds are removed at the st
   description (zeros, 25, 32, channel chunks 2 and 4, the floats 0.25, 0.5, 2, 4, and 1), kept in the recipe with the
   block-to-layer map. Words the runtime patches every frame (scale, jitter, interpolation time, pass index) or that
   Intel's code never initialises are written 0 and listed in the entry's `mask`; for those 16 blocks the recipe's SHA-256
-  is taken with the masked dwords zeroed (28 blocks are hashed exactly). The pack builder applies the same mask.
+  is taken with the masked dwords zeroed (28 blocks are hashed exactly). The pack builder (and `build_pack.py`) writes
+  those dwords as 0 whatever the source gave, so every source builds the same bytes.
   The manifest's `patch` lines write the real values every frame.
 
 ### The translator (`src/translate.h/.cpp`)

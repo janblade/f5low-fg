@@ -24,7 +24,9 @@ tools/           recipe builder, audit, harness
 
 Never commit a vendor binary (`libxess_fg.dll`, Streamline, `nvngx_*`, FidelityFX DLLs) or anything derived
 from one: extracted or translated shaders (DXBC, DXIL, PTX made from them), zstd dictionaries, weights, captured
-buffers, disassembly, RVAs or byte patterns. Intel modules are referred to by SHA-256 only. The audit in
+buffers, disassembly, RVAs or byte patterns. ("Byte patterns" means sequences copied from a vendor binary; the generic
+instruction encodings our scans recognise, such as `mov [rsp+disp], imm`, are not.) Intel modules are referred to by
+SHA-256 only. The audit in
 `tools/` enforces this in CI.
 
 ## Recipe (own generator's graph pack)

@@ -166,12 +166,11 @@ class Builder:
                 blob = noise(d["seed"], int(size[1]), int(size[2]))
             else:
                 sys.exit(f"{rel}: kind {kind} cannot be built")
-            hashed = blob
-            if d.get("mask"):  # root constants patched every frame / never initialised: hashed with those dwords zeroed
+            if d.get("mask"):  # root constants patched every frame / never initialised: written as 0 (as the runtime builder does)
                 z = np.frombuffer(blob, np.uint32).copy()
                 z[d["mask"]] = 0
-                hashed = z.tobytes()
-            if R.sha256(hashed) != d["sha256"]:
+                blob = z.tobytes()
+            if R.sha256(blob) != d["sha256"]:
                 sys.exit(f"{rel}: {kind} content does not match the recipe's SHA-256 (wrong capture or dump?)")
             with open(dst, "wb") as f:
                 f.write(blob)

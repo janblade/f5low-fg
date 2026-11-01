@@ -6,8 +6,12 @@
 //     "mov byte [rsp+disp32], imm8" per data byte, consecutive displacements = one vector).
 // What the recipe (recipe/i0/parts.json, key "decode", ours) carries is only OUR description plus hashes: per weight blob
 // its length, SHA-256 and a short probe tag; per upload which layer family it is, its shape and tiling, which vector run
-// it takes and in which form. Nothing of Intel's is stored: blobs are found by their hash, runs by the generic scan of
-// the store pattern, and every rebuilt upload is checked against the SHA-256 the recipe lists for it.
+// it takes and in which form. No Intel bytes are stored and no address, RVA or file offset appears anywhere: blobs are
+// found by their hash, runs by the generic scan of the store encoding, and every rebuilt upload is checked against the
+// SHA-256 the recipe lists for it. What the code does embed are interoperability facts, listed in docs/PACKLESS.md:
+// the descriptor word order and count of a layer, the call-argument window they are stored in, the function-size
+// filter of the layer-table scan, where the root-constant dwords go and the (sn<<8)|sp packing, and the generic x86
+// encodings (mov byte/dword [rsp+disp], imm; lea reg,[rip+disp]; call) the scans recognise.
 //
 // The root constants of the 44 dispatches are derived too: the size words from the manifest's `set` formulas, the
 // per-layer words (mulPos, shifts, channel chunk) from the layer table of the same DLL (found by a generic scan, no
@@ -17,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,6 +35,10 @@ public:
     // constants); both are the embedded "i0/parts.json" and "i0/manifest.tmpl".
     IntelFileSource(const std::wstring& libxessPath, const std::vector<uint8_t>& partsJson, const std::vector<uint8_t>& manifestTmpl);
     ~IntelFileSource() override;
+    IntelFileSource(const IntelFileSource&) = delete;
+    IntelFileSource& operator=(const IntelFileSource&) = delete;
+    // The caller has already read the file: use its bytes instead of reading it again (must outlive this source).
+    void UseLibraryBytes(const std::vector<uint8_t>* bytes) override;
 
     std::string Id() const override { return "file"; }
     bool Upload(int ordinal, std::vector<uint8_t>& out) override;
@@ -55,7 +64,7 @@ public:
 
 private:
     struct Impl;
-    Impl* impl_ = nullptr;
+    std::unique_ptr<Impl> impl_;
     IntelDataSource* rootSource_ = nullptr;
     std::wstring path_;
     std::vector<uint8_t> parts_;

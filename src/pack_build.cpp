@@ -245,16 +245,13 @@ struct Builder {
             } else {
                 return Fail(rel + ": kind " + kind + " cannot be built");
             }
-            // root constants the runtime patches every frame (or that are never initialised) are listed in `mask`: the
-            // recipe's hash is taken with those dwords zeroed
-            std::vector<uint8_t> hashed;
-            if (const Json* m = d.Get("mask")) {
-                hashed = blob;
+            // root constants the runtime patches every frame (or that are never initialised) are listed in `mask`: they
+            // are written as 0, whatever the source gave, so every source builds the same bytes (and the recipe's hash
+            // is over those zeros)
+            if (const Json* m = d.Get("mask"))
                 for (const Json& x : m->arr)
-                    if (x.num >= 0 && static_cast<size_t>(x.num) * 4 + 4 <= hashed.size()) memset(hashed.data() + x.num * 4, 0, 4);
-            }
-            const std::vector<uint8_t>& toHash = hashed.empty() ? blob : hashed;
-            if (Sha256Hex(toHash.data(), toHash.size()) != d.Str_("sha256"))
+                    if (x.num >= 0 && static_cast<size_t>(x.num) * 4 + 4 <= blob.size()) memset(blob.data() + x.num * 4, 0, 4);
+            if (Sha256Hex(blob.data(), blob.size()) != d.Str_("sha256"))
                 return Fail(rel + ": " + kind + " content does not match the recipe's SHA-256 (wrong source?)");
             if (!WriteFile_(out / fs::path(rel), blob.data(), blob.size(), rel)) return false;
         }
@@ -371,12 +368,13 @@ bool DevCaptureSource::RootConstants(int index, std::vector<uint8_t>& out) {
 
 // ---- BuildPack ----------------------------------------------------------------------------------------------------
 bool BuildPack(const std::wstring& libxessPath, const std::wstring& dxcompilerPath, const Bundle& own, IntelDataSource& data,
-               const std::wstring& outDir, Report& rep, std::string* error) {
+               const std::wstring& outDir, Report& rep, std::string* error, const std::vector<uint8_t>* libBytes) {
     const auto t0 = Clock::now();
     rep = Report();
     Builder b(own, data, dxcompilerPath, rep);
     std::string why;
-    if (!b.lib.Open(libxessPath, &why)) {
+    if (libBytes) data.UseLibraryBytes(libBytes);
+    if (!(libBytes ? b.lib.OpenMemory(libBytes->data(), libBytes->size(), &why) : b.lib.Open(libxessPath, &why))) {
         if (error) *error = "libxess_fg.dll (" + Narrow(libxessPath) + ") cannot be used: " + why;
         return false;
     }
@@ -477,7 +475,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
             " (one-time, runs on the calling thread)");
         Report rep;
         std::string why;
-        if (!BuildPack(req.libxessPath, req.dxcompilerPath, *req.own, *req.data, tmp.wstring(), rep, &why)) {
+        if (!BuildPack(req.libxessPath, req.dxcompilerPath, *req.own, *req.data, tmp.wstring(), rep, &why, &intel)) {
             fs::remove_all(tmp, ec);
             error = why;
             return Outcome::Failed;

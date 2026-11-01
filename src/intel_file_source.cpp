@@ -100,6 +100,7 @@ struct Blob {
     uint32_t tag = 0;
     int firstUser = 0;           // an upload that uses it, for messages
     long long start = -1;        // position in the file once found
+    int attempts = 0;            // SHA-256 checks spent on candidates (capped)
 };
 
 // The size formulas of the manifest's `set` lines: + - * / % ( ), numbers, OW OH RW RH AX AY AW AH, align(x,a) ceil(x) floor(x).
@@ -219,7 +220,7 @@ struct Layer {
     long long co = 0, ci = 0, cop = 0, cip = 0, ct = 0, cit = 0;
     bool tDC = false;                  // conv tile order: false = [A][B][C][tap][D][o][i], true = [A][B][tap][D][C][o][i]
     long long run = -1;
-    std::string form;                  // vector: "f32", "i16" (widen to int32), "pad512" (widen if 16-bit, pad to 512 B)
+    std::string form;                  // vector: "f32", "widen16" (widen to int32), "pad512" (widen if 16-bit, pad to 512 B)
     long long biasRun = -1, scaleRun = -1;
     int weights = 0;                   // fold: the upload whose weights give aux
     // from the recipe's data entry of this upload
@@ -230,7 +231,9 @@ struct Layer {
 }  // namespace
 
 struct IntelFileSource::Impl {
-    std::vector<uint8_t> file;
+    std::vector<uint8_t> own;                   // the file as read here ...
+    const std::vector<uint8_t>* ext = nullptr;  // ... or the bytes the caller already has
+    const std::vector<uint8_t>& F() const { return ext ? *ext : own; }
     std::vector<Blob> blobs;
     std::vector<size_t> runStart, runLen;  // runs of immediate stores: into `runBytes`
     std::vector<uint8_t> runBytes;
@@ -244,7 +247,7 @@ struct IntelFileSource::Impl {
         intel_modules::Sha256 sha{};
     };
     struct RcBlock {
-        std::string layer;
+        int layer = -1;  // position in the model's layer table (file order); -1 = no layer words
         bool head = false;
         std::map<int, uint32_t> plain;  // dwords that are plain numbers
     };
@@ -261,7 +264,7 @@ struct IntelFileSource::Impl {
     long long rcChunk = 32, rcLayers = 0, rcFirstCin = 0;
     bool haveRc = false, tableDone = false, tableOk = false;
     std::string tableErr;
-    std::map<std::string, LayerRec> table;
+    std::vector<LayerRec> table;  // the model's layer descriptors in file order
 
     bool Fail(const std::string& s) {
         if (err.empty()) err = s;
@@ -350,10 +353,11 @@ struct IntelFileSource::Impl {
             rcFirstCin = rc->Num_("first_cin");
             for (const auto& kv : bl2->obj) {
                 RcBlock b;
-                b.layer = kv.second.Str_("layer");
+                b.layer = static_cast<int>(kv.second.Num_("layer", -1));
                 b.head = kv.second.Str_("form") == "head";
+                // a plain number is {"v": value, "what": short meaning}; the meaning is for readers only
                 if (const Json* pl = kv.second.Get("plain"))
-                    for (const auto& d : pl->obj) b.plain[atoi(d.first.c_str())] = static_cast<uint32_t>(d.second.num);
+                    for (const auto& d : pl->obj) b.plain[atoi(d.first.c_str())] = static_cast<uint32_t>(d.second.Num_("v"));
                 rcBlocks[atoi(kv.first.c_str())] = b;
             }
             haveRc = true;
@@ -361,9 +365,10 @@ struct IntelFileSource::Impl {
         return true;
     }
 
-    // The manifest's `cb N data/rcNN.bin` blocks and their `set <slot> <dword> <i|f> {formula}` lines.
+    // The manifest's `cb <slot> data/rcNN.bin` binds and the `set <slot> <dword> <i|f> {formula}` lines that refer to a
+    // slot. A `dispatch` line starts a new dispatch, so the slots are bound afresh.
     void ParseManifest() {
-        int cur = -1;
+        std::map<int, int> slotFile;
         size_t at = 0;
         while (at < manifest.size()) {
             size_t eol = manifest.find('\n', at);
@@ -373,11 +378,15 @@ struct IntelFileSource::Impl {
             while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
             int slot, n, dw;
             char kind;
-            if (sscanf_s(line.c_str(), " cb %d data/rc%d.bin", &slot, &n) == 2) {
-                cur = n;
-            } else if (cur >= 0 && sscanf_s(line.c_str(), " set %d %d %c {", &slot, &dw, &kind, 1) == 3) {
+            if (line.compare(0, 9, "dispatch ") == 0) {
+                slotFile.clear();
+            } else if (sscanf_s(line.c_str(), " cb %d data/rc%d.bin", &slot, &n) == 2) {
+                slotFile[slot] = n;
+            } else if (sscanf_s(line.c_str(), " set %d %d %c {", &slot, &dw, &kind, 1) == 3) {
+                const auto f = slotFile.find(slot);
                 const size_t l = line.find('{'), r = line.rfind('}');
-                if (l != std::string::npos && r != std::string::npos && r > l) sets[cur].push_back({dw, kind, line.substr(l + 1, r - l - 1)});
+                if (f != slotFile.end() && l != std::string::npos && r != std::string::npos && r > l)
+                    sets[f->second].push_back({dw, kind, line.substr(l + 1, r - l - 1)});
             }
         }
     }
@@ -389,11 +398,14 @@ struct IntelFileSource::Impl {
     bool ScanLayerTable() {
         if (tableDone) return tableOk || Fail(tableErr);
         tableDone = true;
-        const uint8_t* d = file.data();
-        const size_t n = file.size();
+        const uint8_t* d = F().data();
+        const size_t n = F().size();
         if (n < 0x40 || d[0] != 'M' || d[1] != 'Z') return Fail("not a PE image");
         const uint32_t pe = Rd32(d + 0x3C);
         if (pe > n || n - pe < 24 + 112 + 8 * 4) return Fail("not a PE image");
+        uint16_t magic;
+        memcpy(&magic, d + pe + 24, 2);
+        if (magic != 0x20B) return Fail("not a 64-bit PE image");
         uint16_t nsec, optSize;
         memcpy(&nsec, d + pe + 6, 2);
         memcpy(&optSize, d + pe + 20, 2);
@@ -419,16 +431,20 @@ struct IntelFileSource::Impl {
         const uint32_t pdataRva = Rd32(d + pe + 24 + 112 + 3 * 8), pdataSize = Rd32(d + pe + 24 + 112 + 3 * 8 + 4);
         size_t pOff;
         if (!pdataRva || !toOff(pdataRva, pOff) || pOff + pdataSize > n) return Fail("this libxess_fg.dll has no function table");
-        std::vector<std::vector<std::pair<std::string, LayerRec>>> tables;
+        // The descriptor words sit in the call-argument window of the builder's frame at these displacements, highest
+        // first = word order: [0] 0, [1] kind, [2] cout, [3] cin, [4] clamp bits, [5] sn, [6] sp, [7] mulPos, [8..11] 7,1,1,1.
+        static const int kWordDisp[12] = {0x98, 0x90, 0x80, 0x78, 0x70, 0x68, 0x60, 0x58, 0x48, 0x40, 0x38, 0x30};
+        std::vector<std::vector<LayerRec>> tables;
         for (size_t e = pOff; e + 12 <= pOff + pdataSize; e += 12) {
             const uint32_t b = Rd32(d + e), en = Rd32(d + e + 4);
             size_t fo;
             if (en <= b || en - b < 40000 || !toOff(b, fo) || fo + (en - b) > n) continue;
             const uint8_t* f = d + fo;
             const size_t len = en - b;
-            std::vector<std::pair<std::string, LayerRec>> layersHere;
-            uint32_t vals[12];
-            int disps[12];
+            std::vector<LayerRec> layersHere;
+            uint32_t byDisp[14] = {};  // store value at argument-window displacement 0x30 + 8*k
+            bool seen[14] = {};
+            bool dup = false;
             int nst = 0;
             bool pending = false;
             LayerRec pend;
@@ -450,16 +466,16 @@ struct IntelFileSource::Impl {
                         sl = 11;
                     }
                     if (disp >= 0x30 && disp <= 0x98 && !(disp & 7)) {  // the call-argument area
-                        if (nst < 12) {
-                            vals[nst] = imm;
-                            disps[nst] = disp;
-                        }
+                        const int k = (disp - 0x30) / 8;
+                        dup = dup || seen[k];
+                        seen[k] = true;
+                        byDisp[k] = imm;
                         ++nst;
                     }
                     i += sl;
                     continue;
                 }
-                // lea reg, [rip+disp32] that names a layer: "i<digits>"
+                // lea reg, [rip+disp32] that points at a layer's "i<digits>" string: only a delimiter, the name is not kept
                 if (pending && (p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 0x05) {
                     int32_t disp;
                     memcpy(&disp, p + 3, 4);
@@ -472,7 +488,7 @@ struct IntelFileSource::Impl {
                             size_t j = 1;
                             while (j < k && isdigit(static_cast<unsigned char>(s[j]))) ++j;
                             if (j == k) {
-                                layersHere.emplace_back(std::string(s, k), pend);
+                                layersHere.push_back(pend);
                                 pending = false;
                                 i += 7;
                                 continue;
@@ -496,22 +512,28 @@ struct IntelFileSource::Impl {
                     isCall = toOff(static_cast<uint32_t>(int64_t(b) + int64_t(i) + 6 + rel), tmp);
                 }
                 if (isCall) {
-                    if (nst == 12) {
-                        bool distinct = true;
-                        for (int a = 0; a < 12; ++a)
-                            for (int c = a + 1; c < 12; ++c) distinct = distinct && disps[a] != disps[c];
-                        if (distinct) {
-                            pend.kind = vals[1];
-                            pend.cout = vals[2];
-                            pend.cin = vals[3];
-                            pend.clamp = vals[4];
-                            pend.sn = vals[5];
-                            pend.sp = vals[6];
-                            pend.mulPos = vals[7];
+                    if (nst == 12 && !dup) {
+                        bool all = true;
+                        uint32_t w[12];
+                        for (int a = 0; a < 12; ++a) {
+                            const int k = (kWordDisp[a] - 0x30) / 8;
+                            all = all && seen[k];
+                            w[a] = byDisp[k];
+                        }
+                        if (all) {
+                            pend.kind = w[1];
+                            pend.cout = w[2];
+                            pend.cin = w[3];
+                            pend.clamp = w[4];
+                            pend.sn = w[5];
+                            pend.sp = w[6];
+                            pend.mulPos = w[7];
                             pending = true;
                         }
                     }
                     nst = 0;
+                    dup = false;
+                    memset(seen, 0, sizeof seen);
                     i += p[0] == 0xE8 ? 5 : 6;
                     continue;
                 }
@@ -521,15 +543,14 @@ struct IntelFileSource::Impl {
         }
         int hits = 0;
         for (const auto& t : tables) {
-            if (static_cast<long long>(t.size()) == rcLayers && t[0].second.cin == rcFirstCin) {
+            if (static_cast<long long>(t.size()) == rcLayers && t[0].cin == rcFirstCin) {
                 ++hits;
-                table.clear();
-                for (const auto& l : t) table[l.first] = l.second;
+                table = t;
             }
         }
         if (hits != 1) {
             tableErr = "the layer table of the multi-frame model was not found in this libxess_fg.dll (" + std::to_string(tables.size()) + " builders, " + std::to_string(hits) + " fit:";
-            for (const auto& t : tables) tableErr += " " + std::to_string(t.size()) + "/" + std::to_string(t[0].second.cin);
+            for (const auto& t : tables) tableErr += " " + std::to_string(t.size()) + "/" + std::to_string(t[0].cin);
             tableErr += ")";
             return Fail(tableErr);
         }
@@ -560,16 +581,17 @@ struct IntelFileSource::Impl {
                     memcpy(&bits, &fv, 4);
                     put(r.dword, bits);
                 } else {
-                    put(r.dword, static_cast<uint32_t>(static_cast<int64_t>(v)));
+                    // the runtime's rounding of a size (xefg_pack.h): floor(v + 1e-6), finite, not negative
+                    if (v < 0 || v > 4294967295.0) return Fail(who + ": {" + r.expr + "} is out of range");
+                    put(r.dword, static_cast<uint32_t>(static_cast<int64_t>(std::floor(v + 1e-6))));
                 }
             }
         auto bk = rcBlocks.find(index);
         if (bk != rcBlocks.end()) {
             const RcBlock& b = bk->second;
-            if (!b.layer.empty()) {
-                auto l = table.find(b.layer);
-                if (l == table.end()) return Fail(who + ": layer " + b.layer + " is not in this libxess_fg.dll");
-                const LayerRec& L = l->second;
+            if (b.layer >= 0) {
+                if (static_cast<size_t>(b.layer) >= table.size()) return Fail(who + ": layer " + std::to_string(b.layer) + " is not in this libxess_fg.dll's table");
+                const LayerRec& L = table[static_cast<size_t>(b.layer)];
                 if (b.head) {
                     put(7, static_cast<uint32_t>(L.mulPos));
                     put(8, static_cast<uint32_t>(L.sp));
@@ -594,11 +616,11 @@ struct IntelFileSource::Impl {
     // back in the file in layer order, but nothing here relies on that or on where they are: a copy shifted by a
     // few bytes (or a second copy of the same weights) cannot pass the hash unless its bytes are the same.
     bool LocateBlobs() {
-        const size_t n = file.size();
+        const size_t n = F().size();
         std::vector<uint8_t> bitmap(8192, 0);
         for (const Blob& b : blobs) bitmap[(b.tag >> 16) >> 3] |= uint8_t(1u << ((b.tag >> 16) & 7));
         size_t left = blobs.size();
-        const uint8_t* d = file.data();
+        const uint8_t* d = F().data();
         for (size_t i = 0; i + 8 <= n && left; ++i) {
             uint64_t v;
             memcpy(&v, d + i, 8);
@@ -608,7 +630,8 @@ struct IntelFileSource::Impl {
             for (Blob& b : blobs) {
                 if (b.tag != h || b.start >= 0 || i < b.probe) continue;
                 const size_t s = i - b.probe;
-                if (s + b.len > n) continue;
+                if (s + b.len > n || b.attempts >= 16) continue;  // a probe window that is not distinctive cannot flood the scan
+                ++b.attempts;
                 intel_modules::Sha256 got{};
                 if (!intel_modules::HashBytes(d + s, b.len, got) || got != b.sha) continue;
                 b.start = static_cast<long long>(s);
@@ -626,8 +649,8 @@ struct IntelFileSource::Impl {
     // are another store whose displacement is one more than the last one.
     void ScanRuns() {
         std::vector<Range> secs;
-        if (!ExecSections(file.data(), file.size(), secs)) return;
-        const uint8_t* d = file.data();
+        if (!ExecSections(F().data(), F().size(), secs)) return;
+        const uint8_t* d = F().data();
         for (const Range& r : secs) {
             bool open = false;
             int32_t next = 0;
@@ -664,7 +687,7 @@ struct IntelFileSource::Impl {
         }
     }
 
-    const uint8_t* BlobData(int b) const { return file.data() + blobs[static_cast<size_t>(b)].start; }
+    const uint8_t* BlobData(int b) const { return F().data() + blobs[static_cast<size_t>(b)].start; }
 
     bool Run(long long r, const uint8_t*& p, size_t& n, const std::string& who) {
         if (r < 0 || static_cast<size_t>(r) >= runStart.size()) return Fail(who + ": the file has no vector run " + std::to_string(r) + " (only " + std::to_string(runStart.size()) + ")");
@@ -738,10 +761,10 @@ struct IntelFileSource::Impl {
                     out.assign(p, p + n);
                     return true;
                 }
-                if (L.form == "i16" || L.form == "pad512") {
+                if (L.form == "widen16" || L.form == "pad512") {
                     // 16-bit values widened to 32-bit; the stem vectors come as 32-bit (448 B) or 16-bit (224 B) and are
                     // zero-padded to 512 B
-                    const bool wide = L.form == "i16" || n == 224;
+                    const bool wide = L.form == "widen16" || n == 224;
                     if (wide) {
                         if (n % 2) return Fail(who + ": run " + std::to_string(L.run) + " has an odd length");
                         out.resize(n * 2);
@@ -806,7 +829,11 @@ IntelFileSource::IntelFileSource(const std::wstring& libxessPath, const std::vec
     impl_->manifest.assign(manifestTmpl.begin(), manifestTmpl.end());
 }
 
-IntelFileSource::~IntelFileSource() { delete impl_; }
+IntelFileSource::~IntelFileSource() = default;
+
+void IntelFileSource::UseLibraryBytes(const std::vector<uint8_t>* bytes) {
+    if (!prepared_) impl_->ext = bytes;
+}
 
 bool IntelFileSource::Prepare() {
     if (prepared_) return ok_;
@@ -817,7 +844,7 @@ bool IntelFileSource::Prepare() {
         problem_ = m.err;
         return false;
     }
-    if (!ReadFileAll(path_, m.file)) {
+    if (!m.ext && !ReadFileAll(path_, m.own)) {
         problem_ = "cannot read " + Narrow(path_);
         return false;
     }
