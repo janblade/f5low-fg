@@ -171,19 +171,18 @@ recon/blend modules, the same rest). Module names are SHA-256 prefixes (8 hex di
 | k12 | net B 32 -> 64 channels, stride 2 | **own** (`gen_s2_ptx.py --shape b32`, story B2b round 2) | 338f1957 (both) | as k11 | as k11; 0.0121 ms vs 0.0130 | done, no translation |
 | k17 | motion splat of the game's motion + depth, per generated frame | plain | aae5e2f6 (both) | **native works** (existing `native` line, no padding); own; translate | native == PTX 0.11 ms per pass in pack_d3d (kernel alone 0.046); outputs equal byte for byte; the cost was the clear before it, now range-cleared | **native** |
 | k17 variants | same, flag variants (inverted depth / no depth cut) | plain | c0481f4f, 4847df5d, 903ffa0d (both) | as k17 | as k17 | **native** |
-| k18 | per-t forward splat of the flow (atomic key buffer) | plain | 9ef8c15d (both) | native possible but **slower** (kept as PTX in the personal pack); own kernel (semantics documented: key = flag, depth, fp16 flow x t, atomic max into 2x2); translate | notes 2026-10-24: "slower native: stays PTX" (no number recorded) | **own** kernel; translate meanwhile |
-| k18 variant | same, other depth sense (inv=0) | plain | bca124cb (both) | as k18 | as k18 | **own** (flag of the k18 kernel) |
+| k18 | per-t forward splat of the flow (atomic key buffer), once per generated frame | **own** (`gen_splat_t_ptx.py`, story B2b round 3) | 9ef8c15d (both) | own kernel (key = flag, depth, fp16-style packing of flow x t, atomic max into the 2x2 targets, through a 16x16 groupshared tile); native possible but not faster | bit-exact against the module on 17 cases per variant (real-size 640x360 at t = 0.2 .. 0.8, 1505x847, 1920x1080, 2560x1440, odd sizes and pitches, heavy collisions, equal depth, scale overflow/underflow); 0.0271 ms (640x360) vs 0.0277 translated and 0.0278 native; 0.275 vs 0.276 translated and 0.260 native at 2560x1440 (atomic-bound; the tile is worth 2x over direct atomics) | done, no translation |
+| k18 variant | same, key on 1 - depth (the non-inverted-depth flag set) | **own** (`gen_splat_t_ptx.py --invert-depth`) | bca124cb (both) | as k18 | as k18 | done, no translation |
 | k19 | reconstruction input (U-Net input, 3 or 4 blend images) | recon (u0 store edit) | a7fc1e46 / 4ffe969e | **native works** (u0 raw, `32` pad; u1-u4 real textures the blend samples); own would be a rewrite of the gathers; translate (needs the u0 store edit) | translated 0.360 ms/pass vs native 0.249 (1440p, NBA inputs); per app frame 2.10 -> 0.94 ms; also makes the blend 0.195 -> 0.122; translation differs +-1/1023 in 0.05% of one image, native is the reference | **native** |
 | k19 variants x11 | same, per init-flag set (ndc, jit, hires, inv) | recon | SDR 5a5a7b35, eae043e6, dfa6feb3, 8c7b249a, ad6437f9, 15dcfb96, 30511d38, 13637bf9, 81316214, 6c30e9aa, 6e84300e; HDR bb0e28cd, a48c8c87, d4b7977d, 31138d0d, 7e4c1e40, 643e6215, 6cb5a7ef, b0bd346d, da334ef5, 1f808ae3, 4cb7798f | as k19 | as k19 | **native** |
 | k31 | blend of the generated frame (writes the redirected ring buffer) | plain | cd506291 / efc1536e | native **impossible** (writes a redirected output); own blend kernel (10 sampled inputs, SDR rgba8 / HDR rgb10a2); translate (today) | translated 0.122 ms/pass; Intel's module native 0.140 (not faster, even before the redirect) | translate; **own** later (largest of the own kernels: 4 formats/variants) |
 | k31 variant | blend without premultiplied alpha | plain | 0f8619d4 / 47821c21 | as k31 | as k31 | as k31 |
 
 Summary: 16 slots per pack run native today (12 recon, 4 splat) and stay native; 10 do not and need an own
-kernel or the translation: k0, k1, k2, k3, k11, k12 now have one (B2b rounds 1-2); k18 (+ variant) and k31 (+ variant) remain = 8 slots with 10 modules
+kernel or the translation: k0, k1, k2, k3, k11, k12 now have one (B2b rounds 1-2); k18 (+ variant) now has one too (round 3); k31 (+ variant) remains
 (the recipe's other 16 `intel_xlate` modules are the PTX twins of the native ones, kept for the CUDA path).
 
-Open (needs GPU timing, not measured here): own vs translated for k0/k1/k11/k12 (all small, once per app frame,
-total about 0.2 ms of the 1.45 ms app-frame budget), and the number behind "k18 slower native".
+Open (needs GPU timing, not measured here): none for k0 .. k18 (measured in the table above).
 
 ## libxess_fg builds checked (story B4, 2026-11-01)
 

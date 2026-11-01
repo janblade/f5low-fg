@@ -9,6 +9,7 @@
 //
 // Usage: repro_test.exe <xefg dll> [libxell.dll]     (Intel's XeFG wants XeLL; ours ignores it)
 //   REPRO_DEBUG=1   the D3D12 debug layer (its errors and warnings are printed; exit code 2)
+//   REPRO_INITFLAGS=n  XeFG init flags (default 1 = inverted depth; 0 runs the pack's non-inverted-depth module variants)
 //   REPRO_OFF=N     frames before frame generation is turned on (default 120)
 //   REPRO_ON=N      frames with it on (default 240)
 //   REPRO_LATE_TAG=1  tag with the frame's list already closed and submitted (Streamline's eValidUntilPresent tags
@@ -327,7 +328,8 @@ int main(int argc, char** argv)
             printf("cannot load %s\n", argv[2]);
     }
 
-    constexpr uint32_t initFlags = XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH; // the game's 0x1
+    // REPRO_INITFLAGS=n: other init flags (0 = depth not inverted: the pack's other flag-set modules run)
+    const uint32_t initFlags = static_cast<uint32_t>(EnvInt("REPRO_INITFLAGS", XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH)); // the game's 0x1
     printf("BuildPipelines: %d\n", xefgSwapChainD3D12BuildPipelines(h, nullptr, 1, initFlags));
 
     WNDCLASSA wc {};
