@@ -1,0 +1,17 @@
+# vendor binaries and anything derived from them never go in
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.dxbc
+*.dxil
+*.dxasm
+*.bin
+*.ptx
+*.cubin
+*.fatbin
+*.zst
+build/
+cache/
+*.log
