@@ -9,9 +9,11 @@
 // it takes and in which form. Nothing of Intel's is stored: blobs are found by their hash, runs by the generic scan of
 // the store pattern, and every rebuilt upload is checked against the SHA-256 the recipe lists for it.
 //
-// The root constants of the dispatches are not derived yet: RootConstants() asks an optional fallback source
-// (DevCaptureSource when F5LOW_DEV_CAP is set) and otherwise fails with one clear line. A derived implementation drops in
-// through SetRootConstantSource() or by replacing RootConstants().
+// The root constants of the 44 dispatches are derived too: the size words from the manifest's `set` formulas, the
+// per-layer words (mulPos, shifts, channel chunk) from the layer table of the same DLL (found by a generic scan, no
+// addresses), the rest from plain numbers of our description. Words the runtime patches every frame or that are never
+// initialised are written 0 and left out of the recipe's hash (its "mask"). SetRootConstantSource() installs an explicit
+// override (a PSO capture, development only).
 #pragma once
 
 #include <cstdint>
@@ -24,8 +26,9 @@ namespace packbuild {
 
 class IntelFileSource : public IntelDataSource {
 public:
-    // `partsJson` = the bytes of the recipe's parts.json (the embedded "i0/parts.json").
-    IntelFileSource(const std::wstring& libxessPath, const std::vector<uint8_t>& partsJson);
+    // `partsJson` = the bytes of the recipe's parts.json, `manifestTmpl` = its manifest.tmpl (size formulas of the root
+    // constants); both are the embedded "i0/parts.json" and "i0/manifest.tmpl".
+    IntelFileSource(const std::wstring& libxessPath, const std::vector<uint8_t>& partsJson, const std::vector<uint8_t>& manifestTmpl);
     ~IntelFileSource() override;
 
     std::string Id() const override { return "file"; }
@@ -33,7 +36,7 @@ public:
     bool RootConstants(int index, std::vector<uint8_t>& out) override;
     std::string Problem() const override { return problem_; }
 
-    // Where the root constants come from until they are derived from the file (not owned; may be null).
+    // Overrides the derived root constants with another source (development; not owned; may be null).
     void SetRootConstantSource(IntelDataSource* s) { rootSource_ = s; }
 
     // Reads the file and finds the weight blobs and the vector runs now (otherwise on the first Upload). False says why in
@@ -45,7 +48,8 @@ public:
         double blobsMs = 0;    // locating the weight blobs (probe scan + SHA-256 of each candidate)
         double runsMs = 0;     // scan for the immediate-store runs
         double decodeMs = 0;   // Upload() calls so far: tiling, widening, folding, SHA-256 check
-        size_t blobs = 0, runs = 0, uploads = 0;
+        double rcMs = 0;       // RootConstants() calls so far (layer-table scan on the first)
+        size_t blobs = 0, runs = 0, uploads = 0, rcBlocks = 0;
     };
     const Stats& GetStats() const { return stats_; }
 

@@ -245,7 +245,16 @@ struct Builder {
             } else {
                 return Fail(rel + ": kind " + kind + " cannot be built");
             }
-            if (Sha256Hex(blob.data(), blob.size()) != d.Str_("sha256"))
+            // root constants the runtime patches every frame (or that are never initialised) are listed in `mask`: the
+            // recipe's hash is taken with those dwords zeroed
+            std::vector<uint8_t> hashed;
+            if (const Json* m = d.Get("mask")) {
+                hashed = blob;
+                for (const Json& x : m->arr)
+                    if (x.num >= 0 && static_cast<size_t>(x.num) * 4 + 4 <= hashed.size()) memset(hashed.data() + x.num * 4, 0, 4);
+            }
+            const std::vector<uint8_t>& toHash = hashed.empty() ? blob : hashed;
+            if (Sha256Hex(toHash.data(), toHash.size()) != d.Str_("sha256"))
                 return Fail(rel + ": " + kind + " content does not match the recipe's SHA-256 (wrong source?)");
             if (!WriteFile_(out / fs::path(rel), blob.data(), blob.size(), rel)) return false;
         }

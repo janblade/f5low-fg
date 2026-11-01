@@ -292,9 +292,9 @@ std::string BuiltPackDir()
         req.bundleBytes = bytes;
         req.bundleSize = bytesSize;
         wchar_t w[MAX_PATH] = {}, c[MAX_PATH] = {};
-        // Weights: rebuilt from the player's libxess_fg.dll file (IntelFileSource). Root constants: not derived yet, so a
-        // development capture (F5LOW_DEV_CAP) stands in. F5LOW_DEV_WEIGHTS (a weight dump folder + F5LOW_DEV_CAP) still
-        // overrides everything for development.
+        // Weights and root constants: rebuilt from the player's libxess_fg.dll file (IntelFileSource). Development
+        // overrides only: F5LOW_DEV_CAP (a PSO capture) replaces the derived root constants, and F5LOW_DEV_WEIGHTS (a weight
+        // dump folder, with F5LOW_DEV_CAP) replaces everything.
         std::unique_ptr<packbuild::IntelDataSource> source;
         std::unique_ptr<packbuild::DevCaptureSource> capSource;
         packbuild::IntelFileSource* fileSource = nullptr;
@@ -304,9 +304,10 @@ std::string BuiltPackDir()
         else
         {
             const auto it = bundle.find("i0/parts.json");
-            if (it != bundle.end())
+            const auto mt = bundle.find("i0/manifest.tmpl");
+            if (it != bundle.end() && mt != bundle.end())
             {
-                auto file = std::make_unique<packbuild::IntelFileSource>(req.libxessPath, it->second);
+                auto file = std::make_unique<packbuild::IntelFileSource>(req.libxessPath, it->second, mt->second);
                 fileSource = file.get();
                 if (haveCap)
                 {
@@ -332,8 +333,8 @@ std::string BuiltPackDir()
         if (o == packbuild::Outcome::Built && fileSource)
         {
             const auto& st = fileSource->GetStats();
-            Log("weights from libxess_fg.dll: %zu uploads rebuilt and hash-checked (read %.0f ms, %zu weight blobs located %.0f ms, %zu vector runs %.0f ms, decode %.0f ms)",
-                st.uploads, st.readMs, st.blobs, st.blobsMs, st.runs, st.runsMs, st.decodeMs);
+            Log("weights from libxess_fg.dll: %zu uploads rebuilt and hash-checked (read %.0f ms, %zu weight blobs located %.0f ms, %zu vector runs %.0f ms, decode %.0f ms); root constants: %zu blocks derived and hash-checked (%.0f ms)",
+                st.uploads, st.readMs, st.blobs, st.blobsMs, st.runs, st.runsMs, st.decodeMs, st.rcBlocks, st.rcMs);
         }
         if (o == packbuild::Outcome::Built)
             Log("pack build took %llu ms on the calling thread (one-time; later runs use the cache)", GetTickCount64() - t0);

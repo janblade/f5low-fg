@@ -46,9 +46,9 @@ Python with numpy.
 `XEFG_CUDA_PACK` / `xefg_pack\` next to the DLL, then a pack embedded in the DLL (personal builds, resource 101),
 then the cache, then a build now. A build needs the player's `libxess_fg.dll` (`XEFG_CUDA_INTEL_LIBRARY` or the usual
 lookup), `dxcompiler.dll` next to f5low.dll (`F5LOW_DXCOMPILER`) and a data source (`IntelDataSource`, `pack_build.h`):
-the 106 weight uploads come from `IntelFileSource` (next section); the 44 root-constant blocks are NOT derived yet
-(story B3 still open) and come from a dev capture, `F5LOW_DEV_CAP` (PSO capture log). `F5LOW_DEV_WEIGHTS` (a weight
-dump folder, with `F5LOW_DEV_CAP`) still overrides everything for development. Every blob is checked against the
+the 106 weight uploads and the 44 root-constant blocks come from `IntelFileSource` (next section), no environment
+variable needed. Development overrides only: `F5LOW_DEV_CAP` (a PSO capture log) replaces the derived root constants,
+`F5LOW_DEV_WEIGHTS` (a weight dump folder, with `F5LOW_DEV_CAP`) replaces everything. Every blob is checked against the
 recipe's SHA-256. If anything is missing the log says so in ONE line ("own generator
 unavailable: ...") and the DLL forwards to libxess_fg.dll as before.
 
@@ -80,9 +80,17 @@ later improvement. Stale `*.tmp*` folders of killed builds are removed at the st
 - **Cost and test.** About 30 ms to read the file, find the 36 blobs and the 219 runs, 10 ms to decode all 106
   uploads. `tests/intel_file_test.cpp` (`tests/build_intel_file_test.ps1`) rebuilds and hash-checks all 106 from a
   libxess_fg.dll: 106/106 on 1.3.4.95 and on 1.3.1.78.
-- **Not done.** The 44 root-constant blocks (`RootConstants()`): until they are derived, `F5LOW_DEV_CAP` stands in and
-  without it the build stops with one line saying so. `IntelFileSource::SetRootConstantSource` is where a derived
-  implementation plugs in.
+- **Root constants** (`RootConstants()`, the 44 `intel_const` blocks, no capture). Three sources:
+  the size words come from the `set` formulas of `manifest.tmpl` evaluated at the size the recipe was made at
+  (`decode.rc.size`); the per-layer words (multiplier position, shifts) come from the layer table of the same DLL, found by
+  a generic scan (every function of the exception directory over 40000 bytes, runs of exactly 12 immediate 32-bit
+  stores into the call-argument area of the frame closed by a call, named by the following "i<digits>" string; the
+  table with 36 layers whose first layer has 2 input channels is the model's); the rest are plain numbers of our
+  description (zeros, 25, 32, channel chunks 2 and 4, the floats 0.25, 0.5, 2, 4, and 1), kept in the recipe with the
+  block-to-layer map. Words the runtime patches every frame (scale, jitter, interpolation time, pass index) or that
+  Intel's code never initialises are written 0 and listed in the entry's `mask`; for those 16 blocks the recipe's SHA-256
+  is taken with the masked dwords zeroed (28 blocks are hashed exactly). The pack builder applies the same mask.
+  The manifest's `patch` lines write the real values every frame.
 
 ### The translator (`src/translate.h/.cpp`)
 

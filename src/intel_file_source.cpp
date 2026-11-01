@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -25,9 +27,17 @@ double MsSince(Clock::time_point t0) { return std::chrono::duration<double, std:
 // 8 bytes per data byte. A vector is a run of such stores whose displacements are consecutive.
 constexpr uint8_t kStoreOp0 = 0xC6, kStoreOp1 = 0x84, kStoreOp2 = 0x24;
 constexpr size_t kStoreLen = 8;
-// The probe tag of a weight blob: the high half of (8 bytes of the blob) * this odd constant. A short tag is only a filter;
-// every candidate is confirmed by the SHA-256 of the whole blob.
-constexpr uint64_t kProbeMul = 0x9E3779B97F4A7C15ull;
+// The probe tag of a weight blob: the high half of a 64-bit finalizer hash (murmur3 fmix64) of 8 bytes of the blob, so the
+// recipe holds a hash, never content. A short tag is only a filter; every candidate is confirmed by the SHA-256 of the
+// whole blob.
+inline uint32_t ProbeTag(uint64_t k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdull;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ull;
+    k ^= k >> 33;
+    return static_cast<uint32_t>(k >> 32);
+}
 // The folded bias of a layer (float32): aux * 128.0f * scale + bias, aux = the sum of the layer's int8 source weights.
 constexpr float kFoldGain = 128.0f;
 
@@ -92,6 +102,117 @@ struct Blob {
     long long start = -1;        // position in the file once found
 };
 
+// The size formulas of the manifest's `set` lines: + - * / % ( ), numbers, OW OH RW RH AX AY AW AH, align(x,a) ceil(x) floor(x).
+// Everything in double, as the reference tool does; `i` results truncate, `f` results round to float32.
+class Expr {
+public:
+    Expr(const std::string& s, const double* vars) : s_(s), v_(vars) {}
+    bool Eval(double& out) {
+        ok_ = true;
+        out = Sum();
+        Ws();
+        return ok_ && p_ == s_.size() && std::isfinite(out);
+    }
+
+private:
+    void Ws() {
+        while (p_ < s_.size() && s_[p_] == ' ') ++p_;
+    }
+    double Sum() {
+        double a = Prod();
+        for (;;) {
+            Ws();
+            if (p_ < s_.size() && (s_[p_] == '+' || s_[p_] == '-')) {
+                const char op = s_[p_++];
+                const double b = Prod();
+                a = op == '+' ? a + b : a - b;
+            } else {
+                return a;
+            }
+        }
+    }
+    double Prod() {
+        double a = Unary();
+        for (;;) {
+            Ws();
+            if (p_ < s_.size() && (s_[p_] == '*' || s_[p_] == '/' || s_[p_] == '%')) {
+                const char op = s_[p_++];
+                const double b = Unary();
+                if (op == '*') a *= b;
+                else if (b == 0) ok_ = false;
+                else if (op == '/') a /= b;
+                else a = std::fmod(a, b);
+            } else {
+                return a;
+            }
+        }
+    }
+    double Unary() {
+        Ws();
+        if (p_ < s_.size() && s_[p_] == '-') {
+            ++p_;
+            return -Unary();
+        }
+        return Primary();
+    }
+    double Primary() {
+        Ws();
+        if (p_ >= s_.size()) { ok_ = false; return 0; }
+        if (s_[p_] == '(') {
+            ++p_;
+            const double a = Sum();
+            Ws();
+            if (p_ < s_.size() && s_[p_] == ')') ++p_;
+            else ok_ = false;
+            return a;
+        }
+        if (isdigit(static_cast<unsigned char>(s_[p_])) || s_[p_] == '.') {
+            char* e = nullptr;
+            const double a = strtod(s_.c_str() + p_, &e);
+            p_ = static_cast<size_t>(e - s_.c_str());
+            return a;
+        }
+        size_t q = p_;
+        while (q < s_.size() && isalnum(static_cast<unsigned char>(s_[q]))) ++q;
+        const std::string name = s_.substr(p_, q - p_);
+        p_ = q;
+        static const char* kVars[] = {"OW", "OH", "RW", "RH", "AX", "AY", "AW", "AH"};
+        for (int i = 0; i < 8; ++i)
+            if (name == kVars[i]) return v_[i];
+        Ws();
+        if (p_ < s_.size() && s_[p_] == '(') {
+            ++p_;
+            const double a = Sum();
+            double b = 0;
+            Ws();
+            if (p_ < s_.size() && s_[p_] == ',') {
+                ++p_;
+                b = Sum();
+            }
+            Ws();
+            if (p_ < s_.size() && s_[p_] == ')') ++p_;
+            else ok_ = false;
+            if (name == "ceil") return std::ceil(a);
+            if (name == "floor") return std::floor(a);
+            if (name == "align") {
+                const long long n = static_cast<long long>(a), m = static_cast<long long>(b);
+                if (m <= 0 || n < 0) { ok_ = false; return 0; }
+                return static_cast<double>((n + m - 1) / m * m);
+            }
+        }
+        ok_ = false;
+        return 0;
+    }
+    const std::string& s_;
+    const double* v_;
+    size_t p_ = 0;
+    bool ok_ = true;
+};
+
+struct LayerRec {
+    long long kind = 0, cout = 0, cin = 0, clamp = 0, sn = 0, sp = 0, mulPos = 0;
+};
+
 struct Layer {
     enum Kind { Conv, Head, Raw, Vector, Fold } kind = Raw;
     int blob = -1;
@@ -115,6 +236,32 @@ struct IntelFileSource::Impl {
     std::vector<uint8_t> runBytes;
     std::map<int, Layer> layers;
     std::string err;
+
+    // ---- root constants
+    struct ConstEntry {
+        size_t dwords = 0;
+        std::vector<int> mask;  // dwords the runtime patches every frame or that are never initialised: written 0, not hashed
+        intel_modules::Sha256 sha{};
+    };
+    struct RcBlock {
+        std::string layer;
+        bool head = false;
+        std::map<int, uint32_t> plain;  // dwords that are plain numbers
+    };
+    struct SetRule {
+        int dword;
+        char kind;
+        std::string expr;
+    };
+    std::string manifest;
+    std::map<int, ConstEntry> consts;
+    std::map<int, RcBlock> rcBlocks;
+    std::map<int, std::vector<SetRule>> sets;  // by block (capture index)
+    double sizeVars[8] = {};                   // OW OH RW RH AX AY AW AH
+    long long rcChunk = 32, rcLayers = 0, rcFirstCin = 0;
+    bool haveRc = false, tableDone = false, tableOk = false;
+    std::string tableErr;
+    std::map<std::string, LayerRec> table;
 
     bool Fail(const std::string& s) {
         if (err.empty()) err = s;
@@ -177,6 +324,269 @@ struct IntelFileSource::Impl {
             }
             layers[ord] = L;
         }
+        // root constants: the blocks' hashes (masked where dwords are patched at run time) and our description
+        for (const auto& kv : data->obj) {
+            if (kv.second.Str_("kind") != "intel_const") continue;
+            ConstEntry c;
+            c.dwords = static_cast<size_t>(kv.second.Num_("dwords"));
+            if (const Json* m = kv.second.Get("mask"))
+                for (const Json& x : m->arr) c.mask.push_back(static_cast<int>(x.num));
+            if (!intel_modules::ParseHex(kv.second.Str_("sha256"), c.sha)) return Fail("a root-constant block has a bad SHA-256 in the recipe");
+            consts[static_cast<int>(kv.second.Num_("capture_index"))] = c;
+        }
+        if (const Json* rc = dec->Get("rc")) {
+            const Json* sz = rc->Get("size");
+            const Json* bl2 = rc->Get("blocks");
+            if (!sz || sz->arr.size() != 4 || !bl2) return Fail("the root-constant description is malformed");
+            sizeVars[0] = double(sz->arr[0].num);
+            sizeVars[1] = double(sz->arr[1].num);
+            sizeVars[2] = double(sz->arr[2].num);
+            sizeVars[3] = double(sz->arr[3].num);
+            sizeVars[4] = sizeVars[5] = 0;
+            sizeVars[6] = sizeVars[0];
+            sizeVars[7] = sizeVars[1];
+            rcChunk = rc->Num_("chunk", 32);
+            rcLayers = rc->Num_("layers");
+            rcFirstCin = rc->Num_("first_cin");
+            for (const auto& kv : bl2->obj) {
+                RcBlock b;
+                b.layer = kv.second.Str_("layer");
+                b.head = kv.second.Str_("form") == "head";
+                if (const Json* pl = kv.second.Get("plain"))
+                    for (const auto& d : pl->obj) b.plain[atoi(d.first.c_str())] = static_cast<uint32_t>(d.second.num);
+                rcBlocks[atoi(kv.first.c_str())] = b;
+            }
+            haveRc = true;
+        }
+        return true;
+    }
+
+    // The manifest's `cb N data/rcNN.bin` blocks and their `set <slot> <dword> <i|f> {formula}` lines.
+    void ParseManifest() {
+        int cur = -1;
+        size_t at = 0;
+        while (at < manifest.size()) {
+            size_t eol = manifest.find('\n', at);
+            if (eol == std::string::npos) eol = manifest.size();
+            std::string line = manifest.substr(at, eol - at);
+            at = eol + 1;
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            int slot, n, dw;
+            char kind;
+            if (sscanf_s(line.c_str(), " cb %d data/rc%d.bin", &slot, &n) == 2) {
+                cur = n;
+            } else if (cur >= 0 && sscanf_s(line.c_str(), " set %d %d %c {", &slot, &dw, &kind, 1) == 3) {
+                const size_t l = line.find('{'), r = line.rfind('}');
+                if (l != std::string::npos && r != std::string::npos && r > l) sets[cur].push_back({dw, kind, line.substr(l + 1, r - l - 1)});
+            }
+        }
+    }
+
+    // The per-layer descriptor table, found without addresses: every function of the exception directory over 40000
+    // bytes is walked for runs of exactly 12 immediate 32-bit stores into the call-argument area of the stack frame
+    // (the descriptor words), closed by a call, and named by the "iNN" string a following lea refers to. The table of
+    // the builder with `rcLayers` layers whose first layer has `rcFirstCin` input channels is the one we want.
+    bool ScanLayerTable() {
+        if (tableDone) return tableOk || Fail(tableErr);
+        tableDone = true;
+        const uint8_t* d = file.data();
+        const size_t n = file.size();
+        if (n < 0x40 || d[0] != 'M' || d[1] != 'Z') return Fail("not a PE image");
+        const uint32_t pe = Rd32(d + 0x3C);
+        if (pe > n || n - pe < 24 + 112 + 8 * 4) return Fail("not a PE image");
+        uint16_t nsec, optSize;
+        memcpy(&nsec, d + pe + 6, 2);
+        memcpy(&optSize, d + pe + 20, 2);
+        const size_t tab = size_t(pe) + 24 + optSize;
+        if (tab + size_t(nsec) * 40 > n) return Fail("bad section table");
+        struct Sec {
+            uint32_t va, vsize, raw, rawSize;
+            bool exec;
+        };
+        std::vector<Sec> secs;
+        for (uint16_t i = 0; i < nsec; ++i) {
+            const uint8_t* s = d + tab + size_t(i) * 40;
+            secs.push_back({Rd32(s + 12), Rd32(s + 8), Rd32(s + 20), Rd32(s + 16), (Rd32(s + 36) & 0x20000000u) != 0});
+        }
+        auto toOff = [&](uint32_t rva, size_t& off) {
+            for (const Sec& s : secs)
+                if (rva >= s.va && rva - s.va < s.rawSize && size_t(s.raw) + (rva - s.va) < n) {
+                    off = size_t(s.raw) + (rva - s.va);
+                    return true;
+                }
+            return false;
+        };
+        const uint32_t pdataRva = Rd32(d + pe + 24 + 112 + 3 * 8), pdataSize = Rd32(d + pe + 24 + 112 + 3 * 8 + 4);
+        size_t pOff;
+        if (!pdataRva || !toOff(pdataRva, pOff) || pOff + pdataSize > n) return Fail("this libxess_fg.dll has no function table");
+        std::vector<std::vector<std::pair<std::string, LayerRec>>> tables;
+        for (size_t e = pOff; e + 12 <= pOff + pdataSize; e += 12) {
+            const uint32_t b = Rd32(d + e), en = Rd32(d + e + 4);
+            size_t fo;
+            if (en <= b || en - b < 40000 || !toOff(b, fo) || fo + (en - b) > n) continue;
+            const uint8_t* f = d + fo;
+            const size_t len = en - b;
+            std::vector<std::pair<std::string, LayerRec>> layersHere;
+            uint32_t vals[12];
+            int disps[12];
+            int nst = 0;
+            bool pending = false;
+            LayerRec pend;
+            size_t i = 0;
+            while (i + 11 <= len) {
+                const uint8_t* p = f + i;
+                // mov dword [rsp+disp8/disp32], imm32
+                if (p[0] == 0xC7 && p[2] == 0x24 && (p[1] == 0x44 || p[1] == 0x84)) {
+                    int32_t disp;
+                    uint32_t imm;
+                    size_t sl;
+                    if (p[1] == 0x44) {
+                        disp = static_cast<int8_t>(p[3]);
+                        memcpy(&imm, p + 4, 4);
+                        sl = 8;
+                    } else {
+                        memcpy(&disp, p + 3, 4);
+                        memcpy(&imm, p + 7, 4);
+                        sl = 11;
+                    }
+                    if (disp >= 0x30 && disp <= 0x98 && !(disp & 7)) {  // the call-argument area
+                        if (nst < 12) {
+                            vals[nst] = imm;
+                            disps[nst] = disp;
+                        }
+                        ++nst;
+                    }
+                    i += sl;
+                    continue;
+                }
+                // lea reg, [rip+disp32] that names a layer: "i<digits>"
+                if (pending && (p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 0x05) {
+                    int32_t disp;
+                    memcpy(&disp, p + 3, 4);
+                    size_t so;
+                    if (toOff(static_cast<uint32_t>(int64_t(b) + int64_t(i) + 7 + disp), so)) {
+                        const char* s = reinterpret_cast<const char*>(d + so);
+                        size_t k = 0;
+                        while (so + k < n && k < 12 && s[k]) ++k;
+                        if (k >= 2 && k < 12 && s[0] == 'i') {
+                            size_t j = 1;
+                            while (j < k && isdigit(static_cast<unsigned char>(s[j]))) ++j;
+                            if (j == k) {
+                                layersHere.emplace_back(std::string(s, k), pend);
+                                pending = false;
+                                i += 7;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // a call closes the run: exactly 12 distinct argument-area stores make a descriptor
+                // (an E8 byte inside another instruction's displacement is ruled out by its target: it must be code)
+                bool isCall = false;
+                if (p[0] == 0xE8) {
+                    int32_t rel;
+                    memcpy(&rel, p + 1, 4);
+                    const int64_t t = int64_t(b) + int64_t(i) + 5 + rel;
+                    for (const Sec& s : secs)
+                        if (s.exec && t >= s.va && t < int64_t(s.va) + s.vsize) isCall = true;
+                } else if (p[0] == 0xFF && p[1] == 0x15) {
+                    int32_t rel;
+                    memcpy(&rel, p + 2, 4);
+                    size_t tmp;
+                    isCall = toOff(static_cast<uint32_t>(int64_t(b) + int64_t(i) + 6 + rel), tmp);
+                }
+                if (isCall) {
+                    if (nst == 12) {
+                        bool distinct = true;
+                        for (int a = 0; a < 12; ++a)
+                            for (int c = a + 1; c < 12; ++c) distinct = distinct && disps[a] != disps[c];
+                        if (distinct) {
+                            pend.kind = vals[1];
+                            pend.cout = vals[2];
+                            pend.cin = vals[3];
+                            pend.clamp = vals[4];
+                            pend.sn = vals[5];
+                            pend.sp = vals[6];
+                            pend.mulPos = vals[7];
+                            pending = true;
+                        }
+                    }
+                    nst = 0;
+                    i += p[0] == 0xE8 ? 5 : 6;
+                    continue;
+                }
+                ++i;
+            }
+            if (!layersHere.empty()) tables.push_back(std::move(layersHere));
+        }
+        int hits = 0;
+        for (const auto& t : tables) {
+            if (static_cast<long long>(t.size()) == rcLayers && t[0].second.cin == rcFirstCin) {
+                ++hits;
+                table.clear();
+                for (const auto& l : t) table[l.first] = l.second;
+            }
+        }
+        if (hits != 1) {
+            tableErr = "the layer table of the multi-frame model was not found in this libxess_fg.dll (" + std::to_string(tables.size()) + " builders, " + std::to_string(hits) + " fit:";
+            for (const auto& t : tables) tableErr += " " + std::to_string(t.size()) + "/" + std::to_string(t[0].second.cin);
+            tableErr += ")";
+            return Fail(tableErr);
+        }
+        tableOk = true;
+        return true;
+    }
+
+    bool RootBlock(int index, std::vector<uint8_t>& out) {
+        const std::string who = "root constants of dispatch #" + std::to_string(index);
+        auto ce = consts.find(index);
+        if (!haveRc || ce == consts.end()) return Fail(who + ": the recipe has no description");
+        if (!ScanLayerTable()) return false;
+        if (sets.empty()) ParseManifest();
+        const ConstEntry& c = ce->second;
+        std::vector<uint32_t> dw(c.dwords, 0u);
+        auto put = [&](long long k, uint32_t v) {
+            if (k >= 0 && static_cast<size_t>(k) < dw.size()) dw[static_cast<size_t>(k)] = v;
+        };
+        auto st = sets.find(index);
+        if (st != sets.end())
+            for (const SetRule& r : st->second) {
+                std::string e = r.expr;
+                double v;
+                if (!Expr(e, sizeVars).Eval(v)) return Fail(who + ": cannot evaluate {" + r.expr + "}");
+                if (r.kind == 'f') {
+                    const float fv = static_cast<float>(v);
+                    uint32_t bits;
+                    memcpy(&bits, &fv, 4);
+                    put(r.dword, bits);
+                } else {
+                    put(r.dword, static_cast<uint32_t>(static_cast<int64_t>(v)));
+                }
+            }
+        auto bk = rcBlocks.find(index);
+        if (bk != rcBlocks.end()) {
+            const RcBlock& b = bk->second;
+            if (!b.layer.empty()) {
+                auto l = table.find(b.layer);
+                if (l == table.end()) return Fail(who + ": layer " + b.layer + " is not in this libxess_fg.dll");
+                const LayerRec& L = l->second;
+                if (b.head) {
+                    put(7, static_cast<uint32_t>(L.mulPos));
+                    put(8, static_cast<uint32_t>(L.sp));
+                } else {
+                    if (!b.plain.count(8)) put(8, static_cast<uint32_t>(std::min(rcChunk, L.cin)));
+                    put(9, static_cast<uint32_t>(L.mulPos));
+                    put(10, static_cast<uint32_t>((L.sn << 8) | L.sp));
+                }
+            }
+            for (const auto& kv : b.plain) put(kv.first, kv.second);
+        }
+        for (int m : c.mask) put(m, 0);
+        out.resize(dw.size() * 4);
+        if (!dw.empty()) memcpy(out.data(), dw.data(), out.size());
+        intel_modules::Sha256 h{};
+        if (!intel_modules::HashBytes(out.data(), out.size(), h) || h != c.sha)
+            return Fail(who + " derived from the libxess_fg.dll do not match the recipe's SHA-256");
         return true;
     }
 
@@ -192,7 +602,7 @@ struct IntelFileSource::Impl {
         for (size_t i = 0; i + 8 <= n && left; ++i) {
             uint64_t v;
             memcpy(&v, d + i, 8);
-            const uint32_t h = static_cast<uint32_t>((v * kProbeMul) >> 32);
+            const uint32_t h = ProbeTag(v);
             const uint32_t slot = h >> 16;
             if (!(bitmap[slot >> 3] & (1u << (slot & 7)))) continue;
             for (Blob& b : blobs) {
@@ -390,8 +800,11 @@ struct IntelFileSource::Impl {
     }
 };
 
-IntelFileSource::IntelFileSource(const std::wstring& libxessPath, const std::vector<uint8_t>& partsJson)
-    : impl_(new Impl), path_(libxessPath), parts_(partsJson) {}
+IntelFileSource::IntelFileSource(const std::wstring& libxessPath, const std::vector<uint8_t>& partsJson,
+                                 const std::vector<uint8_t>& manifestTmpl)
+    : impl_(new Impl), path_(libxessPath), parts_(partsJson) {
+    impl_->manifest.assign(manifestTmpl.begin(), manifestTmpl.end());
+}
 
 IntelFileSource::~IntelFileSource() { delete impl_; }
 
@@ -457,14 +870,23 @@ bool IntelFileSource::Upload(int ordinal, std::vector<uint8_t>& out) {
 }
 
 bool IntelFileSource::RootConstants(int index, std::vector<uint8_t>& out) {
-    // Not derived from the file yet. Until it is, a development capture can stand in (F5LOW_DEV_CAP).
+    // An explicit development override (a PSO capture, F5LOW_DEV_CAP) wins; otherwise the blocks are derived from the file.
     if (rootSource_) {
         if (rootSource_->RootConstants(index, out)) return true;
         problem_ = rootSource_->Problem();
         return false;
     }
-    problem_ = "the dispatch root constants are not derived from libxess_fg.dll yet (development: set F5LOW_DEV_CAP to a PSO capture log)";
-    return false;
+    if (!Prepare()) return false;
+    const auto t0 = Clock::now();
+    impl_->err.clear();
+    const bool ok = impl_->RootBlock(index, out);
+    stats_.rcMs += MsSince(t0);
+    if (!ok) {
+        problem_ = impl_->err;
+        return false;
+    }
+    ++stats_.rcBlocks;
+    return true;
 }
 
 }  // namespace packbuild
