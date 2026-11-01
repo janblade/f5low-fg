@@ -452,7 +452,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
             return Outcome::Cached;
         }
         if (!req.own || !req.data) {
-            error = !req.own ? "this f5low.dll carries no recipe" : "no data source for the weights (F5LOW_DEV_WEIGHTS + F5LOW_DEV_CAP)";
+            error = !req.own ? "this f5low.dll carries no recipe" : "no data source for the weights";
             return Outcome::Failed;
         }
         std::error_code ec;

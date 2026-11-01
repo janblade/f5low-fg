@@ -23,6 +23,7 @@
 #include <vector>
 
 #define XEFG_SWAPCHAIN_EXPORT_API
+#include "intel_file_source.h"
 #include "pack_build.h"
 #include "xefg_own.h"
 #include "xefg_version.h"
@@ -259,9 +260,9 @@ std::wstring RealLibraryPath(const char** from);
 
 // The pack-less route (story B2): our recipe and kernels are built into this DLL (resource 102, tools/recipe/build_own.py),
 // the Intel parts come from the player's libxess_fg.dll on first use and the finished pack is cached in
-// <DLL dir>\f5low_cache\<key>\. F5LOW_DXCOMPILER: dxcompiler.dll (default: next to this DLL). Weights and root constants
-// come from F5LOW_DEV_WEIGHTS (dump folder) + F5LOW_DEV_CAP (PSO capture log) until the decoder of libxess_fg's own data
-// (story B3) exists. Runs once, at the first PackDir() call that finds no other pack; the result is kept.
+// <DLL dir>\f5low_cache\<key>\. F5LOW_DXCOMPILER: dxcompiler.dll (default: next to this DLL). The weights are rebuilt from
+// the libxess_fg.dll file (intel_file_source); the root constants still come from F5LOW_DEV_CAP (PSO capture log) until
+// they are derived too (story B3). Runs once, at the first PackDir() call that finds no other pack; the result is kept.
 std::string BuiltPackDir()
 {
     static std::once_flag once;
@@ -291,9 +292,30 @@ std::string BuiltPackDir()
         req.bundleBytes = bytes;
         req.bundleSize = bytesSize;
         wchar_t w[MAX_PATH] = {}, c[MAX_PATH] = {};
-        std::unique_ptr<packbuild::DevCaptureSource> source;
-        if (GetEnvironmentVariableW(L"F5LOW_DEV_WEIGHTS", w, MAX_PATH) && GetEnvironmentVariableW(L"F5LOW_DEV_CAP", c, MAX_PATH))
+        // Weights: rebuilt from the player's libxess_fg.dll file (IntelFileSource). Root constants: not derived yet, so a
+        // development capture (F5LOW_DEV_CAP) stands in. F5LOW_DEV_WEIGHTS (a weight dump folder + F5LOW_DEV_CAP) still
+        // overrides everything for development.
+        std::unique_ptr<packbuild::IntelDataSource> source;
+        std::unique_ptr<packbuild::DevCaptureSource> capSource;
+        packbuild::IntelFileSource* fileSource = nullptr;
+        const bool haveCap = GetEnvironmentVariableW(L"F5LOW_DEV_CAP", c, MAX_PATH) != 0;
+        if (haveCap && GetEnvironmentVariableW(L"F5LOW_DEV_WEIGHTS", w, MAX_PATH))
             source = std::make_unique<packbuild::DevCaptureSource>(w, c);
+        else
+        {
+            const auto it = bundle.find("i0/parts.json");
+            if (it != bundle.end())
+            {
+                auto file = std::make_unique<packbuild::IntelFileSource>(req.libxessPath, it->second);
+                fileSource = file.get();
+                if (haveCap)
+                {
+                    capSource = std::make_unique<packbuild::DevCaptureSource>(std::wstring(c));
+                    file->SetRootConstantSource(capSource.get());
+                }
+                source = std::move(file);
+            }
+        }
         req.data = source.get();
         std::vector<std::string> lines;
         req.log = [&](const std::string& l) { lines.push_back(l); };
@@ -307,6 +329,12 @@ std::string BuiltPackDir()
         }
         for (const std::string& l : lines)
             Log("%s", l.c_str());
+        if (o == packbuild::Outcome::Built && fileSource)
+        {
+            const auto& st = fileSource->GetStats();
+            Log("weights from libxess_fg.dll: %zu uploads rebuilt and hash-checked (read %.0f ms, %zu weight blobs located %.0f ms, %zu vector runs %.0f ms, decode %.0f ms)",
+                st.uploads, st.readMs, st.blobs, st.blobsMs, st.runs, st.runsMs, st.decodeMs);
+        }
         if (o == packbuild::Outcome::Built)
             Log("pack build took %llu ms on the calling thread (one-time; later runs use the cache)", GetTickCount64() - t0);
         char narrow[MAX_PATH * 2] = {};

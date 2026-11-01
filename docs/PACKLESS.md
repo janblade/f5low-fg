@@ -45,16 +45,44 @@ Python with numpy.
 
 `XEFG_CUDA_PACK` / `xefg_pack\` next to the DLL, then a pack embedded in the DLL (personal builds, resource 101),
 then the cache, then a build now. A build needs the player's `libxess_fg.dll` (`XEFG_CUDA_INTEL_LIBRARY` or the usual
-lookup), `dxcompiler.dll` next to f5low.dll (`F5LOW_DXCOMPILER`) and a weights source. Until the decoder of
-libxess_fg's own data exists (story B3), the source is a dev capture: `F5LOW_DEV_WEIGHTS` (weight dump folder) +
-`F5LOW_DEV_CAP` (PSO capture log); it sits behind `IntelDataSource` (`pack_build.h`), which B3 implements. Every blob is
-checked against the recipe's SHA-256. If anything is missing the log says so in ONE line ("own generator
+lookup), `dxcompiler.dll` next to f5low.dll (`F5LOW_DXCOMPILER`) and a data source (`IntelDataSource`, `pack_build.h`):
+the 106 weight uploads come from `IntelFileSource` (next section); the 44 root-constant blocks are NOT derived yet
+(story B3 still open) and come from a dev capture, `F5LOW_DEV_CAP` (PSO capture log). `F5LOW_DEV_WEIGHTS` (a weight
+dump folder, with `F5LOW_DEV_CAP`) still overrides everything for development. Every blob is checked against the
+recipe's SHA-256. If anything is missing the log says so in ONE line ("own generator
 unavailable: ...") and the DLL forwards to libxess_fg.dll as before.
 
 The build runs synchronously at the first `PackDir()` call (the first `xefgSwapChainGetVersion` /
 `D3D12CreateContext` on the game's thread): about 2.1 s once (decode 46 ms, translate 1.45 s, write 0.55 s on the
 development PC), logged with its phases. A background build while Intel's library serves the first seconds is a
 later improvement. Stale `*.tmp*` folders of killed builds are removed at the start of the next build.
+
+### The weights (`src/intel_file_source.h/.cpp`, story B3 step 2)
+
+`IntelFileSource` rebuilds all 106 weight uploads of the multi-frame model (the `intel_upload` entries) from the
+`libxess_fg.dll` FILE: the library is never loaded or run, nothing is patched, no GPU is involved.
+
+- **Weights.** The int8 convolution weights are plain bytes in the file, one blob per layer. The recipe's `decode` key
+  (ours) lists each blob by length, SHA-256 and a short probe tag; the source scans the file for the probe tags and
+  confirms a candidate by the SHA-256 of the whole blob (a copy shifted by a byte, or a second copy of the same weights,
+  cannot pass unless its bytes are equal). The tiling per layer family is ours: the conv layers are re-tiled with a
+  `[A][B][C][tap][D][o][i]` (net A with a 8x16 tile, net B 16x16) or `[A][B][tap][D][C][o][i]` (U-Net, 16x16) digit
+  order, small stems padded to a 128/32 tile, 1x1 heads as `[cin/4][cout][4]` (a padded column reads on into the next
+  row), one small layer is copied as it is.
+- **Scale and bias.** The per-channel vectors are not data in the file but byte-wise immediate stores in start-up code.
+  The generic scan (`mov byte [rsp+disp32], imm8`, consecutive displacements = one vector, in file order) finds the
+  same runs, in the same order, in 1.3.4.95 and 1.3.1.78. The recipe says per upload which run it takes and in which
+  form: as is (float32 or int32), 16-bit widened to int32, a stem vector widened and zero-padded to 512 bytes, or a
+  folded bias `float32(aux * 128 * scale + bias)` where `aux` is the sum of the layer's int8 weights.
+- **Check.** Every rebuilt upload is compared with the SHA-256 the recipe lists for it before it is used; a mismatch
+  names the upload. A libxess_fg whose blobs are not in the recipe fails with the first missing blob. Nothing Intel's
+  is stored in the recipe: no address, offset into the image or struct layout, only our shapes and hashes.
+- **Cost and test.** About 30 ms to read the file, find the 36 blobs and the 219 runs, 10 ms to decode all 106
+  uploads. `tests/intel_file_test.cpp` (`tests/build_intel_file_test.ps1`) rebuilds and hash-checks all 106 from a
+  libxess_fg.dll: 106/106 on 1.3.4.95 and on 1.3.1.78.
+- **Not done.** The 44 root-constant blocks (`RootConstants()`): until they are derived, `F5LOW_DEV_CAP` stands in and
+  without it the build stops with one line saying so. `IntelFileSource::SetRootConstantSource` is where a derived
+  implementation plugs in.
 
 ### The translator (`src/translate.h/.cpp`)
 
