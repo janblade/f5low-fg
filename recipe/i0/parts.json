@@ -1,17 +1,15 @@
 {
  "version": 1,
  "files": {
-  "k00_xa6aefb7a.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "a6aefb7a73e48f5ce04cf3b34ecd66ed4b5b0692fc30042c3da6609da19398e7",
-   "transform": "plain",
-   "fmts": ["S0=rgba8", "S1=rgba8", "U0=rg8i", "U1=rg8i"]
+  "k00_prep.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_prep_ptx.py",
+   "args": []
   },
-  "k01_xfc68cb62.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "fc68cb621ecb3dd6483376cafdc6394f7d5edd3f899a70ccf6e4b4e1589c0bf3",
-   "transform": "plain",
-   "fmts": ["S0=x32", "U0=x32"]
+  "k01_depth_down.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_depth_down_ptx.py",
+   "args": []
   },
   "k02_x61e52c4b_c18.ptx": {
    "kind": "intel_xlate",
