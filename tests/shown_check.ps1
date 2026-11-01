@@ -31,6 +31,13 @@ foreach ($p in $Paths) {
     if (Test-Path $log) { Copy-Item $log (Join-Path $Out "$p.log") -Force }
     $dumps = Get-ChildItem $Out -Filter "$p.k*.bin" | Sort-Object Name
     if ($code -ne 0 -or -not $dumps) { $lines += "$p FAILED (exit $code, $($dumps.Count) dumps)"; continue }
+    # A d3d12 run that fell back to the CUDA path presents the same pictures, so the hashes alone would pass it.
+    if ($p -eq 'd3d12' -and (Test-Path (Join-Path $Out "$p.log")) -and
+        (Select-String -Path (Join-Path $Out "$p.log") -SimpleMatch 'using the CUDA path' -Quiet)) {
+        $lines += "$p FAILED (the D3D12 path fell back to CUDA, see $p.log)"
+        $dumps | Remove-Item
+        continue
+    }
     foreach ($d in $dumps) {
         $lines += "$p $($d.Name) $((Get-FileHash $d.FullName -Algorithm SHA256).Hash.ToLower())"
         Remove-Item $d.FullName
