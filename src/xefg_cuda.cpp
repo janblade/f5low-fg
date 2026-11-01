@@ -1064,12 +1064,15 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             o->clockPacer ? "clock" : "schedule", o->gate ? " + gate" : "", o->maxLag, o->maxDelay);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
+    const std::string fwdText = fwdReason.empty() ? "forwarding to Intel XeFG" : fwdReason;
     if (!Real("xefgSwapChainD3D12CreateContext"))
         SetStatus(3, fwdReason.empty() ? "libxess_fg.dll not found, nothing to forward to"
                                        : fwdReason + "; libxess_fg.dll not found");
     else if (d && ph)
-        SetStatus(2, fwdReason.empty() ? "forwarding to Intel XeFG" : fwdReason);
+        SetStatus(2, fwdText);
     FORWARD(xefgSwapChainD3D12CreateContext, d, ph);
+    if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS && d && ph && Real("xefgSwapChainD3D12CreateContext"))
+        SetStatus(3, "Intel XeFG CreateContext failed (" + std::to_string(static_cast<int>(r)) + ") after hand-over: " + fwdText);
     Log("D3D12CreateContext device=%p -> %d h=%p", static_cast<void*>(d), r, ph ? static_cast<void*>(*ph) : nullptr);
     return r;
 }

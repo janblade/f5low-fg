@@ -6,8 +6,9 @@ f5low-fg is licensed under the GNU General Public License, version 3 (see LICENS
 permission under section 7 of that licence.
 
 Linking exception. If you modify this Program, or any covered work, by linking or combining it with the Intel XeSS
-libraries (`libxess_fg.dll`, `libxell.dll`, `libxess.dll`) or with a vendor runtime library of NVIDIA or AMD (for
-example the CUDA driver, NVAPI, Streamline `sl.*.dll` and `nvngx_*.dll`, the FidelityFX DLLs), the licensors of this
+libraries (`libxess_fg.dll`, `libxell.dll`, `libxess.dll`, or a modified version of that library) or with GPU vendor
+driver and SDK runtime libraries from NVIDIA, AMD or Intel (for example the CUDA driver, NVAPI, Streamline `sl.*.dll`
+and `nvngx_*.dll`, the FidelityFX DLLs), the licensors of this
 Program grant you additional permission to convey the resulting work. Corresponding Source for a non-source form of such
 a combination shall include the source code for the parts of this Program used as well as that of the covered work, but
 not the source code of those libraries, which are not part of this Program and stay under their own licences. Those

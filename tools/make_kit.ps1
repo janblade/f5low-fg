@@ -2,7 +2,7 @@
 # README. NOT part of CI: Intel's DLL is not in this repo. The Intel DLL and licence are read from the paths you give.
 #   powershell -File tools\make_kit.ps1 -IntelLib <libxess_fg.dll 1.3.4.95> -XessLicense <XeSS LICENSE.txt> -Out H:\Temp\f5low_kit
 param([Parameter(Mandatory)][string]$IntelLib, [Parameter(Mandatory)][string]$XessLicense, [Parameter(Mandatory)][string]$Out,
-      [string]$Dll = '')
+      [string]$Dll = '', [switch]$AllowDirty)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 if (-not $Dll) { $Dll = Join-Path $root 'build\f5low.dll' }
@@ -19,25 +19,46 @@ if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=Int
 }
 $version = (Get-Item $Dll).VersionInfo.FileVersion
 if (-not $version) { throw "$Dll has no FileVersion" }
-if ($version -match '-dirty') { Write-Warning "f5low.dll was built from a dirty tree ($version)" }
+# The source line in README-KIT must be true: the DLL's FileVersion ends in +<shortsha>[-dirty] (build.ps1); that commit
+# must be HEAD of this checkout and the DLL must not come from a dirty tree.
 $commit = (& git -C $root rev-parse HEAD).Trim()
+$short = if ($version -match '\+([0-9a-f]{7,40})(-dirty)?$') { $Matches[1] } else { '' }
+$dirty = $version -match '-dirty$'
+$problem = ''
+if (-not $short) { $problem = "FileVersion '$version' carries no +<commit>" }
+elseif ($dirty) { $problem = "f5low.dll was built from a dirty tree ($version)" }
+elseif (-not $commit.StartsWith($short)) { $problem = "f5low.dll is built from $short, this checkout is at $($commit.Substring(0, 7))" }
+$notForRelease = $false
+if ($problem) {
+    if (-not $AllowDirty) { throw "$problem. Build from a clean, committed tree (build.ps1), or pass -AllowDirty for a local test kit." }
+    Write-Warning "$problem - NOT FOR RELEASE"
+    $notForRelease = $true
+}
+if (-not $notForRelease) {
+    $st = (& git -C $root status --porcelain --untracked-files=no)
+    if ($st) { throw "the checkout has uncommitted changes (the kit's licences and README come from it); commit them or pass -AllowDirty" }
+}
+$tag = if ($notForRelease) { "$version-NOT-FOR-RELEASE" } else { $version }
 
 New-Item -ItemType Directory -Force $Out | Out-Null
 $Out = (Resolve-Path $Out).Path
-$stage = Join-Path $Out "stage-$version"
+$stage = Join-Path $Out "stage-$tag"
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $stage | Out-Null
 
 Copy-Item $Dll (Join-Path $stage 'f5low.dll')
 Copy-Item $IntelLib (Join-Path $stage 'libxess_fg.dll')
 Copy-Item $XessLicense (Join-Path $stage 'XeSS_LICENSE.txt')
+# f5low.dll statically links zstd (third_party\zstd, build.ps1) - the only third-party code compiled in; its BSD notice ships
+Copy-Item (Join-Path $root 'third_party\zstd\LICENSE') (Join-Path $stage 'zstd_LICENSE.txt')
 # LICENSE = GPL-3.0 text, then the additional permission
 $nl = [Environment]::NewLine
 $text = (Get-Content (Join-Path $root 'LICENSE') -Raw) + $nl + ('=' * 78) + $nl + $nl + (Get-Content (Join-Path $root 'LICENSE-EXCEPTION.md') -Raw)
 [IO.File]::WriteAllText((Join-Path $stage 'LICENSE'), $text, (New-Object Text.UTF8Encoding($false)))
 
+$banner = if ($notForRelease) { "*** NOT FOR RELEASE: local test kit ($problem) ***$nl$nl" } else { '' }
 $readme = @"
-f5low $version
+${banner}f5low $version
 =================
 
 f5low.dll is the frame generation host behind OptiScaler-NR's F5Low FG output (our own pacer, gate and presenter, with
@@ -54,6 +75,7 @@ Files
   libxess_fg.dll   Intel XeSS frame generation 1.3.4.95 (SHA-256 $intelSha256)
   LICENSE          GPL-3.0 + additional permission (section 7)
   XeSS_LICENSE.txt Intel's licence for libxess_fg.dll
+  zstd_LICENSE.txt BSD notice of zstd, which f5low.dll contains (statically linked)
   kit_hashes.txt   SHA-256 of every file above (OptiScaler's package_release.ps1 checks them)
 
 How OptiScaler uses it
@@ -68,7 +90,7 @@ $lines = Get-ChildItem $stage -File | Sort-Object Name |
     ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
 Set-Content -Path (Join-Path $stage 'kit_hashes.txt') -Value $lines -Encoding ascii
 
-$zip = Join-Path $Out "f5low-kit-$version.zip"
+$zip = Join-Path $Out "f5low-kit-$tag.zip"
 Remove-Item $zip, "$zip.sha256" -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
 $zh = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
