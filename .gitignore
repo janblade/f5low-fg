@@ -17,3 +17,5 @@ cache/
 *.log
 _xess/
 .claude/
+__pycache__/
+*.pyc
