@@ -129,11 +129,10 @@
    "transform": "plain",
    "fmts": ["S0=rg16f", "S1=x32"]
   },
-  "k18_x9ef8c15d.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "9ef8c15d23bf0e2f8b8086e046e6705c497d4499ea8e41ec922474cd2582e42f",
-   "transform": "plain",
-   "fmts": ["S0=x32"]
+  "k18_splat_t.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_splat_t_ptx.py",
+   "args": []
   },
   "k19_ra7fc1e46.ptx": {
    "kind": "intel_xlate",
@@ -340,11 +339,10 @@
    "transform": "plain",
    "fmts": ["S0=rg16f", "S1=x32"]
   },
-  "v_xbca124cb.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "bca124cb664a35551a2587d863af231b94050fe8f390e525423be1fed67722e0",
-   "transform": "plain",
-   "fmts": ["S0=x32"]
+  "v_splat_t_invdepth.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_splat_t_ptx.py",
+   "args": ["--invert-depth"]
   },
   "v_blend_sdr_straight.ptx": {
    "kind": "own_gen",
