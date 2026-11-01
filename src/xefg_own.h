@@ -41,7 +41,7 @@
 
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
-#include "../cuda/xefg_pack_d3d.h"
+#include "xefg_pack_d3d.h"
 
 #include <dxgi1_6.h>
 

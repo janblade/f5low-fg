@@ -139,11 +139,41 @@ def tree_files(folder):
             if ".git" not in os.path.relpath(r, folder).split(os.sep)]
 
 
-def audit_dll(path):
+# PTX kernels we write by hand in the runtime sources (xefg_pack.h, xefg_pack_d3d.h); any other entry is not ours.
+OWN_PTX_ENTRIES = {b"swaprb", b"fill"}
+RE_ENTRY = re.compile(rb"\.entry\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def own_blob_hashes(path):
+    """SHA-256 list build.ps1 writes for the shader containers it compiles in (first word per line)."""
+    if not path or not os.path.exists(path):
+        return set()
+    return {line.split()[0].lower() for line in open(path, encoding="ascii") if line.strip()}
+
+
+def audit_dll(path, own_blobs=None):
+    import hashlib
     with open(path, "rb") as f:
         data = f.read()
-    found = containers(data)
-    found += [what for what, pat in (("DXIL part", b"DXIL"), ("PTX text", b".target sm_")) if pat in data]
+    own = own_blob_hashes(own_blobs)
+    found = [what for sig, what in MAGICS.items() if sig in data]
+    for m in RE_DXBC.finditer(data):
+        size = int.from_bytes(data[m.start() + 24:m.start() + 28], "little")
+        blob = data[m.start():m.start() + size]
+        if hashlib.sha256(blob).hexdigest() not in own:
+            found.append(f"DXBC container at 0x{m.start():x} ({size} bytes), not one we compile")
+    if b"DXIL" in data:
+        found.append("DXIL part")
+    # A compressed payload (an embedded pack is LZMS, which hides every signature) reads as noise: code and data
+    # sections stay well under 7.5 bits per byte in 64 KB windows.
+    win = 64 * 1024
+    noisy = [o for o in range(0, len(data) - win + 1, win) if entropy(data[o:o + win]) > 7.5]
+    if noisy:
+        found.append(f"compressed/encrypted data: {len(noisy)} x 64 KB from 0x{noisy[0]:x}")
+    if b".target sm_" in data:
+        names = set(RE_ENTRY.findall(data))
+        if not names or names - OWN_PTX_ENTRIES:
+            found.append(f"PTX text with entries {sorted(n.decode() for n in names - OWN_PTX_ENTRIES) or '?'}")
     for what in found:
         print(f"FAIL {path}: {what} inside the DLL")
     return len(found)
@@ -187,6 +217,24 @@ def self_test():
         caught = audit_dll(dll) > 0
         print(f"{'ok  ' if caught else 'MISS'} --dll catches an embedded pack")
         ok &= caught
+        import hashlib
+        dxbc = b"DXBC" + bytes(16) + bytes.fromhex("01000000") + (40).to_bytes(4, "little") + bytes(12)
+        own_list = os.path.join(tmp, "own_blobs.txt")
+        with open(own_list, "w", encoding="ascii") as f:
+            f.write(hashlib.sha256(dxbc).hexdigest() + "  test\n")
+        ptx_own = b".target sm_75\n.visible .entry swaprb(\n"
+        ptx_other = b".target sm_80\n.visible .entry k04_conv(\n"
+        cases = [("own DXBC + own PTX pass", b"MZ" + dxbc + ptx_own, own_list, False),
+                 ("unlisted DXBC fails", b"MZ" + dxbc, None, True),
+                 ("foreign PTX entry fails", b"MZ" + ptx_own + ptx_other, own_list, True),
+                 ("compressed payload fails", b"MZ" + os.urandom(200 * 1024), own_list, True)]
+        for name, data, lst, want_fail in cases:
+            with open(dll, "wb") as f:
+                f.write(data)
+            failed = audit_dll(dll, lst) > 0
+            good = failed == want_fail
+            print(f"{'ok  ' if good else 'MISS'} --dll {name}")
+            ok &= good
     print("SELF TEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -197,11 +245,12 @@ def main():
     g.add_argument("--tree")
     g.add_argument("--dll")
     g.add_argument("--self-test", action="store_true")
+    ap.add_argument("--own-blobs", help="with --dll: build.ps1's own_blobs.txt (default: next to the DLL)")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     if a.dll:
-        bad = audit_dll(a.dll)
+        bad = audit_dll(a.dll, a.own_blobs or os.path.join(os.path.dirname(os.path.abspath(a.dll)), "own_blobs.txt"))
     elif a.tree:
         bad = audit_files(tree_files(a.tree), a.tree)
     else:

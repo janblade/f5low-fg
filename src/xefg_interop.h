@@ -7,7 +7,7 @@
 // layout CopyTextureRegion writes into a buffer footprint.
 #pragma once
 
-#include "../cuda/xefg_pack.h"
+#include "xefg_pack.h"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>

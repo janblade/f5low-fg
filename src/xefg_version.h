@@ -6,7 +6,7 @@
 // the compiler and puts the whole version in the DLL's version resource, which OptiScaler shows. A build without
 // build.ps1 reports build 0, commit "local".
 #define XEFG_CUDA_VERSION_MAJOR 1
-#define XEFG_CUDA_VERSION_MINOR 0
+#define XEFG_CUDA_VERSION_MINOR 1
 #define XEFG_CUDA_VERSION_PATCH 0
 
 #if __has_include("_version_build.h")
