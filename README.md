@@ -26,3 +26,8 @@ Never commit a vendor binary (`libxess_fg.dll`, Streamline, `nvngx_*`, FidelityF
 from one: extracted or translated shaders (DXBC, DXIL, PTX made from them), zstd dictionaries, weights, captured
 buffers, disassembly, RVAs or byte patterns. Intel modules are referred to by SHA-256 only. The audit in
 `tools/` enforces this in CI.
+
+## Licence
+
+GPL-3.0, the same as OptiScaler (see LICENSE). Vendor libraries are never part of this repo; they are loaded
+at runtime from the player's PC.
