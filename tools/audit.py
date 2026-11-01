@@ -139,6 +139,9 @@ def tree_files(folder):
             if ".git" not in os.path.relpath(r, folder).split(os.sep)]
 
 
+# Occurrences inside a built DLL that are the run-time decoder's own constants, not data (see audit_dll).
+DLL_TOLERATED = {"zstd frame": 8, "zstd dictionary": 8, "DXIL": 3}
+
 # PTX kernels we write by hand in the runtime sources (xefg_pack.h, xefg_pack_d3d.h); any other entry is not ours.
 OWN_PTX_ENTRIES = {b"swaprb", b"fill"}
 RE_ENTRY = re.compile(rb"\.entry\s+([A-Za-z_][A-Za-z0-9_]*)")
@@ -156,13 +159,20 @@ def audit_dll(path, own_blobs=None):
     with open(path, "rb") as f:
         data = f.read()
     own = own_blob_hashes(own_blobs)
-    found = [what for sig, what in MAGICS.items() if sig in data]
+    # The DLL decodes the player's libxess_fg at run time (src/intel_modules.cpp + vendored zstd): its code holds the
+    # zstd frame/dictionary magic constants and looks for the word DXIL in decoded data. A few occurrences of those are
+    # that code; a payload would carry one per frame (and show up as noise below).
+    found = []
+    for sig, what in MAGICS.items():
+        n = data.count(sig)
+        if n > DLL_TOLERATED.get(what, 0):
+            found.append(what + (f" (x{n})" if n > 1 else ""))
     for m in RE_DXBC.finditer(data):
         size = int.from_bytes(data[m.start() + 24:m.start() + 28], "little")
         blob = data[m.start():m.start() + size]
         if hashlib.sha256(blob).hexdigest() not in own:
             found.append(f"DXBC container at 0x{m.start():x} ({size} bytes), not one we compile")
-    if b"DXIL" in data:
+    if data.count(b"DXIL") > DLL_TOLERATED["DXIL"]:
         found.append("DXIL part")
     # A compressed payload (an embedded pack is LZMS, which hides every signature) reads as noise: code and data
     # sections stay well under 7.5 bits per byte in 64 KB windows.
@@ -227,7 +237,9 @@ def self_test():
         cases = [("own DXBC + own PTX pass", b"MZ" + dxbc + ptx_own, own_list, False),
                  ("unlisted DXBC fails", b"MZ" + dxbc, None, True),
                  ("foreign PTX entry fails", b"MZ" + ptx_own + ptx_other, own_list, True),
-                 ("compressed payload fails", b"MZ" + os.urandom(200 * 1024), own_list, True)]
+                 ("decoder constants (3 zstd magics) pass", b"MZ" + (bytes.fromhex("28b52ffd") + bytes(8)) * 3, own_list, False),
+                 ("a zstd payload (40 frames) fails", b"MZ" + (bytes.fromhex("28b52ffd") + bytes(8)) * 40, own_list, True),
+                 ("compressed payload fails",b"MZ" + os.urandom(200 * 1024), own_list, True)]
         for name, data, lst, want_fail in cases:
             with open(dll, "wb") as f:
                 f.write(data)
