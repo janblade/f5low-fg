@@ -14,14 +14,59 @@ gets them from the player's own `libxess_fg.dll` when it first needs them.
 2. **Find by hash.** The recipe (`recipe/i0/parts.json`, `recipe/i0/hdr/parts.json`) names a module only by the
    SHA-256 of its restored container, never by position. All 40 distinct modules the recipe needs are in both
    builds. A build where one is missing is not an i0 build we know: the own generator reports itself unavailable.
-3. **Per slot, one of three routes.**
-   - **native**: Intel's container runs as it is on D3D12 (the pack's `native <ptx> <dxbc> [32]` line:
-     Intel's own root signature, descriptors from the manifest's binds; `32` = u0 is a raw buffer written with a
-     one-texel border, which the pack pads). No translation, nothing to build.
-   - **own**: a kernel of ours replaces the module (a generator in `tools/kernels`, compiled with the pack).
-   - **translate**: module disassembled and turned into PTX (dxil2ptx, today Python). In pack-less mode only as a
-     last resort: it needs a C++ port that reads the player's dxcompiler.
-4. **Cache** the built pack per (libxess_fg SHA-256, GPU SM) (story B2 step 3).
+3. **Per slot, one of two routes** (own kernels are a later speed-up, see below).
+   - **native** (16 modules per pack): Intel's container runs as it is on D3D12 (the pack's
+     `native <ptx> <dxbc> [32]` line: Intel's own root signature, descriptors from the manifest's binds; `32` = u0 is
+     a raw buffer written with a one-texel border, which the pack pads). Nothing to build.
+   - **translate in-process** (the 10 modules / 8 slots that cannot run native, plus the PTX twins of the native
+     ones for the CUDA path = 26 `intel_xlate` entries per pack): `src/dxc_disasm.cpp` asks `dxcompiler.dll` for the
+     module's disassembly text, `src/translate.cpp` turns the text into PTX, on the player's PC, with the same
+     rules and the same output as the offline tool (see below). Performance is the current pack's, because the
+     kernels are the same text.
+4. **Cache** the built pack per (libxess_fg SHA-256, dxcompiler version, GPU SM) (story B2 step 3).
+
+### The translator (`src/translate.h/.cpp`)
+
+`Dxil2Ptx` (disassembly text -> PTX), `ReconEdit` (the reconstruction input edit, before translation),
+`ClampVariant` (re-binds the 17/18-bit accumulator clamp of a translated kernel), `VectorizeShared` (groupshared
+loads of four aligned words become one vector load) and `TranslateEntry`, which runs one recipe entry's transform
+(`plain`, `recon`, `clamp:<bits>`) with its `fmts`. It is a port of our own offline tool; its comments keep the
+reasons for the float contraction rules (every fmul with a single fadd/fsub use is fused into it, first operand
+first; everything else `.rn`) and the other bit-exact choices. A module that uses something the translator does not
+know fails with a message, never a crash; the slot is then unavailable and the own generator reports it.
+
+`tests/translate_test.cpp` (build: `tests/build_translate_test.ps1`) translates every `intel_xlate` entry of both
+recipe packs from a libxess_fg.dll in-process and compares byte for byte with the offline tool's PTX for the same
+module and options: 52 entries, identical on libxess_fg 1.3.4.95 and 1.3.1.78. Translating all 52 takes about 1.25 s
+(24 ms each) plus 0.2 s for the disassembly, once per (libxess_fg, GPU) before the cache exists.
+
+### dxcompiler.dll
+
+f5low.dll loads `dxcompiler.dll` from its own folder (`plugins\`) when it has to translate; it is never in this repo
+and not linked at build time (the two COM interfaces used are declared in `src/dxc_disasm.h`). The release
+packaging fetches it.
+
+- **Pinned version: DirectX Shader Compiler 1.9.2602.17 (21d28f727)**, x64 `dxcompiler.dll` of the
+  microsoft/DirectXShaderCompiler redistributable package. This is the build that wrote the disassembly the offline
+  pack was made from; `IDxcCompiler::Disassemble` in-process returns the same text as `dxc -dumpbin` (equal except
+  that dxc.exe writes CR LF line ends and one extra line end at the end of the file; the translator reads LF text and
+  ignores blank lines, so the PTX is identical). A different dxcompiler may print other text; the cache key carries
+  the version and the test above must pass before a new one is pinned.
+- `dxil.dll` is not needed (disassembly does not validate).
+- **Licence**: the compiler source is under the LLVM (University of Illinois/NCSA) licence with MIT parts; the
+  redistributable package ships these as `LICENSE-LLVM.txt` / `LICENSE-MIT.txt` and its binaries under Microsoft's
+  "DirectX Shader Compiler" software licence terms (`LICENSE-MS.txt`), which allow distributing the listed DLLs
+  with an application provided distributors and end users agree to terms that protect Microsoft at least as much and
+  the distributor indemnifies Microsoft for claims arising from the application (not from the unmodified DLL).
+  Bundling needs that clause read and accepted; nothing is bundled yet. Alternatives: the player's PC often has a
+  `dxcompiler.dll` already (game folders, Windows SDK), which would need the version check above.
+
+## Own kernels (later speed-ups)
+
+The translation route is the baseline. Own kernels replace single slots where they are measurably faster, one at a
+time, each proven against the translated PTX with the check_all tolerance: input prep k0 (0.12 -> about 0.04 ms per
+app frame), the blend k31 (largest), k1, k2/k3 (stem generator), k11/k12, k18. Until a slot has one, it stays
+translated.
 
 Native on D3D12 has rules (`D3DPack` refuses the pack otherwise), and they decide most of the table:
 
