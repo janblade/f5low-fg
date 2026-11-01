@@ -13,15 +13,28 @@ namespace longpath
 // Paths shorter than this need no extension (MAX_PATH minus room for what a caller appends).
 inline constexpr size_t kPlainLimit = 240;
 
-inline std::wstring Widen(const std::string& s)
+// Pack folders are held in std::string as UTF-8, whatever the system code page: a folder name with characters outside
+// the ANSI code page (Cyrillic on a Western system) must reach the file APIs unchanged. These two convert at the edges.
+inline std::wstring WidenUtf8(const std::string& s)
 {
     if (s.empty())
         return {};
-    const int n = MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
     std::wstring w(static_cast<size_t>(n > 0 ? n : 0), L'\0');
     if (n > 0)
-        MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
     return w;
+}
+
+inline std::string ToUtf8(const std::wstring& w)
+{
+    if (w.empty())
+        return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n > 0 ? n : 0), '\0');
+    if (n > 0)
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
 }
 
 // The absolute, normalised form of `p` that file APIs take at any length ("\\?\C:\...", "\\?\UNC\server\share\...").

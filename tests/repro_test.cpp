@@ -11,6 +11,7 @@
 //   REPRO_DEBUG=1   the D3D12 debug layer (its errors and warnings are printed; exit code 2)
 //   REPRO_HDR=1     an R10G10B10A2 swap chain (the own generator then uses the pack's hdr\ part)
 //   REPRO_INITFLAGS=n  XeFG init flags (default 1 = inverted depth; 0 runs the pack's non-inverted-depth module variants)
+//   REPRO_W / REPRO_H  output (back buffer) size (default 1920x1080; with REPRO_RW / REPRO_RH for the render size)
 //   REPRO_OFF=N     frames before frame generation is turned on (default 120)
 //   REPRO_ON=N      frames with it on (default 240)
 //   REPRO_LATE_TAG=1  tag with the frame's list already closed and submitted (Streamline's eValidUntilPresent tags
@@ -32,6 +33,7 @@
 // Exit code: 0 ok, 1 setup failed, 2 debug-layer messages, 3 a Present failed / the device was removed.
 
 #include <windows.h>
+#include <shellapi.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
@@ -243,7 +245,10 @@ int main(int argc, char** argv)
         }
     }
 
-    HMODULE dll = LoadLibraryA(argv[1]);
+    // the DLL path from the wide command line: a folder name outside the ANSI code page must reach LoadLibrary unchanged
+    int wargc = 0;
+    wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    HMODULE dll = wargv && wargc >= 2 ? LoadLibraryW(wargv[1]) : LoadLibraryA(argv[1]);
     if (!dll)
     {
         printf("cannot load %s\n", argv[1]);
@@ -340,8 +345,8 @@ int main(int argc, char** argv)
     RegisterClassA(&wc);
     HWND wnd = CreateWindowA("repro_test", "repro_test", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 960, 540, nullptr, nullptr, wc.hInstance, nullptr);
     DXGI_SWAP_CHAIN_DESC1 sd {};
-    sd.Width = 1920;
-    sd.Height = 1080;
+    sd.Width = static_cast<UINT>(EnvInt("REPRO_W", 1920));     // REPRO_W / REPRO_H: the output (back buffer) size
+    sd.Height = static_cast<UINT>(EnvInt("REPRO_H", 1080));
     sd.Format = EnvInt("REPRO_HDR", 0) == 1 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -352,7 +357,7 @@ int main(int argc, char** argv)
     ip.initFlags = initFlags;
     ip.maxInterpolatedFrames = XEFG_SWAPCHAIN_USE_MAX_SUPPORTED_INTERPOLATED_FRAMES;
     auto r = xefgSwapChainD3D12InitFromSwapChainDesc(h, wnd, &sd, nullptr, g_q, fac, &ip);
-    printf("InitFromSwapChainDesc 1920x1080 3 buffers FLIP_SEQUENTIAL flags 0x840: %d\n", r);
+    printf("InitFromSwapChainDesc %ux%u 3 buffers FLIP_SEQUENTIAL flags 0x840: %d\n", sd.Width, sd.Height, r);
     IDXGISwapChain4* sc = nullptr;
     if (r != 0 || xefgSwapChainD3D12GetSwapChainPtr(h, IID_PPV_ARGS(&sc)) != 0 || !sc)
         return 1;

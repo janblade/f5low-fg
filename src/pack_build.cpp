@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <sstream>
 
 #include "intel_modules.h"
 #include "long_path.h"
@@ -351,58 +352,138 @@ bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSour
 }
 
 // ---- cache --------------------------------------------------------------------------------------------------------
+// How this builder lays a pack out and what it leaves out; part of the cache key and of the `complete` marker, so a builder
+// that changes the layout never reuses a folder an older one made, and old folders can be told apart and pruned.
+// !!! RAISE THIS on ANY change to the builder (BuildPack / Builder), to ResolveManifest, to the pack layout or to which
+// files are written: a cache folder made by the old code is otherwise reused as it is. (The recipe and our kernels are in
+// the key already, through the bundle's SHA-256.)
+// 2: no translation, no PTX twins of native modules, a marker file. 3: the marker lists every file with its size.
+constexpr int kFormatVersion = 3;
+constexpr char kMarkerMagic[] = "f5low pack cache ";
+
 namespace {
-size_t CountFiles(const fs::path& d) {
-    size_t n = 0;
+// Every regular file of the pack except the marker: relative path (forward slashes) and size.
+std::vector<std::pair<std::string, uint64_t>> ListFiles(const fs::path& d) {
+    std::vector<std::pair<std::string, uint64_t>> v;
     std::error_code ec;
-    for (fs::recursive_directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec))
-        if (it->is_regular_file(ec) && it->path().filename() != "complete") ++n;
-    return n;
+    for (fs::recursive_directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code e2;
+        if (!it->is_regular_file(e2) || it->path().filename() == "complete") continue;
+        const uint64_t sz = it->file_size(e2);
+        v.emplace_back(longpath::ToUtf8(it->path().lexically_relative(d).generic_wstring()), e2 ? ~0ull : sz);
+    }
+    std::sort(v.begin(), v.end());
+    return v;
 }
 
+// "f5low pack cache <n>\nfiles <count>\n" then one "<size>\t<relative path>" line per file.
+std::string MakeMarker(const fs::path& d) {
+    const auto files = ListFiles(d);
+    std::string m = std::string(kMarkerMagic) + std::to_string(kFormatVersion) + "\nfiles " + std::to_string(files.size()) + "\n";
+    for (const auto& f : files) m += std::to_string(f.second) + "\t" + f.first + "\n";
+    return m;
+}
+
+// The cache format a folder's marker names (0: no readable marker).
+int MarkerFormat(const fs::path& d) {
+    std::vector<uint8_t> m;
+    if (!ReadAll(d / "complete", m)) return 0;
+    const std::string s(m.begin(), m.end());
+    if (s.compare(0, sizeof kMarkerMagic - 1, kMarkerMagic) != 0) return 0;
+    return atoi(s.c_str() + sizeof kMarkerMagic - 1);
+}
+
+// The marker of this format, every file it lists present with the size it was written with, and no other file in the folder.
 bool CacheComplete(const fs::path& d) {
     std::vector<uint8_t> m;
     if (!ReadAll(d / "complete", m)) return false;
-    const std::string s(m.begin(), m.end());
+    std::istringstream in(std::string(m.begin(), m.end()));
+    std::string line;
+    if (!std::getline(in, line) || line != kMarkerMagic + std::to_string(kFormatVersion)) return false;
     size_t want = 0;
-    if (sscanf_s(s.c_str(), "f5low pack cache 2\nfiles %zu", &want) != 1) return false;
-    return want > 0 && CountFiles(d) == want && fs::exists(d / "manifest.txt");
+    if (!std::getline(in, line) || sscanf_s(line.c_str(), "files %zu", &want) != 1 || want == 0) return false;
+    size_t seen = 0;
+    while (std::getline(in, line)) {
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) return false;
+        const uint64_t size = strtoull(line.substr(0, tab).c_str(), nullptr, 10);
+        std::error_code ec;
+        fs::path f = d / fs::path(longpath::WidenUtf8(line.substr(tab + 1)));
+        f.make_preferred();     // a "\\?\" path takes backslashes only
+        const uint64_t have = fs::file_size(f, ec);
+        if (ec || have != size) return false;
+        ++seen;
+    }
+    return seen == want && ListFiles(d).size() == want && fs::exists(d / "manifest.txt");
 }
-// Folders "<key>.tmp<pid>_<tick>" of builds that never finished: removed when nothing in them was written since before
-// this process started (a build still running in another process writes constantly, so its folder is newer). A
-// finished pack has no ".tmp" in its name and is never touched.
-void RemoveStaleTemps(const fs::path& root) {
-    FILETIME created{}, ex{}, k{}, u{};
-    if (!GetProcessTimes(GetCurrentProcess(), &created, &ex, &k, &u)) return;
-    ULARGE_INTEGER start;
-    start.LowPart = created.dwLowDateTime;
-    start.HighPart = created.dwHighDateTime;
+
+ULONGLONG FileTimeU(const FILETIME& t) {
+    ULARGE_INTEGER u;
+    u.LowPart = t.dwLowDateTime;
+    u.HighPart = t.dwHighDateTime;
+    return u.QuadPart;
+}
+
+// Folders "<key>.tmp<pid>_<tick>" of builds that never finished: removed when nothing in them was written since `cutoff`
+// (a build still running in another process writes constantly, so its folder is newer). A finished pack has no ".tmp"
+// in its name and is never touched.
+void RemoveStaleTemps(const fs::path& root, ULONGLONG cutoff) {
     std::error_code ec;
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code e1;
         const std::wstring n = it->path().filename().wstring();
-        if (n.find(L".tmp") == std::wstring::npos || !it->is_directory(ec)) continue;
+        if (n.find(L".tmp") == std::wstring::npos || !it->is_directory(e1)) continue;
         // newest write anywhere in the folder (a directory's own time does not change when a file inside is rewritten)
         ULONGLONG newest = 0;
         auto stamp = [&](const fs::path& p) {
             WIN32_FILE_ATTRIBUTE_DATA d{};
             if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d)) return;
-            ULARGE_INTEGER t;
-            t.LowPart = d.ftLastWriteTime.dwLowDateTime;
-            t.HighPart = d.ftLastWriteTime.dwHighDateTime;
-            newest = std::max<ULONGLONG>(newest, t.QuadPart);
+            newest = std::max<ULONGLONG>(newest, FileTimeU(d.ftLastWriteTime));
         };
         stamp(it->path());
         std::error_code e2;
         for (fs::recursive_directory_iterator f(it->path(), e2), fend; !e2 && f != fend; f.increment(e2)) stamp(f->path());
-        if (newest && newest < start.QuadPart) fs::remove_all(it->path(), ec);
+        if (newest && newest < cutoff) fs::remove_all(it->path(), e1);
+    }
+}
+
+ULONGLONG ProcessStart() {
+    FILETIME created{}, ex{}, k{}, u{};
+    return GetProcessTimes(GetCurrentProcess(), &created, &ex, &k, &u) ? FileTimeU(created) : 0;
+}
+
+// After a successful build or hit: the cache folders of an OLDER format (their `complete` marker names it) and the stale
+// temporary folders (nothing written for an hour) go. A folder of the current format is never touched (another process,
+// or another libxess_fg.dll next to this DLL, uses it). Failures to delete are ignored.
+void PruneCache(const fs::path& root) {
+    std::error_code ec;
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    constexpr ULONGLONG kHour = 3600ull * 10000000ull;
+    const ULONGLONG t = FileTimeU(now);
+    RemoveStaleTemps(root, t > kHour ? t - kHour : 0);
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code e1;
+        if (!it->is_directory(e1) || it->path().filename().wstring().find(L".tmp") != std::wstring::npos) continue;
+        const int f = MarkerFormat(it->path());
+        if (f > 0 && f < kFormatVersion) fs::remove_all(it->path(), e1);
     }
 }
 
 }  // namespace
 
-// How this builder lays a pack out and what it leaves out; part of the cache key, so a builder that changes the layout
-// never reuses a folder an older one made. 2: no translation, no PTX twins of native modules, a marker file.
-constexpr char kFormat[] = "2";
+bool DiscardPack(const std::wstring& dir) {
+    try {
+        const fs::path p(longpath::Extend(dir));
+        // only a cache folder: it sits in a folder called f5low_cache and has our marker
+        if (p.parent_path().filename() != L"f5low_cache" || MarkerFormat(p) <= 0) return false;
+        std::error_code ec;
+        fs::remove_all(p, ec);
+        return !fs::exists(p);
+    } catch (...) {
+        return false;
+    }
+}
 
 Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Report* repOut) {
     auto log = [&](const std::string& s) {
@@ -415,7 +496,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
             return Outcome::Failed;
         }
         const std::string intelSha = Sha256Hex(intel.data(), intel.size());
-        const std::string keyText = std::string("f5low-pack-cache-") + kFormat + "|libxess:" + intelSha +
+        const std::string keyText = std::string("f5low-pack-cache-") + std::to_string(kFormatVersion) + "|libxess:" + intelSha +
                                     "|recipe+kernels:" + Sha256Hex(req.bundleBytes, req.bundleSize);
         // not the data source: every weight and constant is checked against the recipe's SHA-256, so any source that
         // builds a pack builds the same one
@@ -425,6 +506,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
         if (CacheComplete(final_)) {
             dir = longpath::Plain(final_.wstring());
             log("pack cache hit " + key + " (libxess_fg " + intelSha.substr(0, 12) + ")");
+            PruneCache(root);
             return Outcome::Cached;
         }
         if (!req.own || !req.data) {
@@ -432,7 +514,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
             return Outcome::Failed;
         }
         std::error_code ec;
-        RemoveStaleTemps(root);
+        RemoveStaleTemps(root, ProcessStart());
         const fs::path tmp = root / (key + ".tmp" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64()));
         fs::remove_all(tmp, ec);
         fs::create_directories(tmp, ec);
@@ -450,7 +532,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
             return Outcome::Failed;
         }
         rep.intelSha256 = intelSha;
-        const std::string marker = "f5low pack cache 2\nfiles " + std::to_string(CountFiles(tmp)) + "\n";
+        const std::string marker = MakeMarker(tmp);
         if (!WriteAll(tmp / "complete", marker.data(), marker.size())) {
             fs::remove_all(tmp, ec);
             error = "cannot write into the cache folder";
@@ -478,6 +560,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
         log(buf);
         if (repOut) *repOut = rep;
         dir = longpath::Plain(final_.wstring());
+        PruneCache(root);
         return Outcome::Built;
     } catch (const std::exception& e) {
         error = std::string("pack build failed: ") + e.what();

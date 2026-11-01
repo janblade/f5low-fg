@@ -41,19 +41,20 @@ std::string g_logQ;             // formatted lines not yet written
 LARGE_INTEGER g_t0, g_freq;
 long g_lines = 0;
 constexpr long kMaxLines = 400000;
-wchar_t g_dir[MAX_PATH] = {};   // this DLL's folder (set in DllMain, which does no file I/O)
+std::wstring g_dir;   // this DLL's folder, any length (set in DllMain, which does no file I/O)
+std::wstring g_self;  // this DLL's full path
 
 // A setting from f5low.ini ([f5low]) next to this DLL. Without one, xefg_cuda.ini ([xefg_cuda]) from before the DLL
 // was renamed to f5low.dll, so an install keeps its settings.
 std::wstring IniString(const wchar_t* key, const wchar_t* def)
 {
-    const std::wstring dir(g_dir);
-    std::wstring file = dir + L"\\f5low.ini";
+    const std::wstring& dir = g_dir;
+    std::wstring file = longpath::ExtendIfLong(dir + L"\\f5low.ini");
     const wchar_t* section = L"f5low";
     if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES &&
-        GetFileAttributesW((dir + L"\\xefg_cuda.ini").c_str()) != INVALID_FILE_ATTRIBUTES)
+        GetFileAttributesW(longpath::ExtendIfLong(dir + L"\\xefg_cuda.ini").c_str()) != INVALID_FILE_ATTRIBUTES)
     {
-        file = dir + L"\\xefg_cuda.ini";
+        file = longpath::ExtendIfLong(dir + L"\\xefg_cuda.ini");
         section = L"xefg_cuda";
     }
     wchar_t v[64] = {};
@@ -74,7 +75,7 @@ bool OpenLog()
         wcsncpy_s(v, IniString(L"Log", L"0").c_str(), _TRUNCATE);
     if (!(v[0] == L'1' || _wcsicmp(v, L"true") == 0 || _wcsicmp(v, L"on") == 0))
         return false;
-    _wfopen_s(&g_log, (std::wstring(g_dir) + L"\\f5low.log").c_str(), L"w");
+    _wfopen_s(&g_log, longpath::ExtendIfLong(g_dir + L"\\f5low.log").c_str(), L"w");
     if (g_log)
         setvbuf(g_log, nullptr, _IONBF, 0);  // written in batches anyway; nothing left for the CRT to flush at exit
     if (g_log)
@@ -178,17 +179,6 @@ void Log(const char* fmt, ...)
 std::map<xefg_swapchain_handle_t, std::shared_ptr<xefgown::Own>> g_own;
 std::mutex g_ownLock;
 
-std::string ModuleDir()
-{
-    char path[MAX_PATH];
-    HMODULE self = nullptr;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCSTR>(&ModuleDir), &self);
-    GetModuleFileNameA(self, path, MAX_PATH);
-    std::string s(path);
-    return s.substr(0, s.find_last_of('\\'));
-}
-
 // The pack built into this DLL (build.ps1 -EmbedPack): resource 101 (RCDATA), compressed with the Compression API
 // (LZMS), layout as tools/xefg_dll/pack_embed.py writes it. Unpacked once into xefgpack::EmbeddedFiles().
 bool LoadEmbeddedPack()
@@ -264,18 +254,25 @@ std::wstring RealLibraryPath(const char** from);
 // modules as they are and runs on the D3D12 path only (pack_build.h). The weights and root constants are rebuilt from the
 // libxess_fg.dll file (intel_file_source); F5LOW_DEV_CAP (PSO capture log) replaces the derived root constants (development).
 // Runs once, at the first PackDir() call that finds no other pack; the result is kept.
-std::string BuiltPackDir()
+// The folder is UTF-8 (long_path.h). `fromCache`: EnsurePack found it finished (a damaged one is deleted and made again,
+// RepairBuiltPack). All callers hold g_builtLock.
+std::mutex g_builtLock;
+std::string g_builtDir;
+bool g_builtFromCache = false;
+bool g_builtRan = false;
+
+void RunBuiltPack()
 {
-    static std::once_flag once;
-    static std::string result;
-    std::call_once(once, [] {
+    std::string& result = g_builtDir;
+    {
         HMODULE self = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&BuiltPackDir), &self);
+                           reinterpret_cast<LPCWSTR>(&RunBuiltPack), &self);
         HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(102), MAKEINTRESOURCEW(10));
         const uint8_t* bytes = res ? static_cast<const uint8_t*>(LockResource(LoadResource(self, res))) : nullptr;
         const size_t bytesSize = res ? SizeofResource(self, res) : 0;
         static packbuild::Bundle bundle;
+        bundle.clear();
         std::string err;
         if (!bytes || !packbuild::ParseBundle(bytes, bytesSize, bundle, &err))
         {
@@ -337,11 +334,38 @@ std::string BuiltPackDir()
         }
         if (o == packbuild::Outcome::Built)
             Log("pack build took %llu ms on the calling thread (one-time; later runs use the cache)", GetTickCount64() - t0);
-        char narrow[MAX_PATH * 2] = {};
-        WideCharToMultiByte(CP_ACP, 0, packDir.c_str(), -1, narrow, sizeof(narrow), nullptr, nullptr);
-        result = narrow;
-    });
-    return result;
+        g_builtFromCache = o == packbuild::Outcome::Cached;
+        result = longpath::ToUtf8(packDir);
+    }
+}
+
+std::string BuiltPackDir()
+{
+    std::lock_guard<std::mutex> lk(g_builtLock);
+    if (!g_builtRan)
+    {
+        g_builtRan = true;
+        RunBuiltPack();
+    }
+    return g_builtDir;
+}
+
+// A pack taken from the cache that failed to load or to build for D3D12 (a file changed or cut after the marker was
+// written): its folder is deleted and the pack made again, once per process. Returns the new folder ("" when it is not the
+// cached pack, was repaired before, or cannot be made).
+std::string RepairBuiltPack(const std::string& bad)
+{
+    std::lock_guard<std::mutex> lk(g_builtLock);
+    static bool tried = false;
+    if (tried || !g_builtFromCache || bad != g_builtDir)
+        return {};
+    tried = true;
+    Log("the cached pack %s failed - deleting it and building the pack again", bad.c_str());
+    packbuild::DiscardPack(longpath::WidenUtf8(bad));
+    g_builtDir.clear();
+    g_builtFromCache = false;
+    RunBuiltPack();
+    return g_builtDir;
 }
 
 // Where the pack comes from, first that exists: a pack folder next to this DLL (or XEFG_CUDA_PACK) - so a new pack can be
@@ -352,8 +376,17 @@ std::string PackDir()
     char env[MAX_PATH];
     if (GetEnvironmentVariableA("XEFG_CUDA_FORWARD", env, sizeof(env)))
         return {};
-    std::string dir = GetEnvironmentVariableA("XEFG_CUDA_PACK", env, sizeof(env)) ? std::string(env) : ModuleDir() + "\\xefg_pack";
-    if (GetFileAttributesA((dir + "\\manifest.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
+    // UTF-8 from here on (long_path.h): the environment and the DLL's folder are read as wide strings
+    std::wstring wdir;
+    if (const DWORD n = GetEnvironmentVariableW(L"XEFG_CUDA_PACK", nullptr, 0))
+    {
+        wdir.resize(n);
+        wdir.resize(GetEnvironmentVariableW(L"XEFG_CUDA_PACK", wdir.data(), n));
+    }
+    else
+        wdir = std::wstring(g_dir) + L"\\xefg_pack";
+    std::string dir = longpath::ToUtf8(wdir);
+    if (GetFileAttributesW(longpath::ExtendIfLong(wdir + L"\\manifest.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
         return dir;
     if (LoadEmbeddedPack())
         return std::string(xefgpack::kEmbeddedDir);
@@ -375,7 +408,7 @@ void PackFit(ID3D12Device* d, const std::string& pack, int& need, int& have)
         if (dv < 0)
             return;
         have = xefgio::Interop::DeviceSm(cu, dv);
-        need = xefgpack::Pack::NeedSm(cu, pack);
+        need = xefgpack::Pack::NeedSm(cu, pack, xefgown::IsD3dOnlyPack(pack));
     }
     catch (...)
     {
@@ -493,22 +526,22 @@ std::shared_ptr<xefgown::Own> FindOwn(xefg_swapchain_handle_t h)
 //   3. the folder above this DLL - this DLL in OptiScaler\plugins, Intel's in the OptiScaler folder
 std::wstring RealLibraryPath(const char** from)
 {
-    wchar_t self[MAX_PATH] = {};
-    HMODULE module = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&RealLibraryPath), &module);
-    GetModuleFileNameW(module, self, MAX_PATH);
+    const std::wstring& self = g_self;      // any length (DllMain)
 
     const auto exists = [](const std::wstring& p)
     {
-        const DWORD a = GetFileAttributesW(p.c_str());
+        const DWORD a = GetFileAttributesW(longpath::ExtendIfLong(p).c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     };
 
-    wchar_t env[MAX_PATH] = {};
-    const DWORD n = GetEnvironmentVariableW(L"XEFG_CUDA_INTEL_LIBRARY", env, MAX_PATH);
+    std::wstring env;
+    if (const DWORD need = GetEnvironmentVariableW(L"XEFG_CUDA_INTEL_LIBRARY", nullptr, 0))
+    {
+        env.resize(need);
+        env.resize(GetEnvironmentVariableW(L"XEFG_CUDA_INTEL_LIBRARY", env.data(), need));
+    }
     // Never ourselves: a path that names this DLL would load it as its own fallback
-    if (n > 0 && n < MAX_PATH && _wcsicmp(env, self) != 0 && exists(env))
+    if (!env.empty() && _wcsicmp(env.c_str(), self.c_str()) != 0 && exists(env))
     {
         *from = "XEFG_CUDA_INTEL_LIBRARY";
         return env;
@@ -544,7 +577,7 @@ FARPROC Real(const char* name)
         const char* from = "";
         const std::wstring path = RealLibraryPath(&from);
         // The full path: a libxess_fg.dll the game loaded from its own folder is not taken by name instead
-        g_real = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        g_real = LoadLibraryExW(longpath::ExtendIfLong(path).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         Log("real library %S (%s): %p", path.c_str(), from, static_cast<void*>(g_real));
     });
     FARPROC p = g_real ? GetProcAddress(g_real, name) : nullptr;
@@ -869,6 +902,16 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         // A GPU the pack's kernels cannot run on (an older architecture, or not NVIDIA) gets Intel's library from the start:
         // found only at the build, the pack's failure left frame generation off on our own swap chain.
         PackFit(d, pack, need, have);
+        if (need == xefgpack::Pack::kNoSm)
+        {
+            // a cached pack that does not load: make it again (once) and look again
+            const std::string fresh = RepairBuiltPack(pack);
+            if (!fresh.empty())
+            {
+                pack = fresh;
+                PackFit(d, pack, need, have);
+            }
+        }
         if (have < need || !have)
         {
             Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", !have ? "no CUDA device behind this adapter"
@@ -880,6 +923,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     if (!pack.empty() && d && ph)
     {
         const std::string path = PathSetting();
+        xefgown::g_repairBuiltPack = &RepairBuiltPack;
         auto o = xefgown::Own::Create(d, pack, path, GeneratorSetting());
         if (!o)
             return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
@@ -1167,9 +1211,34 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(self);
         QueryPerformanceFrequency(&g_freq);
         QueryPerformanceCounter(&g_t0);
-        GetModuleFileNameW(self, g_dir, MAX_PATH);
-        if (wchar_t* s = wcsrchr(g_dir, L'\\'))
-            *s = 0;
+        {
+            // any length: grow the buffer until the name fits
+            std::wstring path(MAX_PATH, L'\0');
+            for (;;)
+            {
+                const DWORD n = GetModuleFileNameW(self, path.data(), static_cast<DWORD>(path.size()));
+                if (n == 0)
+                {
+                    path.clear();
+                    break;
+                }
+                if (n < path.size())
+                {
+                    path.resize(n);
+                    break;
+                }
+                if (path.size() >= 32768)
+                {
+                    path.clear();
+                    break;
+                }
+                path.resize(path.size() * 2);
+            }
+            path = longpath::Plain(path);       // a DLL loaded as "\\?\C:\..." (a long path): the ordinary form, as callers expect
+            g_self = path;
+            const size_t cut = path.find_last_of(L'\\');
+            g_dir = cut == std::wstring::npos ? path : path.substr(0, cut);
+        }
         if (HANDLE t = CreateThread(nullptr, 0, DredOn, nullptr, 0, nullptr))
             CloseHandle(t);
     }

@@ -103,8 +103,12 @@ enum class Outcome { Cached, Built, Failed };
 
 // Returns Cached (folder reused, no work), Built (made now) or Failed (`error` says what is missing). `dir` is the
 // pack folder on success (an ordinary path, not the \\?\ form). The key is the SHA-256 of the libxess_fg file, the bundle
-// (recipe + our kernels) and kFormat, the version of how this builder lays a pack out. Every file operation works on
+// (recipe + our kernels) and kFormatVersion (pack_build.cpp; raise it on any builder change), the version of how this builder lays a pack out. Every file operation works on
 // paths longer than MAX_PATH. Stale ".tmp" folders of killed builds are removed before a build.
 Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Report* rep = nullptr);
+
+// Deletes a cache folder that EnsurePack handed out (it failed to load later). Only a folder inside a "f5low_cache" folder
+// that carries our `complete` marker is deleted. False when it was not deleted.
+bool DiscardPack(const std::wstring& dir);
 
 }  // namespace packbuild

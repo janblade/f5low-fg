@@ -25,6 +25,8 @@ PC runs on the D3D12 path only.
      `native` line), which the pack built on the PC does not contain: the loader accepts a missing PTX file for a
      kernel a `native` line names (`Kernel::nativeOnly`), takes its constant-buffer blobs from the module's root
      constants, and the CUDA runner refuses such a pack.
+     (`Pack::allowNativeOnly` is set only for a pack with the `d3d12_only` marker; in any other pack a missing PTX file
+     still fails the load.) A pack with the marker also runs the native modules whatever `Native=` says (one log line).
    - **own kernel** (everything else, `own_gen` / `own_tpl` in the recipe): generated at BUILD time, embedded in
      f5low.dll, written into the pack as they are.
 
@@ -35,18 +37,23 @@ PC runs on the D3D12 path only.
    It equals `tools/recipe/build_pack.py`'s neutral-name output minus the PTX twins and plus the marker
    (`tools/recipe/compare_pack.py --packless`). `EnsurePack` keeps it in `<DLL dir>\f5low_cache\<key>\`. The key is the
    SHA-256 of (libxess_fg file, the embedded recipe + our kernels, `kFormat` = the version of the builder's pack layout;
-   not the data source, every blob is checked against the recipe's SHA-256 so any source builds the same pack). Raise
-   `kFormat` whenever the builder lays a pack out differently. The pack is built in a temporary folder next to
-   it, a `complete` marker with the file count is written last and the folder is renamed in one step; a folder
-   without a matching marker (killed build, damaged) is replaced. All file operations use the extended path form
-   (`src/long_path.h`, `\\?\C:\...`), so a DLL folder of 200+ characters works (the deepest cache file is then over 300
-   characters; the pack loader opens its files the same way).
+   not the data source, every blob is checked against the recipe's SHA-256 so any source builds the same pack).
+   **`kFormatVersion` (pack_build.cpp) must be raised on ANY change to the builder, `ResolveManifest`, the pack layout or the
+   set of files written**: otherwise a cache folder made by the old code is reused as it is. The pack is built in a
+   temporary folder next to it, a `complete` marker is written last (format number, file count, and the size of every file)
+   and the folder is renamed in one step; a folder whose marker does not match (killed build, a file cut or missing,
+   damaged) is replaced. If a cached pack still fails to load or to build for D3D12, its folder is deleted and the pack is
+   built again once per process. After a hit or a build, cache folders whose marker names an OLDER format and temporary
+   folders untouched for an hour are deleted (a folder of the current format is never touched; deletion failures are
+   ignored). Pack folders are held as UTF-8 strings and opened through the wide API, in the extended form
+   (`src/long_path.h`, `\\?\C:\...`) when long, so a DLL folder with characters outside the ANSI code page or of 200+
+   characters works (the deepest cache file is then over 300 characters).
 5. **Run.** A pack with the `d3d12_only` marker runs on the D3D12 path whatever `Path=` says (the log says so once: "the
    pack built from libxess_fg.dll runs on the D3D12 path only - Path=cuda is not used"); if NVAPI has no D3D12 cubin
    shaders, the own generator reports itself unavailable (one log line) and the DLL forwards to libxess_fg.dll. Explicit
    packs (`XEFG_CUDA_PACK`, an `xefg_pack\` folder, the pack embedded as resource 101) have no marker and keep both paths.
    The compiled-kernel cache of the D3D12 runner is keyed by the content of the PTX that is compiled
-   (`D3DPack::CubinKey`), not by file name: the SDR and `hdr\` packs name kernels alike.
+   (`D3DPack::CubinKey`, SHA-256), not by file name: the SDR and `hdr\` packs name kernels alike.
 
 ### What is embedded in f5low.dll (ours only)
 
@@ -192,6 +199,9 @@ recon/blend modules, the same rest). Module names are SHA-256 prefixes (8 hex di
 | k19 variants x11 | same, per init-flag set (ndc, jit, hires, inv) | recon | SDR 5a5a7b35, eae043e6, dfa6feb3, 8c7b249a, ad6437f9, 15dcfb96, 30511d38, 13637bf9, 81316214, 6c30e9aa, 6e84300e; HDR bb0e28cd, a48c8c87, d4b7977d, 31138d0d, 7e4c1e40, 643e6215, 6cb5a7ef, b0bd346d, da334ef5, 1f808ae3, 4cb7798f | as k19 | as k19 | **native** |
 | k31 | blend of the generated frame (writes the redirected ring buffer) | **own** (`gen_blend_ptx.py [--hdr]`, story B2b round 4) | cd506291 / efc1536e | own kernel (native impossible: it writes a redirected output) | bit-exact against Intel's module on 24 cases per variant (UI modes 0 and 2..6, debug frame on/off with frame counters, 1x1 .. 2560x1440, odd sizes, per-texture origins, short weight / scale / bias buffers, small U-Net texture, saturated sigmoids); D3D12 pack 0.100 ms per app frame vs 0.101 translated (Intel's module native 0.140); 54 registers like the translated kernel (the reads issued before the weights: 81 registers, 0.128 ms) | done, no translation |
 | k31 variant | blend with straight (not premultiplied) UI alpha | **own** (`gen_blend_ptx.py [--hdr] --premul 0`) | 0f8619d4 / 47821c21 | as k31 | as k31 | done, no translation |
+
+Note on names: `v_splat_t_invdepth.ptx` is the `inv=0` variant (depth NOT inverted, selected by the manifest's `variant 18 ... inv=0`
+line); it is named after what it does inside (the splat key is `1 - depth`), not after the flag.
 
 Kernels of the SDR and the HDR pack that differ are named apart (`k31_blend_sdr.ptx` / `k31_blend_hdr.ptx` and their `v_...straight` variants; the slots whose code is the same share a name). The name no longer matters for correctness: the D3D12 runner keeps its compiled kernels (`cubins`) by the content of the PTX (`D3DPack::CubinKey`), after round 4 found an HDR pack running the SDR kernel because both had the same file name.
 

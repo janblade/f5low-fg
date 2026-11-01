@@ -33,6 +33,18 @@ namespace xefgown
 {
 using namespace xefgio;
 
+// A pack built on the player's PC from libxess_fg.dll carries the d3d12_only marker (pack_build.h): Intel's native modules
+// without PTX twins, so it runs on the D3D12 path only. `dir` is UTF-8.
+inline bool IsD3dOnlyPack(const std::string& dir)
+{
+    return GetFileAttributesW(longpath::ExtendIfLong(longpath::WidenUtf8(dir + "\\" + packbuild::kD3d12OnlyMarker)).c_str()) !=
+           INVALID_FILE_ATTRIBUTES;
+}
+
+// Set by the DLL: a pack built on this PC that was taken from the cache failed to load or to build for D3D12. Deletes that
+// cache folder, builds the pack again (once per process) and returns the new folder, or "" when it cannot or already did.
+inline std::string (*g_repairBuiltPack)(const std::string& badDir) = nullptr;
+
 class OwnGenerator : public IGenerator, public IPackGenerator
 {
 public:
@@ -68,12 +80,17 @@ public:
             return Fail("interop: " + io.error);
         io.cu.CtxPopCurrent(nullptr);         // Init left the context current on this thread
         // A pack built on this PC from libxess_fg.dll (pack-less) holds Intel's native modules only: it runs on the D3D12 path.
-        d3dOnly = GetFileAttributesW(longpath::ExtendIfLong(longpath::Widen(packDir + "\\" + packbuild::kD3d12OnlyMarker)).c_str()) !=
-                  INVALID_FILE_ATTRIBUTES;
+        d3dOnly = IsD3dOnlyPack(packDir);
         if (d3dOnly && !d3dPath)
         {
             XLog("build: the pack built from libxess_fg.dll runs on the D3D12 path only - Path=cuda is not used");
             d3dPath = true;
+        }
+        if (d3dOnly && !cfg.native)
+        {
+            // its native modules have no PTX twin to run instead
+            XLog("build: the pack built from libxess_fg.dll runs Intel's native modules - Native=0 is not used");
+            cfg.native = true;
         }
         if (d3dPath && !nv.Load())
         {
@@ -97,6 +114,17 @@ public:
         {
             GenScope cuda(*this);
             ok = BuildPack(nullptr, gb);
+            if (!ok && d3dOnly && g_repairBuiltPack)
+            {
+                // a damaged cache folder (a file changed or cut after the marker was written): make the pack again, once
+                const std::string fresh = g_repairBuiltPack(packDir);
+                if (!fresh.empty())
+                {
+                    XLog("build: the cached pack failed to load - deleted, built again in %s", fresh.c_str());
+                    packDir = fresh;
+                    ok = BuildPack(nullptr, gb);
+                }
+            }
             if (!ok && d3dPath && !d3dOnly)
             {
                 XLog("build: the D3D12 path failed - using the CUDA path");
@@ -764,6 +792,7 @@ private:
         var.premul = (gb.initFlags & XEFG_SWAPCHAIN_INIT_FLAG_UITEXTURE_NOT_PREMUL_ALPHA) == 0;
         // An HDR10 back buffer takes the pack's hdr\ part (its own frame formats and modules).
         var.hdr = gb.hdr;
+        pack->allowNativeOnly = d3dOnly;
         if (!pack->Load(var.hdr ? packDir + "\\hdr" : packDir, want, var))
             return Fail(std::string("pack") + (var.hdr ? " (HDR10 part)" : "") + ": " + pack->error);
         if (pack->fellBack)

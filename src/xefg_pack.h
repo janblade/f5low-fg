@@ -294,12 +294,10 @@ inline std::vector<uint8_t> Slurp(const std::string& p)
         auto it = files.find(rel);
         return it == files.end() ? std::vector<uint8_t>() : it->second;
     }
-    // a pack folder deep in an install path (the pack cache) passes MAX_PATH: open it in the extended form
+    // `p` is UTF-8 (long_path.h): opened through the wide API, in the extended form when it passes MAX_PATH (the pack cache
+    // in a deep install path)
     std::ifstream f;
-    if (p.size() >= longpath::kPlainLimit)
-        f.open(longpath::Extend(longpath::Widen(p)).c_str(), std::ios::binary);
-    else
-        f.open(p, std::ios::binary);
+    f.open(longpath::ExtendIfLong(longpath::WidenUtf8(p)).c_str(), std::ios::binary);
     if (!f)
         return {};
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -624,7 +622,7 @@ public:
     // (deviceSm 1), each at its PTX target. kNoSm when a manifest fails to load. Reads the manifests, their constant
     // files and the PTX only; no CUDA calls.
     static constexpr int kNoSm = 1 << 30;
-    static int NeedSm(Cuda& cu, const std::string& dir)
+    static int NeedSm(Cuda& cu, const std::string& dir, bool allowNativeOnly = false)
     {
         int need = 0;
         for (const std::string& d : { dir, dir + "\\hdr" })
@@ -633,6 +631,7 @@ public:
                 continue;
             Pack p(cu);
             p.deviceSm = 1;
+            p.allowNativeOnly = allowNativeOnly;
             if (!p.Load(d))
                 return kNoSm;
             for (const Kernel& k : p.kernels)
@@ -655,6 +654,9 @@ public:
     // "fallback <kernel> <file> <block x y z>" line's PTX instead (an RTX 20 card: our own kernels at sm_75,
     // mma.m8n8k16, in place of the sm_80 ones; older packs: Intel's translated modules). 0: no check.
     int deviceSm = 0;
+    // Set before Load for a pack with the d3d12_only marker (built on the player's PC): a kernel that a 'native' line names
+    // may have no PTX file (Kernel::nativeOnly). Without it a missing PTX file fails the load, as in any other pack.
+    bool allowNativeOnly = false;
 
     // Parses the manifest and reads every file it names. No CUDA calls. A "pack 2" manifest is evaluated for
     // `want` (its own captured size when null); a "pack 1" manifest has one size only. A "pack 3" is a pack 2
@@ -962,8 +964,9 @@ public:
             k.ptx = Slurp(dir + "\\" + k.file);
             if (k.ptx.empty())
             {
-                // the PTX twin of a native module may be left out of the pack (pack-less: the D3D12 path runs the DXBC)
-                if (!natives.count(k.file))
+                // the PTX twin of a native module may be left out of a pack built on the player's PC (the d3d12_only marker:
+                // allowNativeOnly); any other pack missing a file is damaged
+                if (!allowNativeOnly || !natives.count(k.file))
                     return Fail("cannot read " + k.file);
                 k.nativeOnly = true;
             }

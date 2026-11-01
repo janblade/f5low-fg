@@ -15,7 +15,7 @@ $cmd = @"
 cd /d "$out"
 set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%"
 call "$vcvars" >nul
-cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$inc" "$root\tests\repro_test.cpp" /link /OUT:repro_test.exe d3d12.lib dxgi.lib user32.lib > _build_repro.log 2>&1
+cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$inc" "$root\tests\repro_test.cpp" /link /OUT:repro_test.exe d3d12.lib dxgi.lib user32.lib shell32.lib > _build_repro.log 2>&1
 "@
 Set-Content -Path (Join-Path $out '_build_repro.bat') -Value $cmd -Encoding ascii
 Remove-Item (Join-Path $out 'repro_test.exe') -ErrorAction SilentlyContinue
