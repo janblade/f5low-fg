@@ -18,6 +18,8 @@
 
 #include <d3d12.h>
 
+#include <functional>
+
 #include <set>
 
 namespace xefgpack
@@ -75,9 +77,27 @@ class D3DPack
 {
 public:
     std::string error;
-    // Compiled kernels by PTX file (optional, owned by the caller): the PTX does not depend on the pack's size,
-    // so a rebuild for another size needs no CUDA when every kernel is in here.
+    // Compiled kernels (optional, owned by the caller), keyed by the CONTENT of the PTX that was compiled (CubinKey), not
+    // by file name: two packs (SDR / HDR) may name different kernels alike. The PTX does not depend on the pack's size, so
+    // a rebuild for another size needs no CUDA when every kernel is in here.
     std::map<std::string, std::vector<uint8_t>>* cubins = nullptr;
+    // Called before the first kernel that is not in `cubins` is compiled: the caller makes a CUDA context current (it
+    // may have released its own after the first build). False: no CUDA, the build fails.
+    std::function<bool()> needCuda;
+
+    // 128-bit content hash of a PTX text (two FNV-1a runs over different bases and the length), as hex.
+    static std::string CubinKey(const std::vector<uint8_t>& ptx)
+    {
+        uint64_t a = 0xcbf29ce484222325ull, b = 0x84222325cbf29ce4ull ^ ptx.size();
+        for (const uint8_t c : ptx)
+        {
+            a = (a ^ c) * 0x100000001b3ull;
+            b = (b ^ (c + 0x9eu)) * 0x1000193ull * 0x100000001b3ull;
+        }
+        char buf[40];
+        snprintf(buf, sizeof buf, "%016llx%016llx", static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
+        return buf;
+    }
 
     D3DPack(Pack& p, Cuda& c, NvApi& n) : pack(p), cu(c), nv(n) {}
     ~D3DPack() { Release(); }
@@ -111,6 +131,16 @@ public:
             }
         if (!Compile())
             return false;
+        // A kernel with no PTX has no parameter declarations either: its constant buffers (the blobs SetConstants and the
+        // patches write, RecordNative reads) are the root constants of its native module.
+        for (size_t ki = 0; ki < pack.kernels.size(); ++ki)
+            if (Kernel& k = pack.kernels[ki]; k.nativeOnly && ki < natives.size())
+            {
+                k.params.clear();
+                for (const NativeKernel::Param& prm : natives[ki].params)
+                    if (prm.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                        k.params.push_back({ true, prm.reg, prm.count * 4 });
+            }
         if (!CreateBuffers(uploadInit))
             return false;
         if (!CreateShadows())
@@ -523,16 +553,20 @@ private:
     // PTX -> cubin for the current context's GPU (or from the cache).
     bool Cubin(const std::vector<uint8_t>& ptx, const std::string& name, std::vector<uint8_t>& out)
     {
+        // `name` is for messages only: the cache is keyed by what is compiled
+        const std::string key = CubinKey(ptx);
         if (cubins)
-            if (auto it = cubins->find(name); it != cubins->end())
+            if (auto it = cubins->find(key); it != cubins->end())
             {
                 out = it->second;
                 return true;
             }
+        if (needCuda && !needCuda())
+            return Fail(name + ": no CUDA to compile it");
         if (!CompileCubin(ptx, name, out))
             return false;
         if (cubins)
-            (*cubins)[name] = out;
+            (*cubins)[key] = out;
         return true;
     }
     bool CompileCubin(const std::vector<uint8_t>& ptx, const std::string& name, std::vector<uint8_t>& out)
@@ -909,6 +943,8 @@ private:
                 kernelShaders.push_back(nullptr);
                 continue;
             }
+            if (k.nativeOnly)
+                return Fail(k.file + ": the pack has only its native module, which is switched off (Native=0)");
             std::string s(reinterpret_cast<const char*>(k.ptx.data()));
             if (s.find("tex.") != std::string::npos)
                 TexelLoads(s, fmts[ki]);

@@ -260,9 +260,10 @@ std::wstring RealLibraryPath(const char** from);
 
 // The pack-less route (story B2): our recipe and kernels are built into this DLL (resource 102, tools/recipe/build_own.py),
 // the Intel parts come from the player's libxess_fg.dll on first use and the finished pack is cached in
-// <DLL dir>\f5low_cache\<key>\. F5LOW_DXCOMPILER: dxcompiler.dll (default: next to this DLL). The weights are rebuilt from
-// the libxess_fg.dll file (intel_file_source); the root constants still come from F5LOW_DEV_CAP (PSO capture log) until
-// they are derived too (story B3). Runs once, at the first PackDir() call that finds no other pack; the result is kept.
+// <DLL dir>\f5low_cache\<key>\. Nothing is translated and no dxcompiler.dll is needed: the pack holds Intel's native
+// modules as they are and runs on the D3D12 path only (pack_build.h). The weights and root constants are rebuilt from the
+// libxess_fg.dll file (intel_file_source); F5LOW_DEV_CAP (PSO capture log) replaces the derived root constants (development).
+// Runs once, at the first PackDir() call that finds no other pack; the result is kept.
 std::string BuiltPackDir()
 {
     static std::once_flag once;
@@ -281,12 +282,10 @@ std::string BuiltPackDir()
             Log("own generator unavailable: no pack found and this DLL carries no recipe (%s)", err.empty() ? "no resource" : err.c_str());
             return;
         }
-        wchar_t env[MAX_PATH] = {};
         const std::wstring dir(g_dir);
         const char* from = "";
         packbuild::Request req;
         req.libxessPath = RealLibraryPath(&from);
-        req.dxcompilerPath = GetEnvironmentVariableW(L"F5LOW_DXCOMPILER", env, MAX_PATH) ? std::wstring(env) : dir + L"\\dxcompiler.dll";
         req.cacheRoot = dir + L"\\f5low_cache";
         req.own = &bundle;
         req.bundleBytes = bytes;

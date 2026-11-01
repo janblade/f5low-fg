@@ -14,10 +14,9 @@
 #include <fstream>
 #include <set>
 
-#include "dxc_disasm.h"
 #include "intel_modules.h"
+#include "long_path.h"
 #include "recipe_json.h"
-#include "translate.h"
 
 namespace fs = std::filesystem;
 
@@ -38,7 +37,8 @@ bool ReadAll(const fs::path& p, std::vector<uint8_t>& out) {
     return static_cast<bool>(f) || n == 0;
 }
 
-bool WriteAll(const fs::path& p, const void* data, size_t n) {
+bool WriteAll(fs::path p, const void* data, size_t n) {
+    p.make_preferred();  // a "\\?\" path takes backslashes only (the recipe names files "data/R7.bin")
     std::error_code ec;
     fs::create_directories(p.parent_path(), ec);
     std::ofstream f(p, std::ios::binary | std::ios::trunc);
@@ -105,63 +105,15 @@ bool ResolveManifest(const std::string& tmplIn, const std::set<std::string>& nam
 struct Builder {
     const Bundle& own;
     IntelDataSource& data;
-    const std::wstring& dxcPath;
     Report& rep;
     intel_modules::Library lib;
-    dxc_disasm::Disassembler dxc;
-    bool dxcTried = false;
-    std::map<std::string, std::string> dis;   // module hash -> disassembly
-    std::map<std::string, std::string> made;  // translation key -> PTX text
     std::string err;
 
-    Builder(const Bundle& o, IntelDataSource& d, const std::wstring& dp, Report& r) : own(o), data(d), dxcPath(dp), rep(r) {}
+    Builder(const Bundle& o, IntelDataSource& d, Report& r) : own(o), data(d), rep(r) {}
 
     bool Fail(const std::string& what) {
         if (err.empty()) err = what;
         return false;
-    }
-
-    bool NeedDxc() {
-        if (dxc.Loaded()) return true;
-        if (dxcTried) return false;
-        dxcTried = true;
-        std::string why;
-        std::error_code ec;
-        if (!fs::exists(dxcPath, ec)) return Fail("dxcompiler.dll not found (" + Narrow(dxcPath) + ")");
-        if (!dxc.Load(dxcPath, &why)) return Fail(why);
-        rep.dxcVersion = dxc.Version();
-        return true;
-    }
-
-    bool Translate(const std::string& name, const Json& part, std::string& ptx) {
-        const std::string mod = part.Str_("module_sha256"), tr = part.Str_("transform");
-        std::vector<std::string> fmts;
-        if (const Json* f = part.Get("fmts"))
-            for (const Json& x : f->arr) fmts.push_back(x.str);
-        const std::string asmName = name.substr(0, name.rfind('.')) + ".dxasm";
-        std::string key = mod + "|" + tr + "|" + asmName;
-        for (const auto& f : fmts) key += "|" + f;
-        if (auto it = made.find(key); it != made.end()) {
-            ptx = it->second;
-            return true;
-        }
-        const auto t0 = Clock::now();
-        const std::vector<uint8_t>* m = lib.FindHex(mod);
-        if (!m) return Fail(name + ": module " + Hex8(mod) + " not found in libxess_fg.dll");
-        if (!NeedDxc()) return false;
-        auto d = dis.find(mod);
-        if (d == dis.end()) {
-            std::string text, why;
-            if (!dxc.Disassemble(m->data(), m->size(), text, &why)) return Fail(name + ": " + why);
-            d = dis.emplace(mod, std::move(text)).first;
-        }
-        std::string why;
-        if (!translate::TranslateEntry(d->second, tr, fmts, asmName, ptx, &why))
-            return Fail(name + ": translation of module " + Hex8(mod) + ": " + why);
-        made[key] = ptx;
-        ++rep.translated;
-        rep.translateMs += MsSince(t0);
-        return true;
     }
 
     bool WriteFile_(const fs::path& p, const void* d, size_t n, const std::string& what) {
@@ -190,7 +142,6 @@ struct Builder {
             const Json& part = kv.second;
             const std::string kind = part.Str_("kind");
             names.insert(n);
-            std::string ptx;
             if (kind == "own_gen" || kind == "own_tpl") {
                 const auto* b = get(n);
                 if (!b) return Fail(n + ": our kernel is not in this f5low.dll");
@@ -202,8 +153,9 @@ struct Builder {
                 ++rep.native;
                 if (!WriteFile_(out / n, m->data(), m->size(), n)) return false;
             } else if (kind == "intel_xlate") {
-                if (!Translate(n, part, ptx)) return false;
-                if (!WriteFile_(out / n, ptx.data(), ptx.size(), n)) return false;
+                // the PTX twin of a native module: only the CUDA path runs it, and nothing is translated here. The
+                // manifest still names the file; the loader runs the kernel's native module (Kernel::nativeOnly).
+                ++rep.skipped;
             } else {
                 return Fail(n + ": kind " + kind + " cannot be built");
             }
@@ -222,7 +174,10 @@ struct Builder {
             if (kind == "intel_upload") {
                 const int ord = static_cast<int>(d.Num_("ordinal"));
                 std::vector<uint8_t> up;
-                if (!data.Upload(ord, up))
+                const auto tw = Clock::now();
+                const bool gotUp = data.Upload(ord, up);
+                rep.weightsMs += MsSince(tw);
+                if (!gotUp)
                     return Fail(rel + ": weight upload " + std::to_string(ord) + " is not available" +
                                 (data.Problem().empty() ? "" : " (" + data.Problem() + ")"));
                 if (static_cast<long long>(up.size()) != d.Num_("upload_bytes"))
@@ -233,7 +188,10 @@ struct Builder {
             } else if (kind == "intel_const") {
                 const int idx = static_cast<int>(d.Num_("capture_index"));
                 std::vector<uint8_t> rc;
-                if (!data.RootConstants(idx, rc))
+                const auto tw = Clock::now();
+                const bool gotRc = data.RootConstants(idx, rc);
+                rep.weightsMs += MsSince(tw);
+                if (!gotRc)
                     return Fail(rel + ": root constants of dispatch #" + std::to_string(idx) + " are not available" +
                                 (data.Problem().empty() ? "" : " (" + data.Problem() + ")"));
                 rc.resize(static_cast<size_t>(d.Num_("dwords")) * 4, 0);
@@ -367,11 +325,11 @@ bool DevCaptureSource::RootConstants(int index, std::vector<uint8_t>& out) {
 }
 
 // ---- BuildPack ----------------------------------------------------------------------------------------------------
-bool BuildPack(const std::wstring& libxessPath, const std::wstring& dxcompilerPath, const Bundle& own, IntelDataSource& data,
-               const std::wstring& outDir, Report& rep, std::string* error, const std::vector<uint8_t>* libBytes) {
+bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSource& data, const std::wstring& outDir,
+               Report& rep, std::string* error, const std::vector<uint8_t>* libBytes) {
     const auto t0 = Clock::now();
     rep = Report();
-    Builder b(own, data, dxcompilerPath, rep);
+    Builder b(own, data, rep);
     std::string why;
     if (libBytes) data.UseLibraryBytes(libBytes);
     if (!(libBytes ? b.lib.OpenMemory(libBytes->data(), libBytes->size(), &why) : b.lib.Open(libxessPath, &why))) {
@@ -379,8 +337,15 @@ bool BuildPack(const std::wstring& libxessPath, const std::wstring& dxcompilerPa
         return false;
     }
     rep.decodeMs = b.lib.GetStats().decodeMs;
-    const bool ok = b.BuildOne("i0/", fs::path(outDir));
-    rep.writeMs = std::max(0.0, MsSince(t0) - rep.decodeMs - rep.translateMs);
+    bool ok = b.BuildOne("i0/", fs::path(outDir));
+    if (ok) {
+        // the pack has no PTX twins of its native modules: it runs on the D3D12 path only
+        static const char kNote[] =
+            "This pack was built on this PC from libxess_fg.dll by f5low.dll. It holds the DXBC of Intel's native modules\n"
+            "but no PTX twins of them, so it runs on the D3D12 path only.\n";
+        ok = b.WriteFile_(fs::path(outDir) / kD3d12OnlyMarker, kNote, sizeof kNote - 1, kD3d12OnlyMarker);
+    }
+    rep.writeMs = std::max(0.0, MsSince(t0) - rep.decodeMs - rep.weightsMs);
     if (!ok && error) *error = b.err;
     return ok;
 }
@@ -400,7 +365,7 @@ bool CacheComplete(const fs::path& d) {
     if (!ReadAll(d / "complete", m)) return false;
     const std::string s(m.begin(), m.end());
     size_t want = 0;
-    if (sscanf_s(s.c_str(), "f5low pack cache 1\nfiles %zu", &want) != 1) return false;
+    if (sscanf_s(s.c_str(), "f5low pack cache 2\nfiles %zu", &want) != 1) return false;
     return want > 0 && CountFiles(d) == want && fs::exists(d / "manifest.txt");
 }
 // Folders "<key>.tmp<pid>_<tick>" of builds that never finished: removed when nothing in them was written since before
@@ -435,27 +400,31 @@ void RemoveStaleTemps(const fs::path& root) {
 
 }  // namespace
 
+// How this builder lays a pack out and what it leaves out; part of the cache key, so a builder that changes the layout
+// never reuses a folder an older one made. 2: no translation, no PTX twins of native modules, a marker file.
+constexpr char kFormat[] = "2";
+
 Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Report* repOut) {
     auto log = [&](const std::string& s) {
         if (req.log) req.log(s);
     };
     try {
         std::vector<uint8_t> intel;
-        if (!ReadAll(req.libxessPath, intel) || intel.empty()) {
+        if (!ReadAll(fs::path(longpath::ExtendIfLong(req.libxessPath)), intel) || intel.empty()) {
             error = "libxess_fg.dll not found or not readable (" + Narrow(req.libxessPath) + ")";
             return Outcome::Failed;
         }
         const std::string intelSha = Sha256Hex(intel.data(), intel.size());
-        const std::string dxcVer = dxc_disasm::FileVersion(req.dxcompilerPath);
-        const std::string keyText = "f5low-pack-cache-1|libxess:" + intelSha + "|recipe+kernels:" +
-                                    Sha256Hex(req.bundleBytes, req.bundleSize) + "|dxcompiler:" + (dxcVer.empty() ? "none" : dxcVer);
+        const std::string keyText = std::string("f5low-pack-cache-") + kFormat + "|libxess:" + intelSha +
+                                    "|recipe+kernels:" + Sha256Hex(req.bundleBytes, req.bundleSize);
         // not the data source: every weight and constant is checked against the recipe's SHA-256, so any source that
         // builds a pack builds the same one
         const std::string key = Sha256Hex(keyText.data(), keyText.size()).substr(0, 32);
-        const fs::path root(req.cacheRoot), final_ = root / key;
+        // every path below is in the extended form (long_path.h): a deep install folder passes MAX_PATH
+        const fs::path root(longpath::Extend(req.cacheRoot)), final_ = root / key;
         if (CacheComplete(final_)) {
-            dir = final_.wstring();
-            log("pack cache hit " + key + " (libxess_fg " + intelSha.substr(0, 12) + ", dxcompiler " + (dxcVer.empty() ? "none" : dxcVer) + ")");
+            dir = longpath::Plain(final_.wstring());
+            log("pack cache hit " + key + " (libxess_fg " + intelSha.substr(0, 12) + ")");
             return Outcome::Cached;
         }
         if (!req.own || !req.data) {
@@ -468,20 +437,20 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
         fs::remove_all(tmp, ec);
         fs::create_directories(tmp, ec);
         if (ec) {
-            error = "cannot create the cache folder " + Narrow(tmp.wstring());
+            error = "cannot create the cache folder " + Narrow(longpath::Plain(tmp.wstring())) + " (" + ec.message() + ")";
             return Outcome::Failed;
         }
         log("pack cache miss " + key + ": building from libxess_fg " + intelSha.substr(0, 12) +
             " (one-time, runs on the calling thread)");
         Report rep;
         std::string why;
-        if (!BuildPack(req.libxessPath, req.dxcompilerPath, *req.own, *req.data, tmp.wstring(), rep, &why, &intel)) {
+        if (!BuildPack(req.libxessPath, *req.own, *req.data, tmp.wstring(), rep, &why, &intel)) {
             fs::remove_all(tmp, ec);
             error = why;
             return Outcome::Failed;
         }
         rep.intelSha256 = intelSha;
-        const std::string marker = "f5low pack cache 1\nfiles " + std::to_string(CountFiles(tmp)) + "\n";
+        const std::string marker = "f5low pack cache 2\nfiles " + std::to_string(CountFiles(tmp)) + "\n";
         if (!WriteAll(tmp / "complete", marker.data(), marker.size())) {
             fs::remove_all(tmp, ec);
             error = "cannot write into the cache folder";
@@ -492,22 +461,23 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
         if (fs::exists(final_) && !CacheComplete(final_)) fs::remove_all(final_, ec);
         fs::rename(tmp, final_, ec);
         if (ec) {
+            const std::string how = ec.message();
             if (CacheComplete(final_)) {
                 fs::remove_all(tmp, ec);
             } else {
                 fs::remove_all(tmp, ec);
-                error = "cannot move the built pack into " + Narrow(final_.wstring());
+                error = "cannot move the built pack into " + Narrow(longpath::Plain(final_.wstring())) + " (" + how + ")";
                 return Outcome::Failed;
             }
         }
         char buf[256];
         snprintf(buf, sizeof buf,
-                 "pack built: %zu files (%zu translated, %zu native), dxcompiler %s; decode %.0f ms, translate %.0f ms, write %.0f ms",
-                 rep.files, rep.translated, rep.native, rep.dxcVersion.empty() ? "-" : rep.dxcVersion.c_str(), rep.decodeMs,
-                 rep.translateMs, rep.writeMs);
+                 "pack built: %zu files (%zu native modules; %zu PTX twins left out, nothing translated); decode %.0f ms, weights + "
+                 "root constants %.0f ms, write %.0f ms",
+                 rep.files, rep.native, rep.skipped, rep.decodeMs, rep.weightsMs, rep.writeMs);
         log(buf);
         if (repOut) *repOut = rep;
-        dir = final_.wstring();
+        dir = longpath::Plain(final_.wstring());
         return Outcome::Built;
     } catch (const std::exception& e) {
         error = std::string("pack build failed: ") + e.what();

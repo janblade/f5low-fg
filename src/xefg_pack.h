@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 
+#include "long_path.h"
+
 namespace xefgpack
 {
 
@@ -292,7 +294,12 @@ inline std::vector<uint8_t> Slurp(const std::string& p)
         auto it = files.find(rel);
         return it == files.end() ? std::vector<uint8_t>() : it->second;
     }
-    std::ifstream f(p, std::ios::binary);
+    // a pack folder deep in an install path (the pack cache) passes MAX_PATH: open it in the extended form
+    std::ifstream f;
+    if (p.size() >= longpath::kPlainLimit)
+        f.open(longpath::Extend(longpath::Widen(p)).c_str(), std::ios::binary);
+    else
+        f.open(p, std::ios::binary);
     if (!f)
         return {};
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -547,6 +554,9 @@ struct Kernel
     std::string file, module, hash;
     unsigned block[3] = { 8, 8, 1 };
     std::vector<uint8_t> ptx;
+    // The pack has no PTX file for this kernel: it is the name of a 'native' line, whose DXBC is all there is (the
+    // pack-less pack, which is for the D3D12 path only). Load leaves ptx empty; the CUDA runner refuses such a pack.
+    bool nativeOnly = false;
     CUmodule mod = nullptr;
     CUfunction fn = nullptr;
     struct Param { bool cb; unsigned idx, size; };
@@ -951,7 +961,12 @@ public:
         {
             k.ptx = Slurp(dir + "\\" + k.file);
             if (k.ptx.empty())
-                return Fail("cannot read " + k.file);
+            {
+                // the PTX twin of a native module may be left out of the pack (pack-less: the D3D12 path runs the DXBC)
+                if (!natives.count(k.file))
+                    return Fail("cannot read " + k.file);
+                k.nativeOnly = true;
+            }
             k.ptx.push_back(0);
             // Parameters after p_desc, in the order dxil2ptx.py declares them.
             const char* q = reinterpret_cast<const char*>(k.ptx.data());
@@ -1022,6 +1037,8 @@ public:
         static char jitLog[16384];
         for (Kernel& k : kernels)
         {
+            if (k.nativeOnly)
+                return Fail(k.file + ": this pack has only the native module of this kernel (D3D12 path only)");
             int opts[] = { 5, 6 };      // CU_JIT_ERROR_LOG_BUFFER, _SIZE_BYTES
             void* vals[] = { jitLog, reinterpret_cast<void*>(static_cast<uintptr_t>(sizeof(jitLog))) };
             jitLog[0] = 0;

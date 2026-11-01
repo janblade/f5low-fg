@@ -13,8 +13,10 @@
 # Always embedded (resource 102, plain text): our recipe (recipe\i0) and the kernels WE generate at build time
 # (tools\recipe\build_own.py: tools\kernels generators, and our HLSL templates through dxc and src\translate.cpp via
 # build\xlate_tool.exe) plus the noise texture. At run time the DLL adds the Intel parts from the player's own
-# libxess_fg.dll and caches the pack (src\pack_build.cpp). Needs dxc.exe at BUILD time (-Dxc, $env:XEFG_DXC, or the
-# WinGet Microsoft.DirectX.ShaderCompiler package) and Python with numpy.
+# libxess_fg.dll (their DXBC modules, weights, root constants - nothing is translated, no dxcompiler.dll is needed or
+# loaded) and caches the pack (src\pack_build.cpp). The translator (src\translate.cpp, src\dxc_disasm.cpp) is a
+# BUILD-time tool and a test oracle only; it is not linked into f5low.dll. Needs dxc.exe at BUILD time (-Dxc,
+# $env:XEFG_DXC, or the WinGet Microsoft.DirectX.ShaderCompiler package) and Python with numpy.
 #
 # Also writes build\own_blobs.txt: SHA-256 of every shader container we compile into the DLL and the SHA-256 of every
 # file we put into resource 102 (our generated PTX among them), which tools\audit.py --dll accepts (anything else inside the DLL fails the audit).
@@ -109,7 +111,7 @@ type nul > _build.log
 rc /nologo /fo _res.res _res.rc >> _build.log 2>&1
 fxc /nologo /T cs_5_0 /E main /O3 /Fh xefg_convert_cs.h /Fo xefg_convert.cso /Vn g_xefgConvertCS "$src\xefg_convert.hlsl" >> _build.log 2>&1
 cl /nologo /c /TC /w /O2 /MT /DNDEBUG /Fo_zstd.obj "$root\third_party\zstd\zstddeclib.c" >> _build.log 2>&1
-cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$out" /I"$src" /I"$inc" /I"$root\third_party\zstd" /LD "$src\xefg_cuda.cpp" "$src\intel_modules.cpp" "$src\translate.cpp" "$src\dxc_disasm.cpp" "$src\pack_build.cpp" "$src\intel_file_source.cpp" _zstd.obj /link /OUT:f5low.dll d3d12.lib dxgi.lib cabinet.lib user32.lib _res.res >> _build.log 2>&1
+cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$out" /I"$src" /I"$inc" /I"$root\third_party\zstd" /LD "$src\xefg_cuda.cpp" "$src\intel_modules.cpp" "$src\pack_build.cpp" "$src\intel_file_source.cpp" _zstd.obj /link /OUT:f5low.dll d3d12.lib dxgi.lib cabinet.lib user32.lib _res.res >> _build.log 2>&1
 "@
 Remove-Item 'f5low.dll' -ErrorAction SilentlyContinue
 Set-Content -Path '_build.bat' -Value $cmd -Encoding ascii
@@ -120,7 +122,7 @@ if (Test-Path 'xefg_convert.cso') {
     Set-Content -Path 'own_blobs.txt' -Encoding ascii -Value "$h  xefg_convert.cso (src\xefg_convert.hlsl, fxc cs_5_0)"
     Add-Content -Path 'own_blobs.txt' -Encoding ascii -Value (Get-Content 'own\own_files.txt')
 }
-Remove-Item '_build.bat','_build.log','xefg_cuda.obj','intel_modules.obj','translate.obj','dxc_disasm.obj','_zstd.obj','f5low.exp','f5low.lib','xefg_cuda.exp','xefg_cuda.lib','_res.rc','_res.res','xefg_pack.bin','_version_build.h','xefg_convert.cso','pack_build.obj','intel_file_source.obj','xlate_tool.exe','xlate_tool.obj','_build_tool.bat','_build_tool.log' -ErrorAction SilentlyContinue
+Remove-Item '_build.bat','_build.log','xefg_cuda.obj','intel_modules.obj','translate.obj','_zstd.obj','f5low.exp','f5low.lib','xefg_cuda.exp','xefg_cuda.lib','_res.rc','_res.res','xefg_pack.bin','_version_build.h','xefg_convert.cso','pack_build.obj','intel_file_source.obj','xlate_tool.exe','xlate_tool.obj','_build_tool.bat','_build_tool.log' -ErrorAction SilentlyContinue
 Remove-Item 'own' -Recurse -ErrorAction SilentlyContinue
 if (Test-Path 'f5low.dll') {
     $what = if ($EmbedPack) { 'with a pack built in: PERSONAL USE ONLY' } else { 'without a pack' }

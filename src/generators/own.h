@@ -9,6 +9,8 @@
 #pragma once
 
 #include "../generator.h"
+#include "../long_path.h"
+#include "../pack_build.h"
 #include "../xefg_interop.h"
 #include "../xefg_pack_d3d.h"
 
@@ -65,8 +67,18 @@ public:
         if (!io.Init(dev))
             return Fail("interop: " + io.error);
         io.cu.CtxPopCurrent(nullptr);         // Init left the context current on this thread
+        // A pack built on this PC from libxess_fg.dll (pack-less) holds Intel's native modules only: it runs on the D3D12 path.
+        d3dOnly = GetFileAttributesW(longpath::ExtendIfLong(longpath::Widen(packDir + "\\" + packbuild::kD3d12OnlyMarker)).c_str()) !=
+                  INVALID_FILE_ATTRIBUTES;
+        if (d3dOnly && !d3dPath)
+        {
+            XLog("build: the pack built from libxess_fg.dll runs on the D3D12 path only - Path=cuda is not used");
+            d3dPath = true;
+        }
         if (d3dPath && !nv.Load())
         {
+            if (d3dOnly)
+                return Fail("the pack built from libxess_fg.dll needs the D3D12 path, and NVAPI has no D3D12 cubin shaders here");
             XLog("build: NVAPI has no D3D12 cubin shaders here - using the CUDA path");
             d3dPath = false;
         }
@@ -75,13 +87,17 @@ public:
             // Our own queue for the build's uploads: the application's one may not be known yet.
             D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_DIRECT };
             if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&setupQueue))))
+            {
+                if (d3dOnly)
+                    return Fail("the pack built from libxess_fg.dll needs the D3D12 path, and no command queue could be made");
                 d3dPath = false;
+            }
         }
         bool ok;
         {
             GenScope cuda(*this);
             ok = BuildPack(nullptr, gb);
-            if (!ok && d3dPath)
+            if (!ok && d3dPath && !d3dOnly)
             {
                 XLog("build: the D3D12 path failed - using the CUDA path");
                 d3dPath = false;
@@ -756,15 +772,6 @@ private:
         // A variant this run has not compiled yet (a resize to render = output size) needs CUDA again for a
         // moment, after the first build released it.
         bool tempCuda = false;
-        if (d3dPath && !io.ctx)
-            for (const Kernel& k : pack->kernels)
-                if (!cubins.count(k.file))
-                {
-                    if (!io.Init(dev))
-                        return Fail("interop (compiling a variant): " + io.error);
-                    tempCuda = true;
-                    break;
-                }
         rCur = pack->Role("frame_cur");
         rPrev = pack->Role("frame_prev");
         rMv = pack->Role("motion");
@@ -789,8 +796,22 @@ private:
         {
             dpack = std::make_unique<D3DPack>(*pack, io.cu, nv);
             dpack->cubins = &cubins;
+            // a kernel not compiled yet (a variant a resize brings in) needs CUDA again for a moment, after the first build
+            // released it; the cache is keyed by the PTX content, so only the compile decides
+            dpack->needCuda = [&]() {
+                if (io.ctx)
+                    return true;
+                if (!io.Init(dev))
+                {
+                    XLog("interop (compiling a kernel): %s", io.error.c_str());
+                    return false;
+                }
+                tempCuda = true;
+                return true;
+            };
             dpack->packNatives = cfg.native;
             const bool built3d = dpack->Build(dev, setupQueue, false);
+            dpack->needCuda = nullptr;          // it refers to this call's locals
             if (tempCuda)
             {
                 io.cu.CtxPopCurrent(nullptr);         // Init left the context current on this thread
@@ -829,7 +850,8 @@ private:
     std::string packDir;
     Interop io;
     bool d3dPath = true;
-    GenSettings& cfg;                   // Prof= (or XEFG_CUDA_PROF), Native= in f5low.ini, shared with the host
+    bool d3dOnly = false;               // the pack is the one built from libxess_fg.dll: no PTX twins, D3D12 path only
+    GenSettings& cfg;                  // Prof= (or XEFG_CUDA_PROF), Native= in f5low.ini, shared with the host
     GenHost host;
     bool shutDone = false;
     NvApi nv;
