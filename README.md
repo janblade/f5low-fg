@@ -27,6 +27,16 @@ from one: extracted or translated shaders (DXBC, DXIL, PTX made from them), zstd
 buffers, disassembly, RVAs or byte patterns. Intel modules are referred to by SHA-256 only. The audit in
 `tools/` enforces this in CI.
 
+## Recipe (own generator's graph pack)
+
+`recipe/i0/` is our half of the own generator's pack: `manifest.tmpl` (the manifest, generated file names as
+`@name`) and `parts.json` (how each file is made; the nested `hdr/` pack alike). `tools/kernels/` holds our
+generators and HLSL templates. Intel modules appear only as SHA-256 of the decoded module, weights as upload
+ordinal + size + SHA-256. `tools/recipe/build_pack.py` recombines the recipe with the Intel parts of a local
+`libxess_fg.dll` and a weight capture (offline, for now); `compare_pack.py` checks a built pack against a reference;
+`classify.py` derives a recipe from a finished pack (dev tool, needs the old libxess-weights checkout). Built packs
+are Intel-derived and stay out of the repo.
+
 ## Licence
 
 GPL-3.0, the same as OptiScaler (see LICENSE). Vendor libraries are never part of this repo; they are loaded

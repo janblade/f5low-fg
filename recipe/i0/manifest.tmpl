@@ -1,0 +1,842 @@
+pack 3
+size 2560 1440 1505 847
+# i0 from XeFGPsoCap.runN.log (first app frame: 28 dispatches once, 16 per generated frame) + weights dump_runO, SDR derived from the HDR10 capture
+resource R0 tex {OW} {OH} 1 28 4 init data/R0.bin
+resource R1 tex {OW} {OH} 1 28 4 init data/R1.bin
+resource R2 tex {ceil(OW/8)} {ceil(OH/8)} 1 52 2
+resource R3 tex {align(ceil(OW/2),8)} {align(ceil(OH/2),8)} 1 52 2
+resource R4 tex {RW} {RH} 1 41 4 init data/R4.bin
+resource R5 tex {align(ceil(OW/2),8)} {align(ceil(OH/2),8)} 1 41 4
+resource R6 tex {align(ceil(OW/16),8)} {2*ceil(OH/32)+1} 16 17 8
+resource R7 raw 4608 init data/R7.bin
+resource R8 raw 512 init data/R8.bin
+resource R9 raw 512 init data/R9.bin
+resource R10 tex {align(ceil(OW/32),8)} {ceil(OH/32)+1} 28 17 8
+resource R11 raw 225792 init data/R11.bin
+resource R12 raw 896 init data/R12.bin
+resource R13 raw 896 init data/R13.bin
+resource R14 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R15 raw 451584 init data/R15.bin
+resource R16 raw 896 init data/R16.bin
+resource R17 raw 896 init data/R17.bin
+resource R18 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R19 raw 451584 init data/R19.bin
+resource R20 raw 896 init data/R20.bin
+resource R21 raw 896 init data/R21.bin
+resource R22 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R23 raw 451584 init data/R23.bin
+resource R24 raw 896 init data/R24.bin
+resource R25 raw 896 init data/R25.bin
+resource R26 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R27 raw 451584 init data/R27.bin
+resource R28 raw 896 init data/R28.bin
+resource R29 raw 896 init data/R29.bin
+resource R30 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R31 raw 451584 init data/R31.bin
+resource R32 raw 896 init data/R32.bin
+resource R33 raw 896 init data/R33.bin
+resource R34 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R35 raw 451584 init data/R35.bin
+resource R36 raw 896 init data/R36.bin
+resource R37 raw 896 init data/R37.bin
+resource R38 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R39 raw 451584 init data/R39.bin
+resource R40 raw 896 init data/R40.bin
+resource R41 raw 896 init data/R41.bin
+resource R42 tex {align(ceil(OW/32),16)} {ceil(OH/32)+1} 28 17 8
+resource R43 raw 451584 init data/R43.bin
+resource R44 raw 896 init data/R44.bin
+resource R45 raw 896 init data/R45.bin
+resource R46 raw {(1*(align(OW,256))*(ceil(OH/32)))*1/2}
+resource R47 raw 2688 init data/R47.bin
+resource R48 raw 48 init data/R48.bin
+resource R49 raw {(1*(align(OW,64))*(align(ceil(OH/4),2)))*1/2}
+resource R50 raw {(8*(align(OW,16))*(8*ceil(OH/16)+1))*1/2}
+resource R51 raw {2*(align(OW,16))*(8*ceil(OH/16)+1)}
+resource R52 tex {align(ceil(OW/4),8)} {4*ceil(OH/16)+1} 2 3 16
+resource R53 raw 2304 init data/R53.bin
+resource R54 raw 128 init data/R54.bin
+resource R55 raw 128 init data/R55.bin
+resource R56 tex {align(ceil(OW/8),8)} {2*ceil(OH/16)+1} 4 3 16
+resource R57 raw 18432 init data/R57.bin
+resource R58 raw 256 init data/R58.bin
+resource R59 raw 256 init data/R59.bin
+resource R60 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R61 raw 36864 init data/R61.bin
+resource R62 raw 256 init data/R62.bin
+resource R63 raw 256 init data/R63.bin
+resource R64 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R65 raw 36864 init data/R65.bin
+resource R66 raw 256 init data/R66.bin
+resource R67 raw 256 init data/R67.bin
+resource R68 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R69 raw 36864 init data/R69.bin
+resource R70 raw 256 init data/R70.bin
+resource R71 raw 256 init data/R71.bin
+resource R72 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R73 raw 36864 init data/R73.bin
+resource R74 raw 256 init data/R74.bin
+resource R75 raw 256 init data/R75.bin
+resource R76 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R77 raw 36864 init data/R77.bin
+resource R78 raw 256 init data/R78.bin
+resource R79 raw 256 init data/R79.bin
+resource R80 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R81 raw 36864 init data/R81.bin
+resource R82 raw 256 init data/R82.bin
+resource R83 raw 256 init data/R83.bin
+resource R84 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R85 raw 36864 init data/R85.bin
+resource R86 raw 256 init data/R86.bin
+resource R87 raw 256 init data/R87.bin
+resource R88 tex {align(ceil(OW/8),16)} {2*ceil(OH/16)+1} 4 3 16
+resource R89 raw 36864 init data/R89.bin
+resource R90 raw 256 init data/R90.bin
+resource R91 raw 256 init data/R91.bin
+resource R92 raw {1*(align(OW,64))*(align(ceil(OH/4),4))}
+resource R93 raw 768 init data/R93.bin
+resource R94 raw 48 init data/R94.bin
+resource R95 raw {2*(align(OW,16))*(align(OH,16))}
+resource R96 tex {RW} {RH} 1 34 4 init data/R96.bin
+resource R97 tex {RW} {RH} 1 41 4 init data/R97.bin
+resource R98 raw {8*(OW)*(OH)}
+resource R99 raw {32*align(ceil(OW/4),4)*align(ceil(OH/4),4)}
+resource R100 tex {256*ceil(OW/512)} {32*ceil(OH/64)} 1 3 16
+resource R101 tex {OW} {OH} 1 28 4
+resource R102 tex {OW} {OH} 1 28 4
+resource R103 tex {OW} {OH} 1 28 4
+resource R104 tex 2560 1440 1 28 4
+resource R105 raw 256
+resource R106 raw 1280 init data/R106.bin
+resource R107 raw 256 init data/R107.bin
+resource R108 raw 256 init data/R108.bin
+resource R109 tex 32 32 1 61 1 init data/R109.bin
+resource R110 tex {128*ceil(OW/512)} {16*ceil(OH/64)} 1 3 16
+resource R111 raw 2304 init data/R111.bin
+resource R112 raw 64 init data/R112.bin
+resource R113 raw 64 init data/R113.bin
+resource R114 tex {64*ceil(OW/512)} {8*ceil(OH/64)} 2 3 16
+resource R115 raw 4608 init data/R115.bin
+resource R116 raw 128 init data/R116.bin
+resource R117 raw 128 init data/R117.bin
+resource R118 tex {32*ceil(OW/512)} {4*ceil(OH/64)} 4 3 16
+resource R119 raw 18432 init data/R119.bin
+resource R120 raw 256 init data/R120.bin
+resource R121 raw 256 init data/R121.bin
+resource R122 tex {16*ceil(OW/512)} {2*ceil(OH/64)} 8 3 16
+resource R123 raw 73728 init data/R123.bin
+resource R124 raw 512 init data/R124.bin
+resource R125 raw 512 init data/R125.bin
+resource R126 tex {16*ceil(OW/512)} {2*ceil(OH/64)} 4 3 16
+resource R127 raw 73728 init data/R127.bin
+resource R128 raw 256 init data/R128.bin
+resource R129 raw 256 init data/R129.bin
+resource R130 tex {ceil(OW/16)} {ceil(OH/16)} 4 3 16
+resource R131 raw 36864 init data/R131.bin
+resource R132 raw 256 init data/R132.bin
+resource R133 raw 256 init data/R133.bin
+resource R134 tex {ceil(OW/16)} {ceil(OH/16)} 2 3 16
+resource R135 raw 18432 init data/R135.bin
+resource R136 raw 128 init data/R136.bin
+resource R137 raw 128 init data/R137.bin
+resource R138 tex {ceil(OW/8)} {ceil(OH/8)} 2 3 16
+resource R139 raw 9216 init data/R139.bin
+resource R140 raw 128 init data/R140.bin
+resource R141 raw 128 init data/R141.bin
+resource R142 tex {ceil(OW/8)} {ceil(OH/8)} 1 3 16
+resource R143 raw 4608 init data/R143.bin
+resource R144 raw 64 init data/R144.bin
+resource R145 raw 64 init data/R145.bin
+resource R146 tex {ceil(OW/4)} {ceil(OH/4)} 1 3 16
+resource R147 raw 2304 init data/R147.bin
+resource R148 raw 64 init data/R148.bin
+resource R149 raw 64 init data/R149.bin
+resource R150 tex {ceil(OW/4)} {ceil(OH/4)} 1 3 16
+resource R151 raw 2304 init data/R151.bin
+resource R152 raw 64 init data/R152.bin
+resource R153 raw 64 init data/R153.bin
+resource R154 tex {ceil(OW/2)} {ceil(OH/2)} 1 3 16
+resource R155 raw 2304 init data/R155.bin
+resource R156 raw 64 init data/R156.bin
+resource R157 raw 64 init data/R157.bin
+resource R158 raw 320 init data/R158.bin
+resource R159 raw 80 init data/R159.bin
+resource R160 raw 80 init data/R160.bin
+resource R161 tex {OW} {OH} 1 28 4
+role frame_prev R0
+role frame_cur R1
+role motion R96
+role depth R97
+role noise R109
+role output R161
+role depth_prev R4
+kernel 0 @k00_xa6aefb7a.ptx 8 8 1
+kernel 1 @k01_xfc68cb62.ptx 8 8 1
+kernel 2 @k02_x61e52c4b_c18.ptx 8 8 1
+kernel 3 @k03_x654e0607_c17.ptx 8 8 1
+kernel 4 @k04_famb_a224_17_sm80.ptx 8 8 1
+fallback 4 @k04_famb_a224_17_sm75.ptx 8 8 1
+kernel 5 @k05_famb_a224_19_sm80.ptx 8 8 1
+fallback 5 @k05_famb_a224_19_sm75.ptx 8 8 1
+kernel 6 @k06_famb_a224_20_sm80.ptx 8 8 1
+fallback 6 @k06_famb_a224_20_sm75.ptx 8 8 1
+kernel 7 @k07_head_2_18.ptx 8 8 1
+kernel 8 @k08_rs_0.ptx 8 8 1
+kernel 9 @k09_rs_1.ptx 8 8 1
+kernel 10 @k10_warp_1.ptx 8 8 1
+kernel 11 @k11_xc68b3843.ptx 8 8 1
+kernel 12 @k12_x338f1957.ptx 8 8 1
+kernel 13 @k13_famb_b64_18_sm80.ptx 8 8 1
+fallback 13 @k13_famb_b64_18_sm75.ptx 8 8 1
+kernel 14 @k14_famb_b64_19_sm80.ptx 8 8 1
+fallback 14 @k14_famb_b64_19_sm75.ptx 8 8 1
+kernel 15 @k15_head_4_17.ptx 8 8 1
+kernel 16 @k16_rs_2.ptx 8 8 1
+kernel 17 @k17_xaae5e2f6.ptx 8 8 1
+kernel 18 @k18_x9ef8c15d.ptx 8 8 1
+kernel 19 @k19_ra7fc1e46.ptx 8 16 1
+kernel 20 @k20_conv_enc16.ptx 256 1 1
+fallback 20 @k20_conv_enc16_sm75.ptx 256 1 1
+kernel 21 @k21_conv_enc32.ptx 128 1 1
+fallback 21 @k21_conv_enc32_sm75.ptx 128 1 1
+kernel 22 @k22_conv_enc64.ptx 128 1 1
+fallback 22 @k22_conv_enc64_sm75.ptx 128 1 1
+kernel 23 @k23_conv_enc128.ptx 256 1 1
+fallback 23 @k23_conv_enc128_sm75.ptx 256 1 1
+kernel 24 @k24_conv_c128.ptx 256 1 1
+fallback 24 @k24_conv_c128_sm75.ptx 256 1 1
+kernel 25 @k25_decoder_64.ptx 128 1 1
+fallback 25 @k25_decoder_64_sm75.ptx 128 1 1
+kernel 26 @k26_conv_c64.ptx 256 1 1
+fallback 26 @k26_conv_c64_sm75.ptx 256 1 1
+kernel 27 @k27_decoder_32.ptx 128 1 1
+fallback 27 @k27_decoder_32_sm75.ptx 128 1 1
+kernel 28 @k28_conv_c32.ptx 128 1 1
+fallback 28 @k28_conv_c32_sm75.ptx 128 1 1
+kernel 29 @k29_decoder_16.ptx 256 1 1
+fallback 29 @k29_decoder_16_sm75.ptx 256 1 1
+kernel 30 @k30_conv_c16.ptx 128 1 1
+fallback 30 @k30_conv_c16_sm75.ptx 128 1 1
+kernel 31 @k31_xcd506291.ptx 8 8 1
+variant 19 @v_r5a5a7b35.ptx 8 16 1 ndc=1 jit=0 hires=1
+variant 19 @v_reae043e6.ptx 8 16 1 ndc=0 jit=0 hires=1
+variant 19 @v_rdfa6feb3.ptx 8 16 1 ndc=0 jit=1 hires=1
+variant 19 @v_r8c7b249a.ptx 8 16 1 ndc=1 jit=1 hires=1
+variant 19 @v_rad6437f9.ptx 8 16 1 ndc=1 jit=1 hires=0 inv=0
+variant 19 @v_r15dcfb96.ptx 8 16 1 ndc=0 jit=1 hires=0 inv=1
+variant 19 @v_r30511d38.ptx 8 16 1 ndc=1 jit=0 hires=0 inv=0
+variant 19 @v_r13637bf9.ptx 8 16 1 ndc=0 jit=1 hires=0 inv=0
+variant 19 @v_r81316214.ptx 8 16 1 ndc=1 jit=0 hires=0 inv=1
+variant 19 @v_r6c30e9aa.ptx 8 16 1 ndc=1 jit=1 hires=0 inv=1
+variant 19 @v_r6e84300e.ptx 8 16 1 ndc=0 jit=0 hires=0 inv=0
+variant 17 @v_xc0481f4f.ptx 8 8 1 inv=0 ndc=0
+variant 17 @v_x4847df5d.ptx 8 8 1 inv=1 ndc=1
+variant 17 @v_x903ffa0d.ptx 8 8 1 inv=0 ndc=1
+variant 18 @v_xbca124cb.ptx 8 8 1 inv=0
+variant 31 @v_x0f8619d4.ptx 8 8 1 premul=0
+native @k19_ra7fc1e46.ptx @k19_ra7fc1e46.dxbc 32
+native @v_r5a5a7b35.ptx @v_r5a5a7b35.dxbc 32
+native @v_reae043e6.ptx @v_reae043e6.dxbc 32
+native @v_rdfa6feb3.ptx @v_rdfa6feb3.dxbc 32
+native @v_r8c7b249a.ptx @v_r8c7b249a.dxbc 32
+native @v_rad6437f9.ptx @v_rad6437f9.dxbc 32
+native @v_r15dcfb96.ptx @v_r15dcfb96.dxbc 32
+native @v_r30511d38.ptx @v_r30511d38.dxbc 32
+native @v_r13637bf9.ptx @v_r13637bf9.dxbc 32
+native @v_r81316214.ptx @v_r81316214.dxbc 32
+native @v_r6c30e9aa.ptx @v_r6c30e9aa.dxbc 32
+native @v_r6e84300e.ptx @v_r6e84300e.dxbc 32
+native @k17_xaae5e2f6.ptx @k17_xaae5e2f6.dxbc
+native @v_x4847df5d.ptx @v_x4847df5d.dxbc
+native @v_x903ffa0d.ptx @v_x903ffa0d.dxbc
+native @v_xc0481f4f.ptx @v_xc0481f4f.dxbc
+dispatch 0 {ceil(AW/32)} {ceil(AH/32)} 1   # 0 once
+  bind 0 R0 28
+  bind 1 R1 28
+  bind 32 R2 52
+  bind 33 R3 52
+  cb 0 data/rc00.bin
+  set 0 0 i {AX}
+  set 0 1 i {AY}
+  set 0 2 i {AW}
+  set 0 3 i {AH}
+  set 0 4 i {AX}
+  set 0 5 i {AY}
+  set 0 6 i {AW}
+  set 0 7 i {AH}
+  set 0 8 i {(align(AW,16)-AW)/2}
+  set 0 9 i {(align(AH,16)-AH)/2}
+dispatch 1 {ceil(AW/32)} {ceil(AH/32)} 1   # 1 once
+  bind 0 R4 41
+  bind 32 R5 41
+  cb 0 data/rc01.bin
+  set 0 2 i {RW}
+  set 0 3 i {RH}
+  set 0 4 i {align(ceil(AW/4),4)}
+  set 0 5 i {align(ceil(AH/4),4)}
+dispatch 2 {ceil(AW/256)} {ceil(AH/256)} 16   # 2 once
+  bind 0 R2 52
+  bind 32 R6 17
+  bind 1 R7 0
+  bind 2 R8 0
+  bind 3 R9 0
+  cb 0 data/rc02.bin
+  set 0 0 i {ceil(AW/16)}
+  set 0 1 i {ceil(AH/16)}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {align(ceil(AW/32),2)}
+  set 0 5 i {align(ceil(AH/32),2)}
+  set 0 6 i {ceil(AW/32)%2}
+  set 0 7 i {ceil(AH/32)%2}
+dispatch 3 {ceil(AW/512)} {ceil(AH/512)} 28   # 3 once
+  bind 0 R6 17
+  bind 32 R10 17
+  bind 1 R11 0
+  bind 2 R12 0
+  bind 3 R13 0
+  cb 0 data/rc03.bin
+  set 0 0 i {align(ceil(AW/32),8)}
+  set 0 1 i {2*ceil(AH/64)+1}
+  set 0 2 i {align(ceil(AW/32),2)}
+  set 0 3 i {align(ceil(AH/32),2)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 4 {ceil(AW/512)} {ceil(AH/512)} 28   # 4 once
+  bind 0 R10 17
+  bind 32 R14 17
+  bind 1 R15 0
+  bind 2 R16 0
+  bind 3 R17 0
+  cb 0 data/rc04.bin
+  set 0 0 i {align(ceil(AW/64),8)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 5 {ceil(AW/512)} {ceil(AH/512)} 28   # 5 once
+  bind 0 R14 17
+  bind 32 R18 17
+  bind 1 R19 0
+  bind 2 R20 0
+  bind 3 R21 0
+  cb 0 data/rc05.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 5 {ceil(AW/512)} {ceil(AH/512)} 28   # 6 once
+  bind 0 R18 17
+  bind 32 R22 17
+  bind 1 R23 0
+  bind 2 R24 0
+  bind 3 R25 0
+  cb 0 data/rc06.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 6 {ceil(AW/512)} {ceil(AH/512)} 28   # 7 once
+  bind 0 R22 17
+  bind 32 R26 17
+  bind 1 R27 0
+  bind 2 R28 0
+  bind 3 R29 0
+  cb 0 data/rc07.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 6 {ceil(AW/512)} {ceil(AH/512)} 28   # 8 once
+  bind 0 R26 17
+  bind 32 R30 17
+  bind 1 R31 0
+  bind 2 R32 0
+  bind 3 R33 0
+  cb 0 data/rc08.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 6 {ceil(AW/512)} {ceil(AH/512)} 28   # 9 once
+  bind 0 R30 17
+  bind 32 R34 17
+  bind 1 R35 0
+  bind 2 R36 0
+  bind 3 R37 0
+  cb 0 data/rc09.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 6 {ceil(AW/512)} {ceil(AH/512)} 28   # 10 once
+  bind 0 R34 17
+  bind 32 R38 17
+  bind 1 R39 0
+  bind 2 R40 0
+  bind 3 R41 0
+  cb 0 data/rc10.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 5 {ceil(AW/512)} {ceil(AH/512)} 28   # 11 once
+  bind 0 R38 17
+  bind 32 R42 17
+  bind 1 R43 0
+  bind 2 R44 0
+  bind 3 R45 0
+  cb 0 data/rc11.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {ceil(AW/64)}
+  set 0 3 i {ceil(AH/64)}
+  set 0 4 i {ceil(AW/64)}
+  set 0 5 i {ceil(AH/64)}
+dispatch 7 {ceil(AW/512)} {ceil(AH/512)} 1   # 12 once
+  bind 0 R42 17
+  bind 32 R46 39
+  bind 2 R47 0
+  bind 3 R48 0
+  cb 0 data/rc12.bin
+  set 0 0 i {align(ceil(AW/64),16)}
+  set 0 1 i {ceil(AH/64)+1}
+  set 0 2 i {align(ceil(AW/32),16)}
+  set 0 3 i {align(ceil(AH/32),2)}
+  set 0 4 i {align(ceil(AW/32),2)}
+  set 0 5 i {align(ceil(AH/32),2)}
+dispatch 8 {ceil(AW/128)} {ceil(AH/128)} 1   # 13 once
+  bind 0 R46 39
+  bind 32 R49 39
+  cb 0 data/rc13.bin
+  set 0 0 i {align(ceil(AW/32),16)}
+  set 0 1 i {align(ceil(AH/32),2)}
+  set 0 2 i {align(ceil(AW/32),2)}
+  set 0 3 i {align(ceil(AH/32),2)}
+  set 0 4 i {align(ceil(AW/16),8)}
+  set 0 5 i {ceil(AH/16)}
+  set 0 6 i {ceil(AW/16)}
+  set 0 7 i {ceil(AH/16)}
+  set 0 8 f {(align(floor(AW/2),32))/(align(AW,16))}
+  set 0 9 f {(align(floor(AH/2),32))/(align(AH,16))}
+  set 0 10 f {(align(AW,16))/(align(floor(AW/2),32))}
+  set 0 11 f {(align(AH,16))/(align(floor(AH/2),32))}
+  set 0 12 i {align(ceil(AW/32),16)}
+dispatch 9 {ceil(AW/32)} {ceil(AH/32)} 1   # 14 once
+  bind 0 R49 39
+  bind 32 R50 39
+  cb 0 data/rc14.bin
+  set 0 0 i {align(ceil(AW/16),8)}
+  set 0 1 i {ceil(AH/16)}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {align(ceil(AW/4),8)}
+  set 0 5 i {4*ceil(AH/16)+1}
+  set 0 6 i {align(ceil(AW/4),4)}
+  set 0 7 i {align(ceil(AH/4),4)}
+dispatch 10 {ceil(AW/32)} {ceil(AH/32)} 1   # 15 once
+  bind 0 R3 52
+  bind 1 R50 39
+  bind 32 R51 39
+  cb 0 data/rc15.bin
+  set 0 0 i {align(ceil(AW/4),4)}
+  set 0 1 i {align(ceil(AH/4),4)}
+  set 0 2 i {align(ceil(AW/4),8)}
+  set 0 3 i {4*ceil(AH/16)+1}
+dispatch 11 {ceil(AW/64)} {ceil(AH/64)} 2   # 16 once
+  bind 0 R50 39
+  bind 4 R51 39
+  bind 32 R52 3
+  bind 1 R53 0
+  bind 2 R54 0
+  bind 3 R55 0
+  cb 0 data/rc16.bin
+  set 0 0 i {align(ceil(AW/4),8)}
+  set 0 1 i {4*ceil(AH/16)+1}
+  set 0 2 i {align(ceil(AW/4),4)}
+  set 0 3 i {align(ceil(AH/4),4)}
+  set 0 4 i {align(ceil(AW/8),2)}
+  set 0 5 i {align(ceil(AH/8),2)}
+dispatch 12 {ceil(AW/128)} {ceil(AH/128)} 4   # 17 once
+  bind 0 R52 3
+  bind 32 R56 3
+  bind 1 R57 0
+  bind 2 R58 0
+  bind 3 R59 0
+  cb 0 data/rc17.bin
+  set 0 0 i {align(ceil(AW/8),8)}
+  set 0 1 i {2*ceil(AH/16)+1}
+  set 0 2 i {align(ceil(AW/8),2)}
+  set 0 3 i {align(ceil(AH/8),2)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 13 {ceil(AW/128)} {ceil(AH/128)} 4   # 18 once
+  bind 0 R56 3
+  bind 32 R60 3
+  bind 1 R61 0
+  bind 2 R62 0
+  bind 3 R63 0
+  cb 0 data/rc18.bin
+  set 0 0 i {align(ceil(AW/16),8)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 13 {ceil(AW/128)} {ceil(AH/128)} 4   # 19 once
+  bind 0 R60 3
+  bind 32 R64 3
+  bind 1 R65 0
+  bind 2 R66 0
+  bind 3 R67 0
+  cb 0 data/rc19.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 13 {ceil(AW/128)} {ceil(AH/128)} 4   # 20 once
+  bind 0 R64 3
+  bind 32 R68 3
+  bind 1 R69 0
+  bind 2 R70 0
+  bind 3 R71 0
+  cb 0 data/rc20.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 13 {ceil(AW/128)} {ceil(AH/128)} 4   # 21 once
+  bind 0 R68 3
+  bind 32 R72 3
+  bind 1 R73 0
+  bind 2 R74 0
+  bind 3 R75 0
+  cb 0 data/rc21.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 14 {ceil(AW/128)} {ceil(AH/128)} 4   # 22 once
+  bind 0 R72 3
+  bind 32 R76 3
+  bind 1 R77 0
+  bind 2 R78 0
+  bind 3 R79 0
+  cb 0 data/rc22.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 13 {ceil(AW/128)} {ceil(AH/128)} 4   # 23 once
+  bind 0 R76 3
+  bind 32 R80 3
+  bind 1 R81 0
+  bind 2 R82 0
+  bind 3 R83 0
+  cb 0 data/rc23.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 14 {ceil(AW/128)} {ceil(AH/128)} 4   # 24 once
+  bind 0 R80 3
+  bind 32 R84 3
+  bind 1 R85 0
+  bind 2 R86 0
+  bind 3 R87 0
+  cb 0 data/rc24.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 13 {ceil(AW/128)} {ceil(AH/128)} 4   # 25 once
+  bind 0 R84 3
+  bind 32 R88 3
+  bind 1 R89 0
+  bind 2 R90 0
+  bind 3 R91 0
+  cb 0 data/rc25.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {ceil(AW/16)}
+  set 0 3 i {ceil(AH/16)}
+  set 0 4 i {ceil(AW/16)}
+  set 0 5 i {ceil(AH/16)}
+dispatch 15 {ceil(AW/128)} {ceil(AH/128)} 1   # 26 once
+  bind 0 R88 3
+  bind 32 R92 39
+  bind 2 R93 0
+  bind 3 R94 0
+  cb 0 data/rc26.bin
+  set 0 0 i {align(ceil(AW/16),16)}
+  set 0 1 i {ceil(AH/16)+1}
+  set 0 2 i {align(ceil(AW/8),16)}
+  set 0 3 i {align(ceil(AH/8),2)}
+  set 0 4 i {align(ceil(AW/8),2)}
+  set 0 5 i {align(ceil(AH/8),2)}
+dispatch 16 {ceil(AW/32)} {ceil(AH/32)} 1   # 27 once
+  bind 0 R92 39
+  bind 1 R50 39
+  bind 32 R95 39
+  cb 0 data/rc27.bin
+  set 0 0 i {align(ceil(AW/8),16)}
+  set 0 1 i {align(ceil(AH/8),2)}
+  set 0 2 i {align(ceil(AW/8),2)}
+  set 0 3 i {align(ceil(AH/8),2)}
+  set 0 4 i {align(ceil(AW/4),8)}
+  set 0 5 i {align(ceil(AH/4),4)}
+  set 0 6 i {align(ceil(AW/4),4)}
+  set 0 7 i {align(ceil(AH/4),4)}
+  set 0 12 i {align(ceil(AW/4),8)}
+dispatch 17 {ceil(RW/8)} {2*ceil(RH/16)} 1   # 28 per-t
+  bind 0 R96 34
+  bind 1 R97 41
+  bind 32 R98 39
+  cb 0 data/rc28.bin
+  set 0 0 i {RW}
+  set 0 1 i {RH}
+  set 0 2 i {RW}
+  set 0 3 i {RH}
+  patch 0 4 mv_scale_x
+  patch 0 5 mv_scale_y
+  clear R98 0 {8*RW*RH}
+  clear R99 0
+dispatch 18 {ceil(AW/32)} {ceil(AH/32)} 1   # 29 per-t
+  bind 0 R5 41
+  bind 1 R95 39
+  bind 32 R99 39
+  cb 0 data/rc29.bin
+  set 0 0 i {align(ceil(AW/4),4)}
+  set 0 1 i {align(ceil(AH/4),4)}
+  set 0 4 i {align(ceil(AW/4),8)}
+  patch 0 2 splat_t
+  patch 0 3 splat_t
+dispatch 19 {ceil(OW/16)} {ceil(OH/32)} 1   # 30 per-t
+  bind 0 R95 39
+  bind 8 R98 39
+  bind 9 R99 39
+  bind 32 R100 3
+  bind 33 R101 28
+  bind 34 R102 28
+  bind 35 R103 28
+  bind 2 R0 28
+  bind 3 R1 28
+  bind 4 R96 34
+  bind 6 R97 41
+  cb 2 data/R106.bin
+  cb 3 data/R107.bin
+  cb 4 data/R108.bin
+  bind 7 R109 61
+  cb 6 data/rc30.bin
+  set 6 0 i {AX}
+  set 6 1 i {AY}
+  set 6 2 i {AW}
+  set 6 3 i {AH}
+  set 6 4 i {AX}
+  set 6 5 i {AY}
+  set 6 6 i {AW}
+  set 6 7 i {AH}
+  set 6 8 i {AW}
+  set 6 9 i {AH}
+  set 6 10 f {1/AW}
+  set 6 11 f {1/AH}
+  set 6 12 i {RW}
+  set 6 13 i {RH}
+  set 6 14 f {1/RW}
+  set 6 15 f {1/RH}
+  set 6 16 i {RW}
+  set 6 17 i {RH}
+  set 6 18 f {1/RW}
+  set 6 19 f {1/RH}
+  set 6 26 f {AW/RW}
+  set 6 27 f {AH/RH}
+  set 6 28 i {ceil(AW/2)}
+  set 6 29 i {ceil(AH/2)}
+  set 6 30 i {256*ceil(OW/512)+2}
+  set 6 31 i {32*ceil(OH/64)+2}
+  set 6 36 i {align(ceil(AW/4),4)}
+  set 6 37 i {align(ceil(AH/4),4)}
+  set 6 38 i {AW}
+  set 6 39 i {AH}
+  set 6 40 f {1/AW}
+  set 6 41 f {1/AH}
+  set 6 42 f {1/OW}
+  set 6 43 f {1/OH}
+  set 6 44 f {1/OW}
+  set 6 45 f {1/OH}
+  set 6 46 i {align(ceil(AW/4),8)}
+  patch 6 20 mv_scale_x
+  patch 6 21 mv_scale_y
+  patch 6 22 jitter_cur_x
+  patch 6 23 jitter_cur_y
+  patch 6 24 jitter_prev_x
+  patch 6 25 jitter_prev_y
+  patch 6 49 interp_t
+dispatch 20 {8*ceil(OW/512)} {ceil(OH/64)} 1   # 31 per-t
+  bind 0 R100 3
+  bind 32 R110 3
+  bind 1 R111 0
+  bind 2 R112 0
+  bind 3 R113 0
+  cb 0 data/rc31.bin
+  set 0 0 i {256*ceil(OW/512)}
+  set 0 1 i {32*ceil(OH/64)}
+dispatch 21 {16*ceil(OW/512)} {ceil(OH/128)} 1   # 32 per-t
+  bind 0 R110 3
+  bind 32 R114 3
+  bind 1 R115 0
+  bind 2 R116 0
+  bind 3 R117 0
+  cb 0 data/rc32.bin
+  set 0 0 i {128*ceil(OW/512)}
+  set 0 1 i {16*ceil(OH/64)}
+dispatch 22 {8*ceil(OW/512)} {ceil(OH/128)} 1   # 33 per-t
+  bind 0 R114 3
+  bind 32 R118 3
+  bind 1 R119 0
+  bind 2 R120 0
+  bind 3 R121 0
+  cb 0 data/rc33.bin
+  set 0 0 i {64*ceil(OW/512)}
+  set 0 1 i {8*ceil(OH/64)}
+dispatch 23 {2*ceil(OW/512)} {ceil(OH/128)} 1   # 34 per-t
+  bind 0 R118 3
+  bind 32 R122 3
+  bind 1 R123 0
+  bind 2 R124 0
+  bind 3 R125 0
+  cb 0 data/rc34.bin
+  set 0 0 i {32*ceil(OW/512)}
+  set 0 1 i {4*ceil(OH/64)}
+dispatch 24 {ceil(OW/512)} {ceil(OH/512)} 1   # 35 per-t
+  bind 0 R122 3
+  bind 32 R126 3
+  bind 1 R127 0
+  bind 2 R128 0
+  bind 3 R129 0
+  cb 0 data/rc35.bin
+  set 0 0 i {16*ceil(OW/512)}
+  set 0 1 i {2*ceil(OH/64)}
+dispatch 25 {ceil(OW/128)} {ceil(OH/256)} 1   # 36 per-t
+  bind 0 R126 3
+  bind 4 R118 3
+  bind 32 R130 3
+  bind 1 R131 0
+  bind 2 R132 0
+  bind 3 R133 0
+  cb 0 data/rc36.bin
+  set 0 0 i {ceil(OW/16)}
+  set 0 1 i {ceil(OH/16)}
+dispatch 26 {ceil(OW/256)} {ceil(OH/128)} 1   # 37 per-t
+  bind 0 R130 3
+  bind 32 R134 3
+  bind 1 R135 0
+  bind 2 R136 0
+  bind 3 R137 0
+  cb 0 data/rc37.bin
+  set 0 0 i {ceil(OW/16)}
+  set 0 1 i {ceil(OH/16)}
+dispatch 27 {ceil(OW/256)} {ceil(OH/64)} 1   # 38 per-t
+  bind 0 R134 3
+  bind 4 R114 3
+  bind 32 R138 3
+  bind 1 R139 0
+  bind 2 R140 0
+  bind 3 R141 0
+  cb 0 data/rc38.bin
+  set 0 0 i {ceil(OW/8)}
+  set 0 1 i {ceil(OH/8)}
+dispatch 28 {ceil(OW/64)} {ceil(OH/64)} 1   # 39 per-t
+  bind 0 R138 3
+  bind 32 R142 3
+  bind 1 R143 0
+  bind 2 R144 0
+  bind 3 R145 0
+  cb 0 data/rc39.bin
+  set 0 0 i {ceil(OW/8)}
+  set 0 1 i {ceil(OH/8)}
+dispatch 29 {ceil(OW/64)} {ceil(OH/128)} 1   # 40 per-t
+  bind 0 R142 3
+  bind 4 R110 3
+  bind 32 R146 3
+  bind 1 R147 0
+  bind 2 R148 0
+  bind 3 R149 0
+  cb 0 data/rc40.bin
+  set 0 0 i {ceil(OW/4)}
+  set 0 1 i {ceil(OH/4)}
+dispatch 30 {ceil(OW/32)} {ceil(OH/32)} 1   # 41 per-t
+  bind 0 R146 3
+  bind 32 R150 3
+  bind 1 R151 0
+  bind 2 R152 0
+  bind 3 R153 0
+  cb 0 data/rc41.bin
+  set 0 0 i {ceil(OW/4)}
+  set 0 1 i {ceil(OH/4)}
+dispatch 29 {ceil(OW/32)} {ceil(OH/64)} 1   # 42 per-t
+  bind 0 R150 3
+  bind 4 R100 3
+  bind 32 R154 3
+  bind 1 R155 0
+  bind 2 R156 0
+  bind 3 R157 0
+  cb 0 data/rc42.bin
+  set 0 0 i {ceil(OW/2)}
+  set 0 1 i {ceil(OH/2)}
+dispatch 31 {ceil(AW/8)} {ceil(AH/8)} 1   # 43 per-t
+  bind 0 R154 3
+  bind 1 R101 28
+  bind 2 R102 28
+  bind 3 R103 28
+  bind 5 R158 0
+  bind 6 R159 0
+  bind 7 R160 0
+  bind 32 R161 28
+  bind 8 R0 28 R1
+  bind 9 R0 28 R1
+  bind 10 R0 28 R1
+  bind 11 R0 28
+  bind 12 R1 28
+  cb 0 data/rc43.bin
+  set 0 0 i {AX}
+  set 0 1 i {AY}
+  set 0 2 i {AX}
+  set 0 3 i {AY}
+  set 0 4 i {AX}
+  set 0 5 i {AY}
+  set 0 6 i {AX}
+  set 0 7 i {AY}
+  set 0 8 i {AX}
+  set 0 9 i {AY}
+  set 0 10 i {ceil(OW/2)}
+  set 0 11 i {ceil(OH/2)}
+  set 0 12 i {AW}
+  set 0 13 i {AH}
+  set 0 17 i {ceil(OW/2)}
+  patch 0 16 pass_index
