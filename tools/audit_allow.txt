@@ -1,1 +1,4 @@
 # <path>:<check>  <reason>   (findings the no-vendor-content rule allows anyway; keep this list short)
+scripts/build.ps1:modid      VERSIONINFO language/codepage block id, not a module name
+src/xefg_pack.h:ptx          our own utility kernel (swaprb: R/B swap), written by hand
+src/xefg_pack_d3d.h:ptx      our own utility kernel (fill), written by hand
