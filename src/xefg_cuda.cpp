@@ -205,6 +205,26 @@ void Log(const char* fmt, ...)
 std::map<xefg_swapchain_handle_t, std::shared_ptr<xefgown::Own>> g_own;
 std::mutex g_ownLock;
 
+// What f5lowGetStatus() reports (the most recent context's decision): 0 not decided, 1 own generator, 2 forwarding to
+// Intel's libxess_fg, 3 unavailable. Own lock: callable from any thread, also before any context.
+int g_statusState = 0;
+std::string g_statusReason;
+std::string g_builtFailReason;      // why RunBuiltPack made no pack (under g_statusLock)
+std::mutex g_statusLock;
+
+void SetStatus(int state, const std::string& reason)
+{
+    std::lock_guard<std::mutex> lk(g_statusLock);
+    g_statusState = state;
+    g_statusReason = reason;
+}
+
+void SetBuiltFail(const std::string& reason)
+{
+    std::lock_guard<std::mutex> lk(g_statusLock);
+    g_builtFailReason = reason;
+}
+
 // The pack built into this DLL (build.ps1 -EmbedPack): resource 101 (RCDATA), compressed with the Compression API
 // (LZMS), layout as tools/xefg_dll/pack_embed.py writes it. Unpacked once into xefgpack::EmbeddedFiles().
 bool LoadEmbeddedPack()
@@ -303,6 +323,7 @@ void RunBuiltPack()
         if (!bytes || !packbuild::ParseBundle(bytes, bytesSize, bundle, &err))
         {
             Log("own generator unavailable: no pack found and this DLL carries no recipe (%s)", err.empty() ? "no resource" : err.c_str());
+            SetBuiltFail("own generator unavailable: no pack found and this DLL carries no recipe (" + (err.empty() ? std::string("no resource") : err) + ")");
             return;
         }
         const std::wstring dir(g_dir);
@@ -351,6 +372,7 @@ void RunBuiltPack()
         if (o == packbuild::Outcome::Failed)
         {
             Log("own generator unavailable: %s", err.c_str());      // the one line: what is missing
+            SetBuiltFail("own generator unavailable: " + err);
             return;
         }
         for (const std::string& l : lines)
@@ -830,6 +852,25 @@ __declspec(dllexport) uint32_t xefgCudaXellCountsRenderedOnly()
     return 0u;
 }
 
+// Not Intel's API: for OptiScaler. What f5low decided for the most recent context: 0 not decided yet, 1 own generator,
+// 2 forwarding to Intel's libxess_fg, 3 unavailable. `reason` (if non-null and reasonSize > 0) gets a NUL-terminated
+// one-line UTF-8 text, cut to fit. Thread-safe, callable at any time.
+extern "C" __declspec(dllexport) int __cdecl f5lowGetStatus(char* reason, int reasonSize)
+{
+    std::lock_guard<std::mutex> lk(g_statusLock);
+    if (reason && reasonSize > 0)
+    {
+        std::string t = g_statusState == 0 ? "not decided yet (no context created)" : g_statusReason;
+        size_t n = std::min(t.size(), static_cast<size_t>(reasonSize - 1));
+        // do not cut a UTF-8 sequence in the middle
+        while (n > 0 && n < t.size() && (static_cast<unsigned char>(t[n]) & 0xC0) == 0x80)
+            --n;
+        memcpy(reason, t.data(), n);
+        reason[n] = 0;
+    }
+    return g_statusState;
+}
+
 xefg_swapchain_result_t xefgSwapChainSetLatencyReduction(xefg_swapchain_handle_t h, void* xell)
 {
     SlowApi slow("xefgSwapChainSetLatencyReduction");
@@ -925,6 +966,21 @@ xefg_swapchain_result_t xefgSwapChainEnableDebugFeature(xefg_swapchain_handle_t 
 xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_swapchain_handle_t* ph)
 {
     std::string pack = PackDir();
+    std::string fwdReason;      // why this context forwards (f5lowGetStatus)
+    {
+        char fenv[8];
+        if (pack.empty())
+        {
+            if (GetEnvironmentVariableA("XEFG_CUDA_FORWARD", fenv, sizeof(fenv)))
+                fwdReason = "forwarding to Intel XeFG: XEFG_CUDA_FORWARD is set";
+            else
+            {
+                std::lock_guard<std::mutex> lk(g_statusLock);
+                fwdReason = g_builtFailReason.empty() ? "own generator unavailable: no pack" : g_builtFailReason;
+                fwdReason += " - forwarding to Intel XeFG";
+            }
+        }
+    }
     int need = 0, have = 0;
     if (!pack.empty() && d && ph)
     {
@@ -946,6 +1002,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             Log("D3D12CreateContext: %s - forwarding to libxess_fg.dll", !have ? "no CUDA device behind this adapter"
                 : need == xefgpack::Pack::kNoSm ? "the pack does not load"
                 : ("this GPU is sm_" + std::to_string(have) + ", the pack's kernels need sm_" + std::to_string(need)).c_str());
+            fwdReason = std::string("forwarding to Intel XeFG: ") +
+                        (!have ? "no CUDA device behind this adapter"
+                         : need == xefgpack::Pack::kNoSm ? "the pack does not load"
+                         : "this GPU is sm_" + std::to_string(have) + ", the pack's kernels need sm_" + std::to_string(need));
             pack.clear();
         }
     }
@@ -955,7 +1015,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         xefgown::g_repairBuiltPack = &RepairBuiltPack;
         auto o = xefgown::Own::Create(d, pack, path, GeneratorSetting());
         if (!o)
+        {
+            SetStatus(3, "own generator unavailable: the context could not be created");
             return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
+        }
         o->genMode = GenQueueSetting();
         o->genPriority = GenPrioritySetting();
         o->genSpread = GenSpreadSetting();
@@ -982,14 +1045,30 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         // Native= (XEFG_CUDA_NATIVE): 0 runs the pack's native modules (the reconstruction) as PTX on D3D12 too.
         o->gs.native = Setting("XEFG_CUDA_NATIVE", "Native", "1") != "0";
         *ph = reinterpret_cast<xefg_swapchain_handle_t>(o.get());
-        std::lock_guard<std::mutex> lk(g_ownLock);
-        g_own[*ph] = o;
+        {
+            std::lock_guard<std::mutex> lk(g_ownLock);
+            g_own[*ph] = o;
+        }
+        {
+            bool cached;
+            {
+                std::lock_guard<std::mutex> bl(g_builtLock);
+                cached = g_builtFromCache;
+            }
+            const char* src = pack == xefgpack::kEmbeddedDir ? "embedded pack" : g_builtDir == pack ? (cached ? "pack built on this PC, cache hit" : "pack built on this PC") : "pack folder";
+            SetStatus(1, std::string("own generator (") + src + "), D3D12");
+        }
         Log("D3D12CreateContext device=%p -> own h=%p, pack %s (needs sm_%d, GPU sm_%d), path %s, early %d, pacer %s%s (CUDA path), max lag "
             "%.2f, max delay %.2f app frames",
             static_cast<void*>(d), static_cast<void*>(*ph), pack.c_str(), need, have, path.c_str(), o->noEarly ? 0 : 1,
             o->clockPacer ? "clock" : "schedule", o->gate ? " + gate" : "", o->maxLag, o->maxDelay);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
+    if (!Real("xefgSwapChainD3D12CreateContext"))
+        SetStatus(3, fwdReason.empty() ? "libxess_fg.dll not found, nothing to forward to"
+                                       : fwdReason + "; libxess_fg.dll not found");
+    else if (d && ph)
+        SetStatus(2, fwdReason.empty() ? "forwarding to Intel XeFG" : fwdReason);
     FORWARD(xefgSwapChainD3D12CreateContext, d, ph);
     Log("D3D12CreateContext device=%p -> %d h=%p", static_cast<void*>(d), r, ph ? static_cast<void*>(*ph) : nullptr);
     return r;

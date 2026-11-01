@@ -130,3 +130,14 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 - Vulkan: the host is D3D12 (D3D11 and Vulkan games reach it through OptiScaler's bridges).
 - Upscaling: generators never upscale; OptiScaler does that before the frame reaches the host.
+
+## Exports that are not Intel's API
+
+- `int __cdecl f5lowGetStatus(char* reason, int reasonSize)` - what the host decided for the most recent context
+  (`xefgSwapChainD3D12CreateContext`). Returns `0` not decided yet (no context created), `1` the own generator runs,
+  `2` handed over to Intel's `libxess_fg` (forwarding), `3` unavailable (own generator failed and no `libxess_fg.dll`
+  to forward to). `reason` (may be null; used when `reasonSize > 0`) receives a NUL-terminated one-line UTF-8 text, cut to
+  fit, for example `own generator (pack built on this PC, cache hit), D3D12` or
+  `own generator unavailable: <what is missing> - forwarding to Intel XeFG`. Thread-safe, callable before any context;
+  the state stays after the last context is destroyed.
+- `uint32_t xefgCudaXellCountsRenderedOnly()` - XeLL cap accounting (see `src/xefg_cuda.cpp`).

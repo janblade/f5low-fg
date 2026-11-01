@@ -296,8 +296,25 @@ int main(int argc, char** argv)
     g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
     g_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
+    // f5lowGetStatus (docs/GENERATORS.md, "Exports"): 0 before any context, 1 own generator, 2 forwarding to Intel's library
+    auto getStatus = reinterpret_cast<int(__cdecl*)(char*, int)>(GetProcAddress(dll, "f5lowGetStatus"));
+    auto printStatus = [&](const char* when) {
+        char reason[256] = {};
+        const int st = getStatus ? getStatus(reason, static_cast<int>(sizeof(reason))) : -1;
+        printf("f5lowGetStatus %s: %d \"%s\"\n", when, st, reason);
+        return st;
+    };
+    const int stBefore = printStatus("before CreateContext");
     xefg_swapchain_handle_t h = nullptr;
     printf("CreateContext: %d\n", xefgSwapChainD3D12CreateContext(g_dev, &h));
+    const int stAfter = printStatus("after CreateContext");
+    if (stBefore != 0 || stAfter < 1 || stAfter > 3)
+    {
+        printf("f5lowGetStatus check FAILED\n");
+        return 1;
+    }
+    if (EnvInt("REPRO_STATUS_ONLY", 0) == 1)
+        return 0;
     if (!h)
         return 1;
     xefgSwapChainSetLoggingCallback(h, XEFG_SWAPCHAIN_LOGGING_LEVEL_WARNING, XefgLog, nullptr);

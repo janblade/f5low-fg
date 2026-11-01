@@ -44,5 +44,13 @@ are Intel-derived and stay out of the repo.
 
 ## Licence
 
-GPL-3.0, the same as OptiScaler (see LICENSE). Vendor libraries are never part of this repo; they are loaded
-at runtime from the player's PC.
+GPL-3.0, the same as OptiScaler (see LICENSE), with an additional permission under section 7
+(LICENSE-EXCEPTION.md): f5low may be combined and conveyed with Intel's XeSS libraries (`libxess_fg.dll`,
+`libxell.dll`, `libxess.dll`) and NVIDIA / AMD vendor runtime libraries without those libraries falling under the GPL.
+Vendor libraries are never part of this repo; they are loaded at runtime from the player's PC and keep their own
+licences. `tools/make_kit.ps1` builds the release kit (f5low.dll + Intel's `libxess_fg.dll` + both licences).
+
+## Exports
+
+Besides Intel's `xefgSwapChain*` API: `f5lowGetStatus` (which generator runs and why) and
+`xefgCudaXellCountsRenderedOnly`; see docs/GENERATORS.md.
