@@ -42,7 +42,8 @@ f5low $version
 
 f5low.dll is the frame generation host behind OptiScaler-NR's F5Low FG output (our own pacer, gate and presenter, with
 our own XeFG-compatible generator for NVIDIA GPUs). On the first run it builds its working data from libxess_fg.dll
-on your PC (about 2 seconds, cached in an f5low_cache folder), then runs on its own.
+on your PC (about half a second, once; cached in plugins\f5low_cache, or in %LOCALAPPDATA%\f5low\f5low_cache when the
+plugins folder is not writable), then runs on its own.
 
 Source: https://github.com/janblade/f5low-fg  (commit $commit)
 Licence: GPL-3.0 with a linking exception, see LICENSE. libxess_fg.dll is Intel's, unchanged and signed by Intel
@@ -53,6 +54,7 @@ Files
   libxess_fg.dll   Intel XeSS frame generation 1.3.4.95 (SHA-256 $intelSha256)
   LICENSE          GPL-3.0 + additional permission (section 7)
   XeSS_LICENSE.txt Intel's licence for libxess_fg.dll
+  kit_hashes.txt   SHA-256 of every file above (OptiScaler's package_release.ps1 checks them)
 
 How OptiScaler uses it
   f5low.dll       -> <game>\OptiScaler\plugins\f5low.dll
@@ -61,6 +63,10 @@ How OptiScaler uses it
   vendor's GPU, a libxess_fg.dll build it does not know) it hands the frames to Intel's library instead.
 "@
 [IO.File]::WriteAllText((Join-Path $stage 'README-KIT.txt'), ($readme -replace "`r?`n", $nl), (New-Object Text.UTF8Encoding($false)))
+# kit_hashes.txt: "<sha256>  <file>" per file, lower case (package_release.ps1 checks f5low.dll and libxess_fg.dll by it)
+$lines = Get-ChildItem $stage -File | Sort-Object Name |
+    ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
+Set-Content -Path (Join-Path $stage 'kit_hashes.txt') -Value $lines -Encoding ascii
 
 $zip = Join-Path $Out "f5low-kit-$version.zip"
 Remove-Item $zip, "$zip.sha256" -ErrorAction SilentlyContinue
