@@ -322,8 +322,9 @@ int main(int argc, char** argv)
     QueryPerformanceCounter(&qb);
     printf("CreateContext: %d (took %.1f ms on this thread)\n", createRc, 1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart));
     const int stAfter = printStatus("after CreateContext");
-    // 0 is right while the DLL builds its frame generator in the background; 1 .. 3 the decision (own, forwarding, unavailable)
-    if (stBefore != 0 || stAfter < 0 || stAfter > 3)
+    // 0 is right while the DLL builds its frame generator in the background; 1 .. 3 the decision (own, forwarding, unavailable).
+    // An older f5low.dll (e.g. a baseline to compare pictures with) has no f5lowGetStatus: nothing to check then.
+    if (getStatus && (stBefore != 0 || stAfter < 0 || stAfter > 3))
     {
         printf("f5lowGetStatus check FAILED\n");
         return 1;
