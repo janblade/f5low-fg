@@ -14,10 +14,13 @@ $Dll = (Resolve-Path $Dll).Path
 New-Item -ItemType Directory -Force $Out | Out-Null
 $Out = (Resolve-Path $Out).Path
 $log = Join-Path (Split-Path -Parent $Dll) 'f5low.log'
+# a DLL folder that cannot be written logs to %LOCALAPPDATA%\f5low\f5low.log (the run's LOCALAPPDATA, which a test may set)
+$fbLog = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'f5low\f5low.log' } else { '' }
 $lines = @()
 foreach ($p in $Paths) {
     Get-ChildItem $Out -Filter "$p.k*.bin" -ErrorAction SilentlyContinue | Remove-Item
     Remove-Item $log -ErrorAction SilentlyContinue
+    if ($fbLog) { Remove-Item $fbLog -ErrorAction SilentlyContinue }
     $env:XEFG_CUDA_PATH = $p
     $env:XEFG_CUDA_LOG = '1'
     $env:XEFG_CUDA_PROF = '2'
@@ -29,6 +32,7 @@ foreach ($p in $Paths) {
     & $exe $Dll | Out-Null
     $code = $LASTEXITCODE
     if (Test-Path $log) { Copy-Item $log (Join-Path $Out "$p.log") -Force }
+    elseif ($fbLog -and (Test-Path $fbLog)) { Copy-Item $fbLog (Join-Path $Out "$p.log") -Force }
     $dumps = Get-ChildItem $Out -Filter "$p.k*.bin" | Sort-Object Name
     if ($code -ne 0 -or -not $dumps) { $lines += "$p FAILED (exit $code, $($dumps.Count) dumps)"; continue }
     # A d3d12 run that fell back to the CUDA path presents the same pictures, so the hashes alone would pass it.

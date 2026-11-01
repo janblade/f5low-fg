@@ -502,10 +502,22 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
         // builds a pack builds the same one
         const std::string key = Sha256Hex(keyText.data(), keyText.size()).substr(0, 32);
         // every path below is in the extended form (long_path.h): a deep install folder passes MAX_PATH
-        const fs::path root(longpath::Extend(req.cacheRoot)), final_ = root / key;
+        fs::path root(longpath::Extend(req.cacheRoot));
+        fs::path final_ = root / key;
+        const fs::path fbRoot(req.fallbackRoot.empty() ? std::wstring() : longpath::Extend(req.fallbackRoot));
         if (CacheComplete(final_)) {
             dir = longpath::Plain(final_.wstring());
             log("pack cache hit " + key + " (libxess_fg " + intelSha.substr(0, 12) + ")");
+            PruneCache(root);
+            return Outcome::Cached;
+        }
+        // a pack an earlier run had to build in the fallback folder (the DLL's folder is not writable)
+        if (!fbRoot.empty() && CacheComplete(fbRoot / key)) {
+            root = fbRoot;
+            final_ = root / key;
+            dir = longpath::Plain(final_.wstring());
+            log("pack cache hit " + key + " in " + Narrow(longpath::Plain(root.wstring())) + " (libxess_fg " +
+                intelSha.substr(0, 12) + ")");
             PruneCache(root);
             return Outcome::Cached;
         }
@@ -515,9 +527,23 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
         }
         std::error_code ec;
         RemoveStaleTemps(root, ProcessStart());
-        const fs::path tmp = root / (key + ".tmp" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64()));
+        const auto tempName = [&] {
+            return key + ".tmp" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64());
+        };
+        fs::path tmp = root / tempName();
         fs::remove_all(tmp, ec);
         fs::create_directories(tmp, ec);
+        if (ec && !fbRoot.empty()) {
+            // not writable (Program Files, a Game Pass WindowsApps install, ...): the per-user folder takes the cache
+            log("cache folder " + Narrow(longpath::Plain(root.wstring())) + " is not writable (" + ec.message() +
+                "): using " + Narrow(longpath::Plain(fbRoot.wstring())));
+            root = fbRoot;
+            final_ = root / key;
+            RemoveStaleTemps(root, ProcessStart());
+            tmp = root / tempName();
+            fs::remove_all(tmp, ec);
+            fs::create_directories(tmp, ec);
+        }
         if (ec) {
             error = "cannot create the cache folder " + Narrow(longpath::Plain(tmp.wstring())) + " (" + ec.message() + ")";
             return Outcome::Failed;

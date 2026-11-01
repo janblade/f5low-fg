@@ -35,7 +35,11 @@ PC runs on the D3D12 path only.
 4. **Build and cache** (`src/pack_build.cpp`). `BuildPack` writes the pack folder: our kernels, the native containers,
    the weights and root constants (checked against the recipe), the manifest, plus a marker file `d3d12_only`.
    It equals `tools/recipe/build_pack.py`'s neutral-name output minus the PTX twins and plus the marker
-   (`tools/recipe/compare_pack.py --packless`). `EnsurePack` keeps it in `<DLL dir>\f5low_cache\<key>\`. The key is the
+   (`tools/recipe/compare_pack.py --packless`). `EnsurePack` keeps it in `<DLL dir>\f5low_cache\<key>\`; when that folder cannot be written (Game Pass /
+   WindowsApps install, Program Files without user rights; detected by failing to create the temporary build folder) it
+   uses `%LOCALAPPDATA%\f5low\f5low_cache\<key>\` instead (a hit is looked for in both; the log says which folder and
+   why; one shared folder is safe for several games because the key includes the libxess_fg hash). `f5low.log` falls
+   back to `%LOCALAPPDATA%\f5low\f5low.log` the same way. The key is the
    SHA-256 of (libxess_fg file, the embedded recipe + our kernels, `kFormat` = the version of the builder's pack layout;
    not the data source, every blob is checked against the recipe's SHA-256 so any source builds the same pack).
    **`kFormatVersion` (pack_build.cpp) must be raised on ANY change to the builder, `ResolveManifest`, the pack layout or the

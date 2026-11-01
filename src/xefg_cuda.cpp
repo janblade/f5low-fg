@@ -44,6 +44,20 @@ constexpr long kMaxLines = 400000;
 std::wstring g_dir;   // this DLL's folder, any length (set in DllMain, which does no file I/O)
 std::wstring g_self;  // this DLL's full path
 
+// %LOCALAPPDATA%\f5low: where f5low writes when its own folder cannot be written (a Game Pass / WindowsApps install, a
+// Program Files folder without user rights). Empty when LOCALAPPDATA is not set. The folder is not created here.
+std::wstring FallbackDir()
+{
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (n < 2)
+        return {};
+    std::wstring base(n, L'\0');
+    base.resize(GetEnvironmentVariableW(L"LOCALAPPDATA", base.data(), n));
+    if (base.empty())
+        return {};
+    return base + L"\\f5low";
+}
+
 // A setting from f5low.ini ([f5low]) next to this DLL. Without one, xefg_cuda.ini ([xefg_cuda]) from before the DLL
 // was renamed to f5low.dll, so an install keeps its settings.
 std::wstring IniString(const wchar_t* key, const wchar_t* def)
@@ -76,6 +90,18 @@ bool OpenLog()
     if (!(v[0] == L'1' || _wcsicmp(v, L"true") == 0 || _wcsicmp(v, L"on") == 0))
         return false;
     _wfopen_s(&g_log, longpath::ExtendIfLong(g_dir + L"\\f5low.log").c_str(), L"w");
+    if (!g_log)
+    {
+        // the DLL's folder is not writable: %LOCALAPPDATA%\f5low\f5low.log instead
+        const std::wstring fb = FallbackDir();
+        if (!fb.empty())
+        {
+            CreateDirectoryW(longpath::ExtendIfLong(fb).c_str(), nullptr);
+            _wfopen_s(&g_log, longpath::ExtendIfLong(fb + L"\\f5low.log").c_str(), L"w");
+            if (g_log)
+                fprintf(g_log, "f5low: %ls is not writable: this log is %ls\\f5low.log\n", g_dir.c_str(), fb.c_str());
+        }
+    }
     if (g_log)
         setvbuf(g_log, nullptr, _IONBF, 0);  // written in batches anyway; nothing left for the CRT to flush at exit
     if (g_log)
@@ -284,6 +310,9 @@ void RunBuiltPack()
         packbuild::Request req;
         req.libxessPath = RealLibraryPath(&from);
         req.cacheRoot = dir + L"\\f5low_cache";
+        // not writable: %LOCALAPPDATA%\f5low\f5low_cache (the folder name stays: DiscardPack checks it)
+        if (const std::wstring fb = FallbackDir(); !fb.empty())
+            req.fallbackRoot = fb + L"\\f5low_cache";
         req.own = &bundle;
         req.bundleBytes = bytes;
         req.bundleSize = bytesSize;

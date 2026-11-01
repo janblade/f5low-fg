@@ -92,6 +92,7 @@ bool BuildPack(const std::wstring& libxessPath, const Bundle& own, IntelDataSour
 struct Request {
     std::wstring libxessPath;
     std::wstring cacheRoot;                 // <DLL dir>\f5low_cache
+    std::wstring fallbackRoot;              // optional: used when cacheRoot cannot be written (%LOCALAPPDATA%\f5low\f5low_cache)
     const Bundle* own = nullptr;
     const uint8_t* bundleBytes = nullptr;   // the embedded bundle as it is (cache key)
     size_t bundleSize = 0;
