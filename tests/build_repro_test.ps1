@@ -13,7 +13,7 @@ $vcvars = Join-Path $VsPath 'VC\Auxiliary\Build\vcvars64.bat'
 $cmd = @"
 @echo off
 cd /d "$out"
-set "PATH=C:Program Files (x86)Microsoft Visual StudioInstaller;%PATH%"
+set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%"
 call "$vcvars" >nul
 cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$inc" "$root\tests\repro_test.cpp" /link /OUT:repro_test.exe d3d12.lib dxgi.lib user32.lib > _build_repro.log 2>&1
 "@
