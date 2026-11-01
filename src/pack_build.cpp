@@ -16,6 +16,7 @@
 
 #include "dxc_disasm.h"
 #include "intel_modules.h"
+#include "recipe_json.h"
 #include "translate.h"
 
 namespace fs = std::filesystem;
@@ -58,133 +59,7 @@ std::string Narrow(const std::wstring& w) {
     return s;
 }
 
-// ---- JSON (parts.json: objects, arrays, strings, integers) ---------------------------------------------------------
-struct Json {
-    enum Type { Null, Num, Str, Arr, Obj } type = Null;
-    long long num = 0;
-    std::string str;
-    std::vector<Json> arr;
-    std::vector<std::pair<std::string, Json>> obj;  // in file order
-
-    const Json* Get(const char* key) const {
-        for (const auto& kv : obj)
-            if (kv.first == key) return &kv.second;
-        return nullptr;
-    }
-    std::string Str_(const char* key) const {
-        const Json* j = Get(key);
-        return j && j->type == Str ? j->str : std::string();
-    }
-    long long Num_(const char* key, long long def = 0) const {
-        const Json* j = Get(key);
-        return j && j->type == Num ? j->num : def;
-    }
-};
-
-class JsonParser {
-public:
-    JsonParser(const char* p, size_t n) : p_(p), e_(p + n) {}
-    bool Parse(Json& out) { return Value(out, 0) && (Ws(), p_ == e_); }
-
-private:
-    void Ws() {
-        while (p_ < e_ && (*p_ == ' ' || *p_ == '\t' || *p_ == '\n' || *p_ == '\r')) ++p_;
-    }
-    bool String(std::string& s) {
-        if (p_ >= e_ || *p_ != '"') return false;
-        ++p_;
-        while (p_ < e_ && *p_ != '"') {
-            char c = *p_++;
-            if (c == '\\') {
-                if (p_ >= e_) return false;
-                char x = *p_++;
-                switch (x) {
-                    case 'n': c = '\n'; break;
-                    case 't': c = '\t'; break;
-                    case 'r': c = '\r'; break;
-                    case 'b': c = '\b'; break;
-                    case 'f': c = '\f'; break;
-                    case 'u': {
-                        if (e_ - p_ < 4) return false;
-                        unsigned v = 0;
-                        for (int i = 0; i < 4; ++i) {
-                            char h = *p_++;
-                            v = v * 16 + (h >= 'a' ? h - 'a' + 10 : h >= 'A' ? h - 'A' + 10 : h - '0');
-                        }
-                        c = v < 0x80 ? static_cast<char>(v) : '?';
-                        break;
-                    }
-                    default: c = x;  // " \ /
-                }
-            }
-            s += c;
-        }
-        if (p_ >= e_) return false;
-        ++p_;
-        return true;
-    }
-    bool Value(Json& j, int depth) {
-        if (depth > 16) return false;
-        Ws();
-        if (p_ >= e_) return false;
-        if (*p_ == '{') {
-            ++p_;
-            j.type = Json::Obj;
-            Ws();
-            if (p_ < e_ && *p_ == '}') return ++p_, true;
-            for (;;) {
-                Ws();
-                std::string k;
-                if (!String(k)) return false;
-                Ws();
-                if (p_ >= e_ || *p_++ != ':') return false;
-                Json v;
-                if (!Value(v, depth + 1)) return false;
-                j.obj.emplace_back(std::move(k), std::move(v));
-                Ws();
-                if (p_ >= e_) return false;
-                if (*p_ == ',') { ++p_; continue; }
-                return *p_++ == '}';
-            }
-        }
-        if (*p_ == '[') {
-            ++p_;
-            j.type = Json::Arr;
-            Ws();
-            if (p_ < e_ && *p_ == ']') return ++p_, true;
-            for (;;) {
-                Json v;
-                if (!Value(v, depth + 1)) return false;
-                j.arr.push_back(std::move(v));
-                Ws();
-                if (p_ >= e_) return false;
-                if (*p_ == ',') { ++p_; continue; }
-                return *p_++ == ']';
-            }
-        }
-        if (*p_ == '"') {
-            j.type = Json::Str;
-            return String(j.str);
-        }
-        if (*p_ == '-' || (*p_ >= '0' && *p_ <= '9')) {
-            const bool neg = *p_ == '-';
-            if (neg) ++p_;
-            if (p_ >= e_ || *p_ < '0' || *p_ > '9') return false;
-            long long v = 0;
-            while (p_ < e_ && *p_ >= '0' && *p_ <= '9') v = v * 10 + (*p_++ - '0');
-            j.type = Json::Num;
-            j.num = neg ? -v : v;
-            return true;
-        }
-        return false;  // true/false/null/floats: not in a recipe
-    }
-    const char* p_;
-    const char* e_;
-};
-
-bool ParseJson(const std::vector<uint8_t>& b, Json& j) {
-    return JsonParser(reinterpret_cast<const char*>(b.data()), b.size()).Parse(j);
-}
+// JSON reader: recipe_json.h
 
 std::string Hex8(const std::string& h) { return h.substr(0, 8); }
 
@@ -370,6 +245,12 @@ struct Builder {
             } else {
                 return Fail(rel + ": kind " + kind + " cannot be built");
             }
+            // root constants the runtime patches every frame (or that are never initialised) are listed in `mask`: they
+            // are written as 0, whatever the source gave, so every source builds the same bytes (and the recipe's hash
+            // is over those zeros)
+            if (const Json* m = d.Get("mask"))
+                for (const Json& x : m->arr)
+                    if (x.num >= 0 && static_cast<size_t>(x.num) * 4 + 4 <= blob.size()) memset(blob.data() + x.num * 4, 0, 4);
             if (Sha256Hex(blob.data(), blob.size()) != d.Str_("sha256"))
                 return Fail(rel + ": " + kind + " content does not match the recipe's SHA-256 (wrong source?)");
             if (!WriteFile_(out / fs::path(rel), blob.data(), blob.size(), rel)) return false;
@@ -487,12 +368,13 @@ bool DevCaptureSource::RootConstants(int index, std::vector<uint8_t>& out) {
 
 // ---- BuildPack ----------------------------------------------------------------------------------------------------
 bool BuildPack(const std::wstring& libxessPath, const std::wstring& dxcompilerPath, const Bundle& own, IntelDataSource& data,
-               const std::wstring& outDir, Report& rep, std::string* error) {
+               const std::wstring& outDir, Report& rep, std::string* error, const std::vector<uint8_t>* libBytes) {
     const auto t0 = Clock::now();
     rep = Report();
     Builder b(own, data, dxcompilerPath, rep);
     std::string why;
-    if (!b.lib.Open(libxessPath, &why)) {
+    if (libBytes) data.UseLibraryBytes(libBytes);
+    if (!(libBytes ? b.lib.OpenMemory(libBytes->data(), libBytes->size(), &why) : b.lib.Open(libxessPath, &why))) {
         if (error) *error = "libxess_fg.dll (" + Narrow(libxessPath) + ") cannot be used: " + why;
         return false;
     }
@@ -577,7 +459,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
             return Outcome::Cached;
         }
         if (!req.own || !req.data) {
-            error = !req.own ? "this f5low.dll carries no recipe" : "no data source for the weights (F5LOW_DEV_WEIGHTS + F5LOW_DEV_CAP)";
+            error = !req.own ? "this f5low.dll carries no recipe" : "no data source for the weights";
             return Outcome::Failed;
         }
         std::error_code ec;
@@ -593,7 +475,7 @@ Outcome EnsurePack(const Request& req, std::wstring& dir, std::string& error, Re
             " (one-time, runs on the calling thread)");
         Report rep;
         std::string why;
-        if (!BuildPack(req.libxessPath, req.dxcompilerPath, *req.own, *req.data, tmp.wstring(), rep, &why)) {
+        if (!BuildPack(req.libxessPath, req.dxcompilerPath, *req.own, *req.data, tmp.wstring(), rep, &why, &intel)) {
             fs::remove_all(tmp, ec);
             error = why;
             return Outcome::Failed;

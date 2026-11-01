@@ -24,13 +24,16 @@ namespace packbuild {
 
 // The weights and root constants the recipe refers to (parts.json: intel_upload by ordinal, intel_const by dispatch
 // index). The builder checks every blob against the recipe's SHA-256, so a wrong source fails by naming the part.
-// DevCaptureSource below reads an offline capture; the decoder of libxess_fg's own data (story B3) implements this
-// interface later.
+// IntelFileSource (intel_file_source.h) rebuilds every weight upload and every root-constant block from the player's
+// libxess_fg.dll file; DevCaptureSource below reads an offline capture (development only).
 class IntelDataSource {
 public:
     virtual ~IntelDataSource() = default;
-    // Short identifier of the source kind, for the log ("dev", later "decoder-1"). Not part of the cache key.
+    // Short identifier of the source kind, for the log ("dev", "file"). Not part of the cache key.
     virtual std::string Id() const = 0;
+    // BuildPack has already read the libxess_fg file: a source that reads it too may use these bytes (valid for the
+    // whole build) instead of reading it again.
+    virtual void UseLibraryBytes(const std::vector<uint8_t>*) {}
     // The weight upload with this ordinal (recipe `ordinal`), its exact bytes before padding.
     virtual bool Upload(int ordinal, std::vector<uint8_t>& out) = 0;
     // The root constants of dispatch `index` (recipe `capture_index`): little-endian dwords as bytes.
@@ -44,6 +47,8 @@ public:
 class DevCaptureSource : public IntelDataSource {
 public:
     DevCaptureSource(const std::wstring& weightsDir, const std::wstring& capLog);
+    // Root constants only (the weights come from elsewhere): Upload() then always fails.
+    explicit DevCaptureSource(const std::wstring& capLog) : capLog_(capLog) {}
     std::string Id() const override { return "dev"; }
     bool Upload(int ordinal, std::vector<uint8_t>& out) override;
     bool RootConstants(int index, std::vector<uint8_t>& out) override;
@@ -74,8 +79,10 @@ struct Report {
 
 // Builds the pack into `outDir` (created; existing files are overwritten). False with `error` naming what is missing
 // or does not match (a module the build does not know, a weight with the wrong SHA-256, no dxcompiler, ...).
+// `libBytes`: the libxess_fg file when the caller has read it already (used instead of reading it again).
 bool BuildPack(const std::wstring& libxessPath, const std::wstring& dxcompilerPath, const Bundle& own,
-               IntelDataSource& data, const std::wstring& outDir, Report& rep, std::string* error);
+               IntelDataSource& data, const std::wstring& outDir, Report& rep, std::string* error,
+               const std::vector<uint8_t>* libBytes = nullptr);
 
 // The cache: `<cacheRoot>\<key>\` holds a finished pack and a `complete` marker.
 struct Request {

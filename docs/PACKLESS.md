@@ -45,16 +45,63 @@ Python with numpy.
 
 `XEFG_CUDA_PACK` / `xefg_pack\` next to the DLL, then a pack embedded in the DLL (personal builds, resource 101),
 then the cache, then a build now. A build needs the player's `libxess_fg.dll` (`XEFG_CUDA_INTEL_LIBRARY` or the usual
-lookup), `dxcompiler.dll` next to f5low.dll (`F5LOW_DXCOMPILER`) and a weights source. Until the decoder of
-libxess_fg's own data exists (story B3), the source is a dev capture: `F5LOW_DEV_WEIGHTS` (weight dump folder) +
-`F5LOW_DEV_CAP` (PSO capture log); it sits behind `IntelDataSource` (`pack_build.h`), which B3 implements. Every blob is
-checked against the recipe's SHA-256. If anything is missing the log says so in ONE line ("own generator
+lookup), `dxcompiler.dll` next to f5low.dll (`F5LOW_DXCOMPILER`) and a data source (`IntelDataSource`, `pack_build.h`):
+the 106 weight uploads and the 44 root-constant blocks come from `IntelFileSource` (next section), no environment
+variable needed. Development overrides only: `F5LOW_DEV_CAP` (a PSO capture log) replaces the derived root constants,
+`F5LOW_DEV_WEIGHTS` (a weight dump folder, with `F5LOW_DEV_CAP`) replaces everything. Every blob is checked against the
+recipe's SHA-256. If anything is missing the log says so in ONE line ("own generator
 unavailable: ...") and the DLL forwards to libxess_fg.dll as before.
 
 The build runs synchronously at the first `PackDir()` call (the first `xefgSwapChainGetVersion` /
 `D3D12CreateContext` on the game's thread): about 2.1 s once (decode 46 ms, translate 1.45 s, write 0.55 s on the
 development PC), logged with its phases. A background build while Intel's library serves the first seconds is a
 later improvement. Stale `*.tmp*` folders of killed builds are removed at the start of the next build.
+
+### The weights (`src/intel_file_source.h/.cpp`, story B3 step 2)
+
+`IntelFileSource` rebuilds all 106 weight uploads of the multi-frame model (the `intel_upload` entries) from the
+`libxess_fg.dll` FILE: the library is never loaded or run, nothing is patched, no GPU is involved.
+
+- **Weights.** The int8 convolution weights are plain bytes in the file, one blob per layer. The recipe's `decode` key
+  (ours) lists each blob by length, SHA-256 and a short probe tag; the source scans the file for the probe tags and
+  confirms a candidate by the SHA-256 of the whole blob (a copy shifted by a byte, or a second copy of the same weights,
+  cannot pass unless its bytes are equal). The tiling per layer family is ours: the conv layers are re-tiled with a
+  `[A][B][C][tap][D][o][i]` (net A with a 8x16 tile, net B 16x16) or `[A][B][tap][D][C][o][i]` (U-Net, 16x16) digit
+  order, small stems padded to a 128/32 tile, 1x1 heads as `[cin/4][cout][4]` (a padded column reads on into the next
+  row), one small layer is copied as it is.
+- **Scale and bias.** The per-channel vectors are not data in the file but byte-wise immediate stores in start-up code.
+  The generic scan (`mov byte [rsp+disp32], imm8`, consecutive displacements = one vector, in file order) finds the
+  same runs, in the same order, in 1.3.4.95 and 1.3.1.78. The recipe says per upload which run it takes and in which
+  form: as is (float32 or int32), 16-bit widened to int32, a stem vector widened and zero-padded to 512 bytes, or a
+  folded bias `float32(aux * 128 * scale + bias)` where `aux` is the sum of the layer's int8 weights.
+- **Check.** Every rebuilt upload is compared with the SHA-256 the recipe lists for it before it is used; a mismatch
+  names the upload. A libxess_fg whose blobs are not in the recipe fails with the first missing blob.
+- **What is and is not in the repo.** No Intel bytes (not even a few: the recipe holds lengths, SHA-256 and a hash tag
+  of 8 probe bytes), and no address, RVA or file offset. The code does embed interoperability facts, all of them
+  about how the data is laid out, none copied from the binary as bytes:
+  the number and order of a layer descriptor's words (12; kind, cout, cin, clamp bits, sn, sp, mulPos, then 7, 1, 1, 1);
+  the call-argument window of the builder's frame they are stored in (displacements 0x30 to 0x98, word order = highest
+  first); the function-size filter of the layer-table scan (over 40000 bytes); that the model's table is the one with
+  36 layers whose first layer has 2 input channels; which root-constant dwords the layer words go to (conv blocks:
+  channel chunk, mulPos, `(sn<<8)|sp`; head blocks: mulPos, sp) and the plain numbers in `decode.rc` (each with a
+  short meaning); the weight tilings; the fold gain 128; and the generic x86 encodings the scans recognise
+  (`mov byte [rsp+disp32], imm8`, `mov dword [rsp+disp], imm32`, `lea reg,[rip+disp32]`, `call`). The layer
+  "i<digits>" strings are only used as a delimiter by the scan; blocks refer to a layer by its position in the table.
+- **Cost and test.** About 30 ms to read the file, find the 36 blobs and the 219 runs, 10 ms to decode all 106
+  uploads. `tests/intel_file_test.cpp` (`tests/build_intel_file_test.ps1`) rebuilds and hash-checks all 106 from a
+  libxess_fg.dll: 106/106 on 1.3.4.95 and on 1.3.1.78.
+- **Root constants** (`RootConstants()`, the 44 `intel_const` blocks, no capture). Three sources:
+  the size words come from the `set` formulas of `manifest.tmpl` evaluated at the size the recipe was made at
+  (`decode.rc.size`); the per-layer words (multiplier position, shifts) come from the layer table of the same DLL, found by
+  a generic scan (every function of the exception directory over 40000 bytes, runs of exactly 12 immediate 32-bit
+  stores into the call-argument area of the frame closed by a call, named by the following "i<digits>" string; the
+  table with 36 layers whose first layer has 2 input channels is the model's); the rest are plain numbers of our
+  description (zeros, 25, 32, channel chunks 2 and 4, the floats 0.25, 0.5, 2, 4, and 1), kept in the recipe with the
+  block-to-layer map. Words the runtime patches every frame (scale, jitter, interpolation time, pass index) or that
+  Intel's code never initialises are written 0 and listed in the entry's `mask`; for those 16 blocks the recipe's SHA-256
+  is taken with the masked dwords zeroed (28 blocks are hashed exactly). The pack builder (and `build_pack.py`) writes
+  those dwords as 0 whatever the source gave, so every source builds the same bytes.
+  The manifest's `patch` lines write the real values every frame.
 
 ### The translator (`src/translate.h/.cpp`)
 
