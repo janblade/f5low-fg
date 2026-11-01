@@ -251,11 +251,10 @@
    "generator": "gen_conv_ptx.py",
    "args": ["--layer", "c16", "--sm", "75"]
   },
-  "k31_xcd506291.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "cd506291d980f99decc55b3d1595b021b805cd499991ea6750b44e0fe6222249",
-   "transform": "plain",
-   "fmts": ["S0=x128", "S10=rgba8", "S11=rgba8", "S12=rgba8", "S1=rgba8", "S2=rgba8", "S3=rgba8", "S8=rgba8", "S9=rgba8", "U0=rgba8"]
+  "k31_blend.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_blend_ptx.py",
+   "args": []
   },
   "v_r5a5a7b35.ptx": {
    "kind": "intel_xlate",
@@ -347,11 +346,10 @@
    "transform": "plain",
    "fmts": ["S0=x32"]
   },
-  "v_x0f8619d4.ptx": {
-   "kind": "intel_xlate",
-   "module_sha256": "0f8619d434793dfe8d5a912ad0303a7ac670a5f0a5982c94e1ce3089a9367309",
-   "transform": "plain",
-   "fmts": ["S0=x128", "S10=rgba8", "S11=rgba8", "S12=rgba8", "S1=rgba8", "S2=rgba8", "S3=rgba8", "S8=rgba8", "S9=rgba8", "U0=rgba8"]
+  "v_blend_straight.ptx": {
+   "kind": "own_gen",
+   "generator": "gen_blend_ptx.py",
+   "args": ["--premul", "0"]
   },
   "k19_ra7fc1e46.dxbc": {
    "kind": "intel_native",
