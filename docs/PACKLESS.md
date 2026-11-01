@@ -23,7 +23,38 @@ gets them from the player's own `libxess_fg.dll` when it first needs them.
      module's disassembly text, `src/translate.cpp` turns the text into PTX, on the player's PC, with the same
      rules and the same output as the offline tool (see below). Performance is the current pack's, because the
      kernels are the same text.
-4. **Cache** the built pack per (libxess_fg SHA-256, dxcompiler version, GPU SM) (story B2 step 3).
+4. **Build and cache** (`src/pack_build.cpp`, story B2 step 3). `BuildPack` writes a pack folder equal byte for byte
+   to `tools/recipe/build_pack.py`'s neutral-name output (`tools/recipe/compare_pack.py`: 460 files, 0 differences);
+   `EnsurePack` keeps it in `<DLL dir>\f5low_cache\<key>\`. The key is the SHA-256 of (libxess_fg file, the embedded
+   recipe + our kernels, dxcompiler file version; not the data source, every blob is checked against the recipe's
+   SHA-256 so any source builds the same pack). The pack is built in a temporary folder next to
+   it, a `complete` marker with the file count is written last and the folder is renamed in one step; a folder
+   without a matching marker (killed build, damaged) is replaced.
+
+### What is embedded in f5low.dll (ours only)
+
+`build.ps1` runs `tools/recipe/build_own.py`: our generators (`tools/kernels`) and our HLSL templates (dxc at BUILD
+time, then `src/translate.cpp` through `tools/xlate_tool.cpp`) produce the `own_gen` / `own_tpl` PTX of both packs,
+and the noise texture is drawn from the recorded seed. They go with the recipe into one plain-text resource (102,
+format in `build_own.py`). `build\own_blobs.txt` lists the SHA-256 of every file in it. `tools/audit.py --dll`
+finds the container inside the DLL by its structure and fails any file not listed; PTX text anywhere else in the DLL
+fails unless it is one of the two hand-written utility kernels. So Intel-translated PTX can never ride along. Build needs `dxc.exe` (`-Dxc`, `XEFG_DXC`, the WinGet DirectX.ShaderCompiler package or the Windows SDK) and
+Python with numpy.
+
+### Loading order (`src/xefg_cuda.cpp`, `PackDir`)
+
+`XEFG_CUDA_PACK` / `xefg_pack\` next to the DLL, then a pack embedded in the DLL (personal builds, resource 101),
+then the cache, then a build now. A build needs the player's `libxess_fg.dll` (`XEFG_CUDA_INTEL_LIBRARY` or the usual
+lookup), `dxcompiler.dll` next to f5low.dll (`F5LOW_DXCOMPILER`) and a weights source. Until the decoder of
+libxess_fg's own data exists (story B3), the source is a dev capture: `F5LOW_DEV_WEIGHTS` (weight dump folder) +
+`F5LOW_DEV_CAP` (PSO capture log); it sits behind `IntelDataSource` (`pack_build.h`), which B3 implements. Every blob is
+checked against the recipe's SHA-256. If anything is missing the log says so in ONE line ("own generator
+unavailable: ...") and the DLL forwards to libxess_fg.dll as before.
+
+The build runs synchronously at the first `PackDir()` call (the first `xefgSwapChainGetVersion` /
+`D3D12CreateContext` on the game's thread): about 2.1 s once (decode 46 ms, translate 1.45 s, write 0.55 s on the
+development PC), logged with its phases. A background build while Intel's library serves the first seconds is a
+later improvement. Stale `*.tmp*` folders of killed builds are removed at the start of the next build.
 
 ### The translator (`src/translate.h/.cpp`)
 

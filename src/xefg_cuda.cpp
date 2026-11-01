@@ -23,6 +23,7 @@
 #include <vector>
 
 #define XEFG_SWAPCHAIN_EXPORT_API
+#include "pack_build.h"
 #include "xefg_own.h"
 #include "xefg_version.h"
 #include <xefg_swapchain_debug.h>
@@ -254,8 +255,70 @@ bool LoadEmbeddedPack()
     return ok;
 }
 
-// A pack folder next to this DLL (or XEFG_CUDA_PACK) wins over the embedded one, so a new pack can be tried
-// without rebuilding.
+std::wstring RealLibraryPath(const char** from);
+
+// The pack-less route (story B2): our recipe and kernels are built into this DLL (resource 102, tools/recipe/build_own.py),
+// the Intel parts come from the player's libxess_fg.dll on first use and the finished pack is cached in
+// <DLL dir>\f5low_cache\<key>\. F5LOW_DXCOMPILER: dxcompiler.dll (default: next to this DLL). Weights and root constants
+// come from F5LOW_DEV_WEIGHTS (dump folder) + F5LOW_DEV_CAP (PSO capture log) until the decoder of libxess_fg's own data
+// (story B3) exists. Runs once, at the first PackDir() call that finds no other pack; the result is kept.
+std::string BuiltPackDir()
+{
+    static std::once_flag once;
+    static std::string result;
+    std::call_once(once, [] {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&BuiltPackDir), &self);
+        HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(102), MAKEINTRESOURCEW(10));
+        const uint8_t* bytes = res ? static_cast<const uint8_t*>(LockResource(LoadResource(self, res))) : nullptr;
+        const size_t bytesSize = res ? SizeofResource(self, res) : 0;
+        static packbuild::Bundle bundle;
+        std::string err;
+        if (!bytes || !packbuild::ParseBundle(bytes, bytesSize, bundle, &err))
+        {
+            Log("own generator unavailable: no pack found and this DLL carries no recipe (%s)", err.empty() ? "no resource" : err.c_str());
+            return;
+        }
+        wchar_t env[MAX_PATH] = {};
+        const std::wstring dir(g_dir);
+        const char* from = "";
+        packbuild::Request req;
+        req.libxessPath = RealLibraryPath(&from);
+        req.dxcompilerPath = GetEnvironmentVariableW(L"F5LOW_DXCOMPILER", env, MAX_PATH) ? std::wstring(env) : dir + L"\\dxcompiler.dll";
+        req.cacheRoot = dir + L"\\f5low_cache";
+        req.own = &bundle;
+        req.bundleBytes = bytes;
+        req.bundleSize = bytesSize;
+        wchar_t w[MAX_PATH] = {}, c[MAX_PATH] = {};
+        std::unique_ptr<packbuild::DevCaptureSource> source;
+        if (GetEnvironmentVariableW(L"F5LOW_DEV_WEIGHTS", w, MAX_PATH) && GetEnvironmentVariableW(L"F5LOW_DEV_CAP", c, MAX_PATH))
+            source = std::make_unique<packbuild::DevCaptureSource>(w, c);
+        req.data = source.get();
+        std::vector<std::string> lines;
+        req.log = [&](const std::string& l) { lines.push_back(l); };
+        const ULONGLONG t0 = GetTickCount64();
+        std::wstring packDir;
+        const packbuild::Outcome o = packbuild::EnsurePack(req, packDir, err);
+        if (o == packbuild::Outcome::Failed)
+        {
+            Log("own generator unavailable: %s", err.c_str());      // the one line: what is missing
+            return;
+        }
+        for (const std::string& l : lines)
+            Log("%s", l.c_str());
+        if (o == packbuild::Outcome::Built)
+            Log("pack build took %llu ms on the calling thread (one-time; later runs use the cache)", GetTickCount64() - t0);
+        char narrow[MAX_PATH * 2] = {};
+        WideCharToMultiByte(CP_ACP, 0, packDir.c_str(), -1, narrow, sizeof(narrow), nullptr, nullptr);
+        result = narrow;
+    });
+    return result;
+}
+
+// Where the pack comes from, first that exists: a pack folder next to this DLL (or XEFG_CUDA_PACK) - so a new pack can be
+// tried without rebuilding - then the pack embedded in this DLL (personal builds), then the cache / a build from the
+// player's libxess_fg.dll (BuiltPackDir).
 std::string PackDir()
 {
     char env[MAX_PATH];
@@ -264,7 +327,9 @@ std::string PackDir()
     std::string dir = GetEnvironmentVariableA("XEFG_CUDA_PACK", env, sizeof(env)) ? std::string(env) : ModuleDir() + "\\xefg_pack";
     if (GetFileAttributesA((dir + "\\manifest.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
         return dir;
-    return LoadEmbeddedPack() ? std::string(xefgpack::kEmbeddedDir) : std::string();
+    if (LoadEmbeddedPack())
+        return std::string(xefgpack::kEmbeddedDir);
+    return BuiltPackDir();
 }
 
 // Whether the pack runs on the GPU behind a D3D12 device: `have` its compute capability as sm_NN (0: no CUDA driver,
