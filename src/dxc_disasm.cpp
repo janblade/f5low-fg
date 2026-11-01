@@ -71,17 +71,20 @@ bool Disassembler::Load(const std::wstring& path, std::string* error) {
     module_ = m;
     compiler_ = comp;
     utils_ = utils;
-    // file version, for the log
-    DWORD dummy = 0, sz = GetFileVersionInfoSizeW(path.c_str(), &dummy);
-    if (sz) {
-        std::string buf(sz, '\0');
-        VS_FIXEDFILEINFO* fi = nullptr;
-        UINT len = 0;
-        if (GetFileVersionInfoW(path.c_str(), 0, sz, buf.data()) && VerQueryValueW(buf.data(), L"\\", reinterpret_cast<LPVOID*>(&fi), &len) && fi)
-            version_ = std::to_string(HIWORD(fi->dwFileVersionMS)) + "." + std::to_string(LOWORD(fi->dwFileVersionMS)) + "." +
-                       std::to_string(HIWORD(fi->dwFileVersionLS)) + "." + std::to_string(LOWORD(fi->dwFileVersionLS));
-    }
+    version_ = FileVersion(path);
     return true;
+}
+
+std::string FileVersion(const std::wstring& path) {
+    DWORD dummy = 0, sz = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    if (!sz) return {};
+    std::string buf(sz, '\0');
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!GetFileVersionInfoW(path.c_str(), 0, sz, buf.data()) || !VerQueryValueW(buf.data(), L"\\", reinterpret_cast<LPVOID*>(&fi), &len) || !fi)
+        return {};
+    return std::to_string(HIWORD(fi->dwFileVersionMS)) + "." + std::to_string(LOWORD(fi->dwFileVersionMS)) + "." +
+           std::to_string(HIWORD(fi->dwFileVersionLS)) + "." + std::to_string(LOWORD(fi->dwFileVersionLS));
 }
 
 bool Disassembler::Disassemble(const uint8_t* container, size_t size, std::string& text, std::string* error) const {

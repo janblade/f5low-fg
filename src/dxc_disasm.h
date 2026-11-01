@@ -12,6 +12,9 @@
 
 namespace dxc_disasm {
 
+// "<major>.<minor>.<build>.<rev>" of a DLL file from its version resource (the file is not loaded); empty if none.
+std::string FileVersion(const std::wstring& path);
+
 class Disassembler {
 public:
     Disassembler() = default;

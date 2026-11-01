@@ -129,6 +129,11 @@ struct Dict {
 
 }  // namespace
 
+bool HashBytes(const void* data, size_t n, Sha256& out) {
+    Hasher hash;
+    return hash(static_cast<const uint8_t*>(data), n, out);
+}
+
 std::string ToHex(const Sha256& h) {
     static const char* digits = "0123456789abcdef";
     std::string s;
