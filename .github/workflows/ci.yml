@@ -47,5 +47,15 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./build.ps1 -VsPath $vs -XessInc "$PWD\_xess\inc\xess_fg" -StreamlineInc "$PWD\_streamline\include"
 
+      # The unlock families' own tests on synthetic images (no NVIDIA file is involved; the checkers and probes that read the
+      # player's DLSS-G files are built too, not run)
+      - name: Unlock tests
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_mfgunlock_tests.ps1 -VsPath $vs
+          ./build/mfgunlock_core_smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "mfgunlock_core_smoke failed" }
+
       - name: Audit the DLL (only what we compile in)
         run: python tools/audit.py --dll build/f5low.dll

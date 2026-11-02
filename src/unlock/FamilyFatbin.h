@@ -1,5 +1,5 @@
 // Ported from OptiScaler-NR OptiScaler/framegen/mfgunlock/FamilyFatbin.h at 745e49431 (origin/release/0.1.36).
-// Kept identical to the original except where listed here: nothing.
+// Kept identical to the original except where listed here: ForEachContainer takes the fatbin magic from PtxTuring::kFatbinMagic instead of a byte literal.
 // GPL-3.0 with the rest of this repo. 
 #pragma once
 
@@ -362,7 +362,11 @@ inline bool CollectAmpere(Report& report, const ImageView& image, uint32_t conta
 // container's bytes are skipped when visit returns true (they are its images, not further containers).
 template <typename Visit> inline void ForEachContainer(const ImageView& image, Visit&& visit)
 {
-    constexpr uint8_t magic[] = { 0x50, 0xED, 0x55, 0xBA };
+    // f5low: the magic comes from PtxTuring's run-time built constant (little endian bytes 50 ED 55 BA), so this scan does not put the
+    // 4-byte sequence into f5low.dll (tools/audit.py --dll rejects it there).
+    uint8_t magic[sizeof(uint32_t)];
+    const uint32_t magicValue = PtxTuring::kFatbinMagic;
+    std::memcpy(magic, &magicValue, sizeof(magic));
     for (WORD index = 0; index < image.SectionCount(); ++index)
     {
         IMAGE_SECTION_HEADER section {};

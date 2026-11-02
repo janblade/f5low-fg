@@ -9,9 +9,9 @@
 //     game's own DLSS-G modules (any other handle of the same base name) are only listed in the log, never touched.
 //   - the GPU comes from the caller (compute capability sm_NN, F5LOW_TEST_GPU_SM in tests) instead of IdentifyGpu/NVAPI:
 //     sm >= 100 (RTX 50 and newer) patches nothing, 89 Ada, 80..88 Ampere, 75..79 Turing.
-//   - the CUDA module loaders are not detoured process wide. nvngx_dlssg resolves nvcuda's entry points with GetProcAddress, so
-//     the kernel32!GetProcAddress slot in THAT module's import table is pointed at a function of ours, which hands the four
-//     module-load functions (directly, or through cuGetProcAddress) back as our hooks. Nobody else's calls are ever seen.
+//   - the CUDA module loaders are hooked with a small inline hook of our own (Detours is not used; see InstallInlineHook), and a load
+//     is only rewritten when its container lies inside OUR nvngx_dlssg (or the call comes from it); every other load goes straight
+//     to the real function.
 //   - no config/menu: tiers are not modes; there is no off switch (the unlock exists only for this private copy).
 //   - all-or-none: both modules are located first; nothing is written unless every family of the tier located; the two patch
 //     sets are applied one after the other and the first is restored if the second fails.
@@ -29,12 +29,14 @@
 #include "Provider.h"
 #include "PtxTuring.h"
 #include "Status.h"
+#include "hde/hde64.h"
 
 #include "../long_path.h"
 
 #include <windows.h>
 #include <bcrypt.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <intrin.h>
 
 #include <array>
@@ -43,7 +45,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
+
+#pragma comment(lib, "Bcrypt.lib")
 
 namespace unlock
 {
@@ -219,11 +224,11 @@ inline std::string HashFileSha256(const std::wstring& path)
 
 // ---- the RTX 20 CUDA rewrite (OptiScaler MfgUnlock.cpp: SubstituteCudaImage and its hooks) -------------------------------------
 // RTX 20: nvngx_dlssg's kernels are PTX for newer cards. The driver is handed rewritten sm_75 PTX text instead of the shipped
-// fatbin whenever one of OUR nvngx_dlssg's containers is loaded (PtxTuring.h). The hooks reach only that module (below).
+// fatbin whenever one of OUR nvngx_dlssg's containers is loaded (PtxTuring.h). Everything else passes through (below).
 inline std::atomic<bool> turingRewriteWanted { false };
 inline std::mutex cudaRewriteMutex;
 inline uintptr_t ourBase = 0, ourEnd = 0; // our nvngx_dlssg's mapped range
-inline std::atomic<unsigned> cudaSeen { 0 }, cudaInOurs { 0 }, cudaRewritten { 0 }, cudaLeft { 0 }, cudaViaProc { 0 }, cudaViaGet { 0 };
+inline std::atomic<unsigned> cudaSeen { 0 }, cudaInOurs { 0 }, cudaRewritten { 0 }, cudaLeft { 0 }, cudaOthers { 0 };
 
 struct CudaRewriteEntry
 {
@@ -235,14 +240,10 @@ inline std::map<const void*, CudaRewriteEntry> cudaRewriteCache; // keyed by ima
 using PFN_cuModuleLoadData = int(WINAPI*)(void**, const void*);
 using PFN_cuModuleLoadDataEx = int(WINAPI*)(void**, const void*, unsigned, int*, void**);
 using PFN_cuLibraryLoadData = int(WINAPI*)(void**, const void*, void*, void**, unsigned, void*, void**, unsigned);
-using PFN_cuGetProcAddress = int(WINAPI*)(const char*, void**, int, unsigned long long);
-using PFN_cuGetProcAddress2 = int(WINAPI*)(const char*, void**, int, unsigned long long, void*);
 inline PFN_cuModuleLoadData o_cuModuleLoadData = nullptr;
 inline PFN_cuModuleLoadData o_cuModuleLoadFatBinary = nullptr;
 inline PFN_cuModuleLoadDataEx o_cuModuleLoadDataEx = nullptr;
 inline PFN_cuLibraryLoadData o_cuLibraryLoadData = nullptr;
-inline PFN_cuGetProcAddress o_cuGetProcAddress = nullptr;
-inline PFN_cuGetProcAddress2 o_cuGetProcAddress2 = nullptr;
 
 inline bool ReadMagic(const void* image, uint32_t& magic)
 {
@@ -305,7 +306,10 @@ inline CudaSubstitute SubstituteCudaImage(const void* image, const void* caller)
         Log("unlock: RTX 20: CUDA module load seen (image %p, caller %s, container %s our nvngx_dlssg)", image,
             InOurModule(caller) ? "in" : "outside", InOurModule(image) ? "inside" : "outside");
     if (!ours)
+    {
+        cudaOthers.fetch_add(1, std::memory_order_relaxed);
         return { image, nullptr };
+    }
     cudaInOurs.fetch_add(1, std::memory_order_relaxed);
 
     uint32_t magic = 0;
@@ -359,98 +363,202 @@ inline int WINAPI hkCuLibraryLoadData(void** library, const void* image, void* j
     return o_cuLibraryLoadData(library, s.image, jitOptions, jitValues, numJitOptions, libraryOptions, libraryValues, numLibraryOptions);
 }
 
-// A driver entry point by name -> our hook for the four module loaders (the real one is remembered), else the pointer as it is.
-inline void* HookFor(const char* name, void* real)
+// ---- a small x64 inline hook (what Detours does for OptiScaler) ---------------------------------------------------------------------
+// The four module-load exports of nvcuda are 6-byte stubs, `jmp qword ptr [rip+disp32]`, and the CUDA runtime / the NGX core do not
+// go through them: cuGetProcAddress hands out the REAL functions behind (probe: tests/unlock_hook_probe.cpp). So the stub is followed
+// and the function behind it hooked, like Detours does: its first whole instructions (>= 14 bytes) are copied into a trampoline
+// next to nvcuda (a RIP-relative operand is re-based; a relative branch inside the copied bytes, a ret or an undecodable
+// instruction refuses the hook) and replaced by `jmp [rip+0]` to the hook. Other threads are suspended for the write. Every caller
+// of the function goes through our hook, which hands anything that is not one of OUR nvngx_dlssg's containers to the trampoline.
+// Returns false with the reason when a function does not have a prologue this can take (then the RTX 20 path stands aside).
+inline void SuspendOtherThreads(std::vector<HANDLE>& suspended)
 {
-    if (!name || !real)
-        return real;
-    const auto is = [&](const char* n) { return strcmp(name, n) == 0; };
-    if (is("cuModuleLoadData")) { o_cuModuleLoadData = reinterpret_cast<PFN_cuModuleLoadData>(real); return reinterpret_cast<void*>(&hkCuModuleLoadData); }
-    if (is("cuModuleLoadFatBinary")) { o_cuModuleLoadFatBinary = reinterpret_cast<PFN_cuModuleLoadData>(real); return reinterpret_cast<void*>(&hkCuModuleLoadFatBinary); }
-    if (is("cuModuleLoadDataEx")) { o_cuModuleLoadDataEx = reinterpret_cast<PFN_cuModuleLoadDataEx>(real); return reinterpret_cast<void*>(&hkCuModuleLoadDataEx); }
-    if (is("cuLibraryLoadData")) { o_cuLibraryLoadData = reinterpret_cast<PFN_cuLibraryLoadData>(real); return reinterpret_cast<void*>(&hkCuLibraryLoadData); }
-    return real;
-}
-
-inline int WINAPI hkCuGetProcAddress(const char* symbol, void** pfn, int version, unsigned long long flags)
-{
-    const int r = o_cuGetProcAddress(symbol, pfn, version, flags);
-    if (r == 0 && pfn && *pfn)
-        if (void* h = HookFor(symbol, *pfn); h != *pfn)
-        {
-            cudaViaGet.fetch_add(1, std::memory_order_relaxed);
-            *pfn = h;
-        }
-    return r;
-}
-inline int WINAPI hkCuGetProcAddress2(const char* symbol, void** pfn, int version, unsigned long long flags, void* status)
-{
-    const int r = o_cuGetProcAddress2(symbol, pfn, version, flags, status);
-    if (r == 0 && pfn && *pfn)
-        if (void* h = HookFor(symbol, *pfn); h != *pfn)
-        {
-            cudaViaGet.fetch_add(1, std::memory_order_relaxed);
-            *pfn = h;
-        }
-    return r;
-}
-
-// What nvngx_dlssg's kernel32!GetProcAddress slot points at while the rewrite is wanted.
-inline FARPROC(WINAPI* o_GetProcAddress)(HMODULE, LPCSTR) = nullptr;
-inline FARPROC WINAPI hkGetProcAddress(HMODULE module, LPCSTR name)
-{
-    FARPROC real = o_GetProcAddress(module, name);
-    if (!real || reinterpret_cast<uintptr_t>(name) < 0x10000 || !turingRewriteWanted.load(std::memory_order_acquire))
-        return real;
-    if (strcmp(name, "cuGetProcAddress") == 0)
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+    THREADENTRY32 te { sizeof(te) };
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
     {
-        o_cuGetProcAddress = reinterpret_cast<PFN_cuGetProcAddress>(real);
-        return reinterpret_cast<FARPROC>(&hkCuGetProcAddress);
-    }
-    if (strcmp(name, "cuGetProcAddress_v2") == 0)
-    {
-        o_cuGetProcAddress2 = reinterpret_cast<PFN_cuGetProcAddress2>(real);
-        return reinterpret_cast<FARPROC>(&hkCuGetProcAddress2);
-    }
-    void* h = HookFor(name, reinterpret_cast<void*>(real));
-    if (h != reinterpret_cast<void*>(real))
-        cudaViaProc.fetch_add(1, std::memory_order_relaxed);
-    return reinterpret_cast<FARPROC>(h);
-}
-
-// Points the kernel32!GetProcAddress import slot of `module` at hkGetProcAddress. False when the module has no such import.
-inline bool HookGetProcAddressImport(HMODULE module)
-{
-    const auto* base = reinterpret_cast<const uint8_t*>(module);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress)
-        return false;
-    for (const auto* d = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); d->Name; ++d)
-    {
-        if (_stricmp(reinterpret_cast<const char*>(base + d->Name), "KERNEL32.dll") != 0)
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId())
             continue;
-        const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(const_cast<uint8_t*>(base) + d->FirstThunk);
-        for (size_t i = 0; names[i].u1.AddressOfData; ++i)
+        if (HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID))
         {
-            if (IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal))
-                continue;
-            const auto* by = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names[i].u1.AddressOfData);
-            if (strcmp(by->Name, "GetProcAddress") != 0)
-                continue;
-            DWORD old = 0;
-            if (!VirtualProtect(&slots[i], sizeof(void*), PAGE_READWRITE, &old))
-                return false;
-            if (!o_GetProcAddress)
-                o_GetProcAddress = reinterpret_cast<FARPROC(WINAPI*)(HMODULE, LPCSTR)>(slots[i].u1.Function);
-            slots[i].u1.Function = reinterpret_cast<ULONGLONG>(&hkGetProcAddress);
-            VirtualProtect(&slots[i], sizeof(void*), old, &old);
-            return true;
+            if (SuspendThread(t) != static_cast<DWORD>(-1))
+                suspended.push_back(t);
+            else
+                CloseHandle(t);
         }
     }
-    return false;
+    CloseHandle(snap);
+}
+inline void ResumeThreads(std::vector<HANDLE>& suspended)
+{
+    for (const HANDLE t : suspended)
+    {
+        ResumeThread(t);
+        CloseHandle(t);
+    }
+    suspended.clear();
+}
+
+inline bool InstallInlineHook(void* function, void* hook, void** trampolineOut, std::string& why)
+{
+    auto* code = static_cast<uint8_t*>(function);
+    constexpr size_t kJump = 14; // FF 25 00 00 00 00 <imm64>
+    // Follow `jmp [rip+disp32]` stubs to the function itself
+    for (int hops = 0; hops < 4 && code[0] == 0xFF && code[1] == 0x25; ++hops)
+    {
+        int32_t disp = 0;
+        std::memcpy(&disp, code + 2, sizeof(disp));
+        code = *reinterpret_cast<uint8_t**>(code + 6 + disp);
+    }
+    struct Copied
+    {
+        std::array<uint8_t, 48> bytes {};
+        size_t length = 0;
+        std::vector<std::pair<size_t, int64_t>> ripFixups; // offset of a disp32 in `bytes`, the absolute address it meant
+    } copied;
+    while (copied.length < kJump)
+    {
+        hde64s d {};
+        const unsigned len = hde64_disasm(code + copied.length, &d);
+        if (len == 0 || (d.flags & F_ERROR) != 0 || copied.length + len > copied.bytes.size())
+        {
+            why = "cannot decode its first instructions";
+            return false;
+        }
+        if ((d.flags & F_RELATIVE) != 0 || d.opcode == 0xC3 || d.opcode == 0xC2 || d.opcode == 0xCC || d.opcode == 0xE9 || d.opcode == 0xEB)
+        {
+            why = "its first instructions hold a branch or a return";
+            return false;
+        }
+        std::memcpy(copied.bytes.data() + copied.length, code + copied.length, len);
+        if ((d.flags & F_MODRM) != 0 && d.modrm_mod == 0 && d.modrm_rm == 5)
+        {
+            if ((d.flags & F_DISP32) == 0 || d.p_67)
+            {
+                why = "a RIP-relative operand this cannot re-base";
+                return false;
+            }
+            const size_t immBytes = (d.flags & F_IMM8) ? 1 : (d.flags & F_IMM16) ? 2 : (d.flags & F_IMM32) ? 4 : (d.flags & F_IMM64) ? 8 : 0;
+            const size_t dispAt = copied.length + len - immBytes - 4;
+            copied.ripFixups.emplace_back(dispAt, reinterpret_cast<int64_t>(code) + static_cast<int64_t>(copied.length + len) + static_cast<int32_t>(d.disp.disp32));
+        }
+        copied.length += len;
+    }
+    // The trampoline: within +-2 GB of the function (its RIP-relative operands keep reaching their data)
+    const size_t trampSize = copied.length + kJump;
+    uint8_t* tramp = nullptr;
+    const auto where = reinterpret_cast<uintptr_t>(code) & ~static_cast<uintptr_t>(0xFFFF);
+    for (uintptr_t step = 1; step < 0x4000 && !tramp; ++step)
+        for (const int dir : { -1, 1 })
+        {
+            const uintptr_t at = where + dir * step * 0x10000;
+            tramp = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(at), trampSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+            if (tramp)
+                break;
+        }
+    if (!tramp)
+    {
+        why = "no memory next to nvcuda for the trampoline";
+        return false;
+    }
+    std::memcpy(tramp, copied.bytes.data(), copied.length);
+    for (const auto& [at, target] : copied.ripFixups)
+    {
+        const int64_t disp = target - (reinterpret_cast<int64_t>(tramp) + static_cast<int64_t>(at) + 4 + 0);
+        // The immediate (if any) follows the disp32, so the RIP used by the CPU is the end of the instruction; recompute from it
+        size_t instrEnd = 0, pos = 0;
+        while (pos <= at)
+        {
+            hde64s d {};
+            const unsigned len = hde64_disasm(tramp + pos, &d);
+            instrEnd = pos + len;
+            pos += len;
+        }
+        const int64_t fixed = target - (reinterpret_cast<int64_t>(tramp) + static_cast<int64_t>(instrEnd));
+        (void)disp;
+        if (fixed < INT32_MIN || fixed > INT32_MAX)
+        {
+            VirtualFree(tramp, 0, MEM_RELEASE);
+            why = "the trampoline cannot reach the operand of its first instructions";
+            return false;
+        }
+        const int32_t f32 = static_cast<int32_t>(fixed);
+        std::memcpy(tramp + at, &f32, sizeof(f32));
+    }
+    tramp[copied.length] = 0xFF;
+    tramp[copied.length + 1] = 0x25;
+    std::memset(tramp + copied.length + 2, 0, 4);
+    const uint64_t back = reinterpret_cast<uint64_t>(code) + copied.length;
+    std::memcpy(tramp + copied.length + 6, &back, 8);
+    FlushInstructionCache(GetCurrentProcess(), tramp, trampSize);
+
+    uint8_t patch[kJump] = { 0xFF, 0x25, 0, 0, 0, 0 };
+    const uint64_t hookAddress = reinterpret_cast<uint64_t>(hook);
+    std::memcpy(patch + 6, &hookAddress, 8);
+    std::vector<HANDLE> others;
+    DWORD old = 0;
+    if (!VirtualProtect(code, kJump, PAGE_EXECUTE_READWRITE, &old))
+    {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        why = "cannot unprotect the function";
+        return false;
+    }
+    SuspendOtherThreads(others);
+    std::memcpy(code, patch, kJump);
+    FlushInstructionCache(GetCurrentProcess(), code, kJump);
+    ResumeThreads(others);
+    VirtualProtect(code, kJump, old, &old);
+    *trampolineOut = tramp;
+    return true;
+}
+
+inline bool HookCudaLoaders(std::string& why)
+{
+    HMODULE nvcuda = LoadLibraryW(L"nvcuda.dll");
+    if (!nvcuda)
+    {
+        why = "nvcuda.dll cannot be loaded";
+        return false;
+    }
+    // The module-load functions are placeholders until the driver is initialised (cuInit is idempotent)
+    if (const auto init = reinterpret_cast<int(WINAPI*)(unsigned)>(GetProcAddress(nvcuda, "cuInit")); !init || init(0) != 0)
+    {
+        why = "cuInit failed";
+        return false;
+    }
+    struct Entry
+    {
+        const char* name;
+        void* hook;
+        void** original;
+    };
+    const Entry entries[] = {
+        { "cuModuleLoadData", reinterpret_cast<void*>(&hkCuModuleLoadData), reinterpret_cast<void**>(&o_cuModuleLoadData) },
+        { "cuModuleLoadFatBinary", reinterpret_cast<void*>(&hkCuModuleLoadFatBinary), reinterpret_cast<void**>(&o_cuModuleLoadFatBinary) },
+        { "cuModuleLoadDataEx", reinterpret_cast<void*>(&hkCuModuleLoadDataEx), reinterpret_cast<void**>(&o_cuModuleLoadDataEx) },
+        { "cuLibraryLoadData", reinterpret_cast<void*>(&hkCuLibraryLoadData), reinterpret_cast<void**>(&o_cuLibraryLoadData) },
+    };
+    std::vector<void*> done; // real functions already hooked (two exports can lead to one function)
+    for (const Entry& e : entries)
+    {
+        auto* function = reinterpret_cast<void*>(GetProcAddress(nvcuda, e.name));
+        if (!function)
+        {
+            why = std::string("nvcuda has no ") + e.name;
+            return false;
+        }
+        if (*e.original) // hooked by an earlier call
+            continue;
+        std::string one;
+        if (!InstallInlineHook(function, e.hook, e.original, one))
+        {
+            why = std::string(e.name) + ": " + one;
+            return false;
+        }
+    }
+    return true;
 }
 
 // RTX 20: every kernel container has to come out of the sm_75 rewrite now, at locate time. A container the rewrite cannot take would
@@ -677,12 +785,13 @@ inline Result Apply(const std::wstring& dir, Tier tier)
         // The CUDA rewrite is enabled before the patches are applied: the patched module advertises a feature whose kernels can only
         // load rewritten. The hooks pass everything through while the rewrite is not wanted.
         turingRewriteWanted.store(true, std::memory_order_release);
-        if (!HookGetProcAddressImport(g_ngx))
+        std::string hookWhy;
+        if (!HookCudaLoaders(hookWhy))
         {
             turingRewriteWanted.store(false, std::memory_order_release);
-            return fail("this DLSS-G build is not recognised by the unlock: its CUDA loader cannot be reached (no GetProcAddress import)");
+            return fail("this DLSS-G build is not recognised by the unlock: the CUDA module loaders cannot be reached (" + hookWhy + ")");
         }
-        Log("unlock: RTX 20: kernel32!GetProcAddress of OUR nvngx_dlssg points at the unlock; the CUDA module loaders are handed back as hooks (kernels are rewritten for sm_75)");
+        Log("unlock: RTX 20: nvcuda's module loaders (cuModuleLoadData/FatBinary/DataEx, cuLibraryLoadData) are hooked; only containers of OUR nvngx_dlssg are rewritten for sm_75, everything else passes through");
     }
 
     const auto ngxApplied = g_ngxSet.Apply(ngx.operations);
@@ -729,6 +838,8 @@ inline void LogAfterStart()
         return;
     ListModules(L"nvngx_dlssg.dll", g_ngx, "DLSS-G module:");
     ListModules(L"sl.xefg_dlss_g.dll", g_plugin, "plugin module:");
+    for (const wchar_t* n : { L"nvcuda.dll", L"nvapi64.dll", L"_nvngx.dll", L"nvngx.dll" })
+        ListModules(n, nullptr, "driver module:");
     bool ngxStill = false, plStill = false;
     Guarded([&] {
         ngxStill = g_ngxSet.StillApplied();
@@ -736,14 +847,14 @@ inline void LogAfterStart()
     });
     Log("unlock: patches still in place: nvngx_dlssg %s, sl.dlss_g %s", ngxStill ? "yes" : "no", plStill ? "yes" : "no");
     if (turingRewriteWanted.load())
-        Log("unlock: RTX 20 CUDA rewrite so far: %u module loads seen, %u from our module, %u containers rewritten to sm_75, %u left as shipped (hooks handed out: %u by name, %u through cuGetProcAddress)",
-            cudaSeen.load(), cudaInOurs.load(), cudaRewritten.load(), cudaLeft.load(), cudaViaProc.load(), cudaViaGet.load());
+        Log("unlock: RTX 20 CUDA rewrite so far: %u module loads seen, %u from our module, %u containers rewritten to sm_75, %u left as shipped (%u loads from other callers passed through)",
+            cudaSeen.load(), cudaInOurs.load(), cudaRewritten.load(), cudaLeft.load(), cudaOthers.load());
 }
 
 inline void LogCudaTotals()
 {
     if (g_done && turingRewriteWanted.load())
-        Log("unlock: RTX 20 CUDA rewrite: %u module loads seen, %u from our module, %u containers rewritten to sm_75, %u left as shipped (hooks handed out: %u by name, %u through cuGetProcAddress)",
-            cudaSeen.load(), cudaInOurs.load(), cudaRewritten.load(), cudaLeft.load(), cudaViaProc.load(), cudaViaGet.load());
+        Log("unlock: RTX 20 CUDA rewrite: %u module loads seen, %u from our module, %u containers rewritten to sm_75, %u left as shipped (%u loads from other callers passed through)",
+            cudaSeen.load(), cudaInOurs.load(), cudaRewritten.load(), cudaLeft.load(), cudaOthers.load());
 }
 } // namespace unlock

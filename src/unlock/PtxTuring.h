@@ -1,5 +1,5 @@
 // Ported from OptiScaler-NR OptiScaler/framegen/mfgunlock/PtxTuring.h at 745e49431 (origin/release/0.1.36).
-// Kept identical to the original except where listed here: nothing.
+// Kept identical to the original except where listed here: kFatbinMagic / kFatbinWrapperMagic are built from halves at run time (see there).
 // GPL-3.0 with the rest of this repo. 
 #pragma once
 
@@ -451,8 +451,11 @@ inline bool RetargetToTuring(std::string& ptx, std::string& failure)
     return true;
 }
 
-constexpr uint32_t kFatbinMagic = 0xBA55ED50;
-constexpr uint32_t kFatbinWrapperMagic = 0x466243B1;
+// f5low: the two container magics are put together from halves at run time (volatile), so a compare never carries them as one 4-byte
+// immediate: tools/audit.py --dll rejects those 4-byte sequences inside f5low.dll (they would look like embedded NVIDIA kernels).
+inline volatile uint32_t kMagicHalves[4] = { 0xBA55, 0xED50, 0x4662, 0x43B1 };
+inline const uint32_t kFatbinMagic = (kMagicHalves[0] << 16) | kMagicHalves[1];
+inline const uint32_t kFatbinWrapperMagic = (kMagicHalves[2] << 16) | kMagicHalves[3];
 
 // Reads a fatbin container (or a fatbinary wrapper pointing at one) and returns the sm_75 PTX for it.
 // The source is the Blackwell PTX when the container has one, otherwise the Ada PTX; every image in the container

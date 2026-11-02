@@ -3,7 +3,11 @@
 //
 // Routing: a dlssg context is its own kind of context at the XeFG entry-point level (xefg_cuda.cpp, next to the forwarding route);
 // it does not go through class Own or IPackGenerator. DlssgGenerator below is its IGenerator face: Caps() says whether it can run
-// on this GPU, and the host's selection (D3D12CreateContext) uses it to choose dlssg or fall back to own, with one log line.
+// on this GPU. There is NO fallback to the own generator: when dlssg cannot start, D3D12CreateContext reports status 3 with the
+// reason and returns an error.
+//
+// The unlock (unlock/Unlock.h): on RTX 20/30/40, OptiScaler's MFG unlock families are applied in memory to OUR copy of nvngx_dlssg and
+// sl.dlss_g before slInit, so DLSS-G offers 2x-6x there too; RTX 50 and newer need nothing.
 //
 // DLSS-G is driven through Streamline's public API (headers: NVIDIA's public Streamline SDK), the way the spike (tests/dlssg_spike.cpp)
 // proved it:
@@ -193,7 +197,7 @@ inline Streamline* GetLocked(const std::wstring& dir, int gpuSm, ID3D12Device* d
         s.marker = reinterpret_cast<PFun_slPCLSetMarker*>(mark);
         if (!s.getState || !s.setOptions || !s.reflexOptions || !s.marker)
         {
-            s.error = "DLSS-G, Reflex or PCL did not load (GPU below RTX 40, an old driver, or nvngx_dlssg.dll missing)";
+            s.error = "DLSS-G, Reflex or PCL did not load (an old driver, a plugin Streamline refused to load, or nvngx_dlssg.dll missing)";
             return nullptr;
         }
         // DLSS-G refuses to run without Reflex (eDLSSGStatusFailReflexNotDetectedAtRuntime)
