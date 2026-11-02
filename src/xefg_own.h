@@ -2039,24 +2039,31 @@ private:
         return Bound(f.base + (f.lead > 0 ? std::min(f.step, f.lead) : f.step) + static_cast<long long>(k - 1) * f.step, f.step);
     }
     // PaceLead=auto, after a generated frame's present (Show, schedule pacer): late = ms our own GPU work held it past its time.
-    // Late: the lead grows by that at once, at most to one step; a batch with none late eases it down (LeadEase).
-    void LeadAfterPresent(const Frame& f, double late)
+    void LeadAfterPresent(double late)
     {
         if (late > 0.5)
         {
             ++statLeadLate;
-            leadAnyLate = true;
-            if (paceLeadAuto)
-                leadMs = std::min(leadMs + late, static_cast<double>(f.step) * 1000.0 / freq());
+            leadFrameLate = std::max(leadFrameLate, late);
         }
     }
-    // Down by 1/32 of the way to the floor, at least 20 us, per batch: slow, since the cost of a late frame is a
-    // hitch, the cost of a lead too long is only latency.
-    void LeadEase()
+    // After an app frame's presents: what its lead should have been (its own plus the worst late plus a margin; 0 if none was late)
+    // goes into a window of the last kLeadWindow frames, and the lead follows the window's maximum: up at once, down by 1/16 of
+    // the way per app frame. A window, since one late frame must hold the lead for a few seconds: easing down right after it walked
+    // straight into the next late frame (harness 4K 2x60: 10 of 120 late). Capped at the frame's step.
+    void LeadEndFrame(const Frame& f)
     {
-        if (paceLeadAuto && !leadAnyLate && leadMs > kLeadFloor)
-            leadMs = std::max(kLeadFloor, leadMs - std::max(0.02, (leadMs - kLeadFloor) / 32));
-        leadAnyLate = false;
+        if (paceLeadAuto)
+        {
+            leadNeed[leadNeedAt++ % kLeadWindow] = leadFrameLate > 0 ? static_cast<double>(f.lead) * 1000.0 / freq() + leadFrameLate + kLeadMargin : 0.0;
+            leadNeedN = std::min(leadNeedN + 1, kLeadWindow);
+            leadRingMax = kLeadFloor;
+            for (size_t i = 0; i < leadNeedN; ++i)
+                leadRingMax = std::max(leadRingMax, leadNeed[i]);
+            const double target = std::min(leadRingMax, static_cast<double>(f.step) * 1000.0 / freq());
+            leadMs = target > leadMs ? target : std::max(target, leadMs - (leadMs - target) / 16);
+        }
+        leadFrameLate = 0;
     }
     // Half a step after the last present at the soonest, two steps after it at the latest: a frame the game handed over
     // after a stutter has its schedule set from that late frame, and it waited lag + a step more with its picture ready.
@@ -2398,7 +2405,7 @@ private:
             else
             {
                 if (f.lead > 0)
-                    LeadAfterPresent(f, late);
+                    LeadAfterPresent(late);
                 if (!D3d() && late > 0.5)   // not a hair's breadth, which undid the fall below every frame
                     paceLag = std::min(std::max(paceLag, f.lag + late), readyInterval * maxLag);
             }
@@ -2407,7 +2414,7 @@ private:
         }
 
         if (f.lead > 0 && !f.clock && !DisplayPaced(j))
-            LeadEase();
+            LeadEndFrame(f);
 
         // 3. The application's frame, and cur -> prev.
         {
@@ -3399,8 +3406,8 @@ private:
                  flipBatchMs, flipStatus, flipFeedback, flipCalls);
         statFlipMetered = 0;
         if (leadMs > 0)
-            XLog("stats: pace lead %.2f ms (%.2f - %.2f over the 120 app frames, %s), %u generated frames late", leadMs, leadMin, leadMax,
-                 paceLeadAuto ? "auto" : "fixed", statLeadLate);
+            XLog("stats: pace lead %.2f ms (%.2f - %.2f over the 120 app frames, %s, window max %.2f), %u generated frames late", leadMs,
+                 leadMin, leadMax, paceLeadAuto ? "auto" : "fixed", leadRingMax, statLeadLate);
         leadMin = 1e9;
         leadMax = 0;
         statLeadLate = 0;
@@ -4220,7 +4227,11 @@ private:
     static constexpr double kLeadStart = 3.0, kLeadFloor = 3.0;
     double leadMs = 0, leadMin = 1e9, leadMax = 0;
     unsigned statLeadLate = 0;
-    bool leadAnyLate = false;
+    double leadFrameLate = 0, leadRingMax = 0;      // the worst late of the batch in hand; the window's maximum (stats)
+    static constexpr size_t kLeadWindow = 128;
+    static constexpr double kLeadMargin = 1.0;
+    std::array<double, kLeadWindow> leadNeed {};
+    size_t leadNeedAt = 0, leadNeedN = 0;
     std::mutex paceMu;
     std::vector<PaceRec> paceRecs;
     // Flip metering (Meter, presenter thread); meteredFrame (app frame + 1 whose batch the driver meters) is read by the
