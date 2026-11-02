@@ -657,9 +657,9 @@ public:
         caps.name = "DLSS-G";
         caps.presentsItself = true;
         caps.anyGpu = false;
-        // NVIDIA's native maximum per architecture, before Streamline says (RTX 40: 2x; RTX 50: 4x). Create() replaces it with
-        // numFramesToGenerateMax once the real library has been asked.
-        caps.maxGenerated = gpuSm >= 100 ? 3 : 1;
+        // NVIDIA's native maximum per architecture, before Streamline says (RTX 40: 2x; RTX 50: numFramesToGenerateMax 5 with NVIDIA's
+        // 310.9 files, measured on an RTX 5070 Ti). The context creation replaces it with what the real library reports.
+        caps.maxGenerated = gpuSm >= 100 ? 5 : 1;
         if (gpuSm <= 0)
             Fail("DLSS-G needs an NVIDIA GPU (no CUDA device behind this adapter)");
         else if (gpuSm < 89)
