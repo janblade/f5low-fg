@@ -255,7 +255,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             else if (q.empty() && emptyAt && static_cast<double>(t - emptyAt) > 0.5 * sTicks)
                 sTicks *= 1.02;
         }
-        if (lastBurstStart && scproxy::g_enabled && EnvSet("SINK_TRACE2"))
+        if (lastBurstStart && Collect() && EnvSet("SINK_TRACE2"))
             fprintf(stdout, "sink: burst start +%.2f ms, blocked %d, queued %zu\n", static_cast<double>(t - lastBurstStart) * 1000.0 / Freq(), blocked ? 1 : 0, q.size());
         if (lastBurstStart && !blocked)
         {
@@ -547,7 +547,10 @@ public:
     void SetBurst(uint32_t count)
     {
         std::lock_guard<std::mutex> l(mu);
-        burst = count ? count : 1;
+        const uint32_t nb = count ? count : 1;
+        if (nb == burst)
+            return;         // the pacing state (interval, spacing) is only reset by a real change
+        burst = nb;
         curCount = 0;
         lastFull = false;
         lastBurstStart = 0;
@@ -624,6 +627,8 @@ public:
         }
         cvSpace.wait(l, [&] { return stop || q.size() < kMaxQueue; });
         Observe(arrived);
+        if (static const bool trace3 = Collect() && EnvSet("SINK_TRACE3"); trace3)    // tests: when each frame of a burst arrives
+            fprintf(stdout, "sink: arrive %.3f\n", static_cast<double>(arrived) * 1000.0 / Freq());
         q.push_back({ sync, flags, stable ? static_cast<UINT>(in % appBuffers) : static_cast<UINT>(in % kSlots) });
         ++in;
         maxDepth = (std::max)(maxDepth, q.size());
@@ -705,6 +710,7 @@ class SinkFactory final : public scproxy::LogFactory
 {
     SinkSwapChain* last = nullptr;
     const bool stable;
+    uint32_t burst = 1;     // under g_linkMu: the frames per application frame set last, so a chain made later starts with it
 
 public:
     // stableBuffers: for a library that takes its buffers once (DLSS-G through Streamline), see SinkSwapChain
@@ -728,8 +734,9 @@ public:
     void SetBurst(uint32_t count)
     {
         std::lock_guard<std::mutex> g(g_linkMu);
+        burst = count ? count : 1;
         if (last)
-            last->SetBurst(count);
+            last->SetBurst(burst);
     }
 
     HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* d, HWND w, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs,
@@ -763,6 +770,7 @@ public:
                 last->owner = nullptr;
             last = sink;
             sink->owner = &last;
+            sink->SetBurst(burst);      // a chain made after a SetBurst (a re-created chain) starts with the current burst
         }
         *s = sink;
         return h;

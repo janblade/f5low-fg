@@ -59,7 +59,7 @@ $samples = Join-Path $Work 'samples.txt'          # outside the scanned folders
 & $samplesExe $Lib $Dll $samples
 if ($LASTEXITCODE -ne 0) { throw 'pack_samples failed' }
 $parts = @((Join-Path $root 'recipe\i0\parts.json'), (Join-Path $root 'recipe\i0\hdr\parts.json'))
-$args1 = @('-I', (Join-Path $root 'tests\no_intel_on_disk.py'), '--samples', $samples, '--allow-name', 'f5low.dll', '--allow-name', 'libxess_fg.dll', '--allow-name', 'f5low_xefg_fg.dll', '--allow-name', 'f5low_xefg_ll.dll', '--allow-name', 'libxell.dll')
+$args1 = @('-I', (Join-Path $root 'tests\no_intel_on_disk.py'), '--samples', $samples, '--allow-name', 'f5low.dll', '--allow-name', 'libxess_fg.dll')
 foreach ($p in $parts) { $args1 += @('--parts', $p) }
 Write-Host 'files f5low left behind:'
 Get-ChildItem $a, $aLocal -Recurse -File | ForEach-Object { '  {0} ({1} bytes)' -f $_.FullName, $_.Length }
