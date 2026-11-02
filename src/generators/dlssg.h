@@ -662,8 +662,8 @@ public:
         caps.maxGenerated = gpuSm >= 100 ? 5 : 1;
         if (gpuSm <= 0)
             Fail("DLSS-G needs an NVIDIA GPU (no CUDA device behind this adapter)");
-        else if (gpuSm < 89)
-            Fail("DLSS-G needs RTX 40 or newer (RTX 20/30 come later)");
+        else if (gpuSm < 75)
+            Fail("DLSS-G needs RTX 20 or newer");
         else
             caps.available = true;
     }

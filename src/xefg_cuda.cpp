@@ -1297,9 +1297,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     const auto callStart = std::chrono::steady_clock::now();
     const PackRoute route = ResolvePack();
     // Generator=dlssg (generators/dlssg.h): DLSS-G through a private renamed Streamline, presenting into our sink. DlssgGenerator::Caps
-    // decides: below RTX 40, no NVIDIA GPU, Streamline missing or slInit failing -> one log line, a reason in f5lowGetStatus, and
-    // the own generator runs. XEFG_CUDA_FORWARD wins over everything (Intel's library does it all).
-    std::string note;           // in front of every status reason of the own route when dlssg was asked for and could not run
+    // decides: no NVIDIA GPU, below RTX 20, Streamline missing, the unlock not recognising this DLSS-G build or slInit failing ->
+    // one log line, status 3 with the reason, and an error from CreateContext. There is NO fallback to the own generator (user
+    // 2026-11-02: when the player picks DLSS-G it runs or frame generation is off with the reason shown; switching to XeFG Tensor
+    // is the player's choice, never automatic). XEFG_CUDA_FORWARD wins over everything (Intel's library does it all).
     const bool wantDlssg = !route.forward && d && ph && GeneratorRaw() == "dlssg";
     if (wantDlssg)
     {
@@ -1341,8 +1342,12 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 static_cast<void*>(*ph), c->sl->dir.c_str());
             return XEFG_SWAPCHAIN_RESULT_SUCCESS;
         }
-        note = std::string("dlssg unavailable: ") + dg.Caps().reason + " - ";
-        Log("f5low: generator dlssg not available (%s), running own", dg.Caps().reason);
+        // No own context is made. UNSUPPORTED_DEVICE is the XeFG API's "this GPU/driver cannot do it" and is what OptiScaler already
+        // treats as "frame generation unavailable"; the exact reason travels in f5lowGetStatus (status 3).
+        const std::string reason = std::string("dlssg unavailable: ") + dg.Caps().reason;
+        SetStatus(3, reason);
+        Log("f5low: generator dlssg not available (%s) - frame generation is off (no fallback to own)", dg.Caps().reason);
+        return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
     }
     std::string pack = route.forward ? std::string() : route.dir;
     std::string fwdReason;      // why this context forwards (f5lowGetStatus)
@@ -1416,10 +1421,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     {
         // a pack built on this PC runs on the D3D12 path only (the generator says so once, at its build)
         const std::string path = route.built() ? std::string("d3d12") : PathSetting();
-        auto o = xefgown::Own::Create(d, pack, path, wantDlssg ? std::string("own") : GeneratorSetting());
+        auto o = xefgown::Own::Create(d, pack, path, GeneratorSetting());
         if (!o)
         {
-            SetStatus(3, note + "own generator unavailable: the context could not be created");
+            SetStatus(3, "own generator unavailable: the context could not be created");
             return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
         }
         o->genMode = GenQueueSetting();
@@ -1459,24 +1464,24 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             if (deferred)
             {
                 // status 0 until the first build is done on its own thread; then 1 (or 3: a late failure, no way back to Intel's)
-                const uint64_t serial = SetStatus(0, note + "building its frame generator in the background");
+                const uint64_t serial = SetStatus(0, "building its frame generator in the background");
                 const std::string from = src;
                 o->packPoll = &PackPoll;
                 o->packFit = [have] { return FitReason(have, PackNeedSm(xefgpack::kBuiltDir)); };
                 o->onAbandoned = [serial] { SetStatusIf(serial, 0, "no context (destroyed before its generator was ready)"); };
-                o->deferredDone = [serial, from, note](bool ok, const std::string& why) {
+                o->deferredDone = [serial, from](bool ok, const std::string& why) {
                     if (ok)
                         Log("deferred first build: ready, generation can start");
                     else
                         Log("deferred first build: FAILED - passing frames through: %s", why.c_str());
                     if (ok)
-                        SetStatusIf(serial, 1, note + "own generator (" + from + "), D3D12");
+                        SetStatusIf(serial, 1, "own generator (" + from + "), D3D12");
                     else
-                        SetStatusIf(serial, 3, note + (why.compare(0, 25, "own generator unavailable") == 0 ? why : "own generator unavailable: " + why));
+                        SetStatusIf(serial, 3, (why.compare(0, 25, "own generator unavailable") == 0 ? why : "own generator unavailable: " + why));
                 };
             }
             else
-                SetStatus(1, note + "own generator (" + src + "), D3D12");
+                SetStatus(1, std::string("own generator (") + src + "), D3D12");
         }
         Log("D3D12CreateContext device=%p -> own h=%p, pack %s (needs sm_%d, GPU sm_%d), path %s, early %d, pacer %s%s (CUDA path), max lag "
             "%.2f, max delay %.2f app frames",
@@ -1484,15 +1489,15 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             o->clockPacer ? "clock" : "schedule", o->gate ? " + gate" : "", o->maxLag, o->maxDelay);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    const std::string fwdText = note + (fwdReason.empty() ? "forwarding to Intel XeFG" : fwdReason);
+    const std::string fwdText = fwdReason.empty() ? std::string("forwarding to Intel XeFG") : fwdReason;
     if (!Real("xefgSwapChainD3D12CreateContext"))
-        SetStatus(3, note + (fwdReason.empty() ? "libxess_fg.dll not found, nothing to forward to"
-                                               : fwdReason + "; libxess_fg.dll not found"));
+        SetStatus(3, fwdReason.empty() ? std::string("libxess_fg.dll not found, nothing to forward to")
+                                       : fwdReason + "; libxess_fg.dll not found");
     else if (d && ph)
         SetStatus(2, fwdText);
     FORWARD(xefgSwapChainD3D12CreateContext, d, ph);
     if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS && d && ph && Real("xefgSwapChainD3D12CreateContext"))
-        SetStatus(3, note + "Intel XeFG CreateContext failed (" + std::to_string(static_cast<int>(r)) + ") after hand-over: " + fwdText);
+        SetStatus(3, "Intel XeFG CreateContext failed (" + std::to_string(static_cast<int>(r)) + ") after hand-over: " + fwdText);
     Log("D3D12CreateContext device=%p -> %d h=%p", static_cast<void*>(d), r, ph ? static_cast<void*>(*ph) : nullptr);
     return r;
 }
