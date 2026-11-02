@@ -27,6 +27,7 @@
 #include "../generator.h"
 #include "../sink/sink.h"
 #include "dlssg_files.h"
+#include "../unlock/Unlock.h"
 
 #include <sl.h>
 #include <sl_dlss_g.h>
@@ -89,16 +90,16 @@ inline void SlLog(sl::LogType type, const char* msg)
 // Loads and initialises Streamline from `dir` (the renamed folder, dlssg_files.h) on the first call and hands it `dev`. Null with the
 // reason in `why`. A later call with another folder keeps the first (one Streamline per process).
 inline Streamline g_sl;
-inline Streamline* GetLocked(const std::wstring& dir, ID3D12Device* dev);
-inline Streamline* Get(const std::wstring& dir, ID3D12Device* dev, std::string& why)
+inline Streamline* GetLocked(const std::wstring& dir, int gpuSm, ID3D12Device* dev);
+inline Streamline* Get(const std::wstring& dir, int gpuSm, ID3D12Device* dev, std::string& why)
 {
     std::lock_guard<std::mutex> lk(g_slMu);
-    Streamline* s = GetLocked(dir, dev);
+    Streamline* s = GetLocked(dir, gpuSm, dev);
     if (!s)
         why = g_sl.error.empty() ? "a second D3D12 device (Streamline keeps the first)" : g_sl.error;
     return s;
 }
-inline Streamline* GetLocked(const std::wstring& dir, ID3D12Device* dev)
+inline Streamline* GetLocked(const std::wstring& dir, int gpuSm, ID3D12Device* dev)
 {
     Streamline& s = g_sl;
     static bool tried = false;
@@ -113,6 +114,24 @@ inline Streamline* GetLocked(const std::wstring& dir, ID3D12Device* dev)
                 s.error = Narrow(plain) + " in the Streamline folder " + Narrow(dir) + " - plain names are never loaded";
                 return nullptr;
             }
+        // The unlock (unlock/Unlock.h): OptiScaler's MFG unlock families, applied in memory to OUR copy of nvngx_dlssg and sl.dlss_g, which
+        // are loaded here by full path BEFORE slInit so Streamline gets the patched modules. RTX 50 and newer: nothing to patch. No
+        // fallback: a build the families do not recognise fails below RTX 50 with the reason (status 3).
+        {
+            unlock::g_log = g_log;
+            unlock::Tier tier;
+            if (unlock::TierOfSm(gpuSm, tier) != 0)
+            {
+                s.error = "DLSS-G needs an RTX 20 or newer GeForce (this GPU is sm_" + std::to_string(gpuSm) + ")";
+                return nullptr;
+            }
+            const unlock::Result u = unlock::Apply(dir, tier);
+            if (!u.ok)
+            {
+                s.error = u.reason;
+                return nullptr;
+            }
+        }
         s.m = LoadLibraryW(longpath::Plain(dir + L"\\xefg_slinterposer.dll").c_str());
         if (!s.m)
         {
@@ -606,9 +625,9 @@ inline uint32_t BeforePresent(Ctx& c)
 }
 
 // A DLSS-G context for `dev`, or null with the reason in `why`.
-inline std::shared_ptr<Ctx> Create(ID3D12Device* dev, const std::wstring& dir, std::string& why)
+inline std::shared_ptr<Ctx> Create(ID3D12Device* dev, const std::wstring& dir, int gpuSm, std::string& why)
 {
-    Streamline* s = Get(dir, dev, why);
+    Streamline* s = Get(dir, gpuSm, dev, why);
     if (!s)
         return nullptr;
     LUID luid = dev->GetAdapterLuid();
@@ -631,12 +650,14 @@ inline std::shared_ptr<Ctx> Create(ID3D12Device* dev, const std::wstring& dir, s
         c->maxGen = st.numFramesToGenerateMax;
     if (g_log)
         g_log("dlssg: at create, DLSS-G's maximum %u (state %d)", st.numFramesToGenerateMax, static_cast<int>(r));
+    unlock::LogAfterStart();
     return c;
 }
 
 // F5LOW_SINK_STATS=1 (tests): the sink's statistics into the log, once the context is gone
 inline void LogSinkStats()
 {
+    unlock::LogCudaTotals();
     if (!g_log || !xsink::g_stats)
         return;
     for (const std::string& t : xsink::StatsLines())
@@ -657,13 +678,16 @@ public:
         caps.name = "DLSS-G";
         caps.presentsItself = true;
         caps.anyGpu = false;
-        // NVIDIA's native maximum per architecture, before Streamline says (RTX 40: 2x; RTX 50: numFramesToGenerateMax 5 with NVIDIA's
-        // 310.9 files, measured on an RTX 5070 Ti). The context creation replaces it with what the real library reports.
-        caps.maxGenerated = gpuSm >= 100 ? 5 : 1;
+        // 5 (6x) on every tier: native on RTX 50 (numFramesToGenerateMax 5 with NVIDIA's 310.9 files, measured on an RTX 5070 Ti), and
+        // after the unlock (unlock/Unlock.h) on RTX 20/30/40. The context creation replaces it with what the real library reports.
+        caps.maxGenerated = 5;
+        unlock::Tier tier;
         if (gpuSm <= 0)
             Fail("DLSS-G needs an NVIDIA GPU (no CUDA device behind this adapter)");
         else if (gpuSm < 75)
             Fail("DLSS-G needs RTX 20 or newer");
+        else if (unlock::TierOfSm(gpuSm, tier) != 0)
+            Fail("DLSS-G is not supported on this NVIDIA GPU (sm_" + std::to_string(gpuSm) + "; GeForce RTX 20 to 50 only)");
         else
             caps.available = true;
     }

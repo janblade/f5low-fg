@@ -1306,7 +1306,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     {
         xdlssg::g_log = XLog;
         xsink::g_stats = xsink::EnvSet("F5LOW_SINK_STATS");     // tests: the sink's statistics into the log
-        xefgown::DlssgGenerator dg(GpuSm(d));
+        const int gpuSm = GpuSm(d);
+        xefgown::DlssgGenerator dg(gpuSm);
         std::wstring dir;
         if (dg.Caps().available)
         {
@@ -1323,7 +1324,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         if (dg.Caps().available)
         {
             std::string why;
-            c = xdlssg::Create(d, dir, why);
+            c = xdlssg::Create(d, dir, gpuSm, why);
             if (c)
                 dg.SetMax(c->maxGen);
             else
