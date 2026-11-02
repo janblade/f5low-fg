@@ -14,6 +14,10 @@ Flags, per file:
   rva       a hex number on a line that says RVA / offset into the vendor image
   bytes     a run of 24+ byte literals (0x.., 0x.., ...): a byte pattern
   entropy   a file over 64 KB at more than 7.5 bits per byte (compressed or encrypted data)
+  nvidia    NVIDIA module content: a file named like one of NVIDIA's modules (nvngx_*, sl.*.dll, the renamed Streamline copies
+            of the dlssg generator), a CUDA fatbin (magic 0xBA55ED50, or the fatbin wrapper 0x466243B1), an .nv_fatb PE
+            section or the nvFatbin API's name inside a non-text file. The dlssg generator copies the player's own NVIDIA files
+            at run time; none of them (and nothing derived from them) is ever committed or compiled in.
 
 A finding the rule allows anyway goes in tools/audit_allow.txt as "<path>:<check>  <reason>"; keep it short.
 """
@@ -37,7 +41,11 @@ MAGICS = {
     bytes.fromhex("7f454c46"): "ELF image",
     bytes.fromhex("50ed55ba"): "CUDA fatbin",
     b"XFPK" + bytes.fromhex("01000000"): "embedded pack",
+    bytes.fromhex("b1436246"): "CUDA fatbin wrapper",
 }
+# NVIDIA module content (the "nvidia" check): file names, and section / API names inside binary files
+RE_NV_NAME = re.compile(r"(^|/)(nvngx_[^/]*|nvngx\.[^/]*|sl\.[^/]*\.dll|sl\.xefg_[^/]*|xefg_slinterposer\.dll|nvapi64?\.dll|nvcuda\.dll)$", re.I)
+NV_BIN_MARKERS = (b".nv_fatb", b"nvFatbin", b"__nv_fatbin", b".nv.info")
 # DXBC: the signature, a 16-byte digest, then version 1.0 (the bare word is fine in docs)
 RE_DXBC = re.compile(b"DXBC.{16}" + re.escape(bytes.fromhex("01000000")), re.S)
 
@@ -80,11 +88,15 @@ def check_file(path: str, rel: str):
     ext = os.path.splitext(rel)[1].lower()
     if ext in BAD_EXT:
         found.append(("ext", f"file type {ext}"))
+    if RE_NV_NAME.search(rel.replace("\\", "/")):
+        found.append(("nvidia", "file named like an NVIDIA module"))
     with open(path, "rb") as f:
         data = f.read()
     if is_pe(data):
         found.append(("magic", "PE image"))
     found += [("magic", what) for what in containers(data)]
+    if ext not in TEXT_EXT:
+        found += [("nvidia", f"{m.decode()} in a binary file") for m in NV_BIN_MARKERS if m in data]
     if len(data) > 64 * 1024:
         e = entropy(data)
         if e > 7.5:
@@ -201,6 +213,9 @@ def audit_dll(path, own_blobs=None):
             found.append(f"DXBC container at 0x{m.start():x} ({size} bytes), not one we compile")
     if data.count(b"DXIL") > DLL_TOLERATED["DXIL"]:
         found.append("DXIL part")
+    for m in NV_BIN_MARKERS:
+        if m in data:
+            found.append(f"NVIDIA {m.decode()} (fatbin section / API name)")
     # A compressed payload (an embedded pack is LZMS, which hides every signature) reads as noise: code and data
     # sections stay well under 7.5 bits per byte in 64 KB windows.
     win = 64 * 1024
@@ -244,8 +259,19 @@ def self_test():
         "a/sites.h": (b"constexpr uint32_t kSite = 0x18C469; // RVA of the ceiling check\n", {"rva"}),
         "a/pat.h": (b"const unsigned char p[] = {" + b"0x90, " * 30 + b"};\n", {"bytes"}),
         "a/blob.dat": (os.urandom(80 * 1024), {"entropy"}),
+        # NVIDIA content (planted files, never real ones)
+        "a/nvngx_dlssg.dll": (b"MZ", {"ext", "nvidia"}),
+        "a/streamline/sl.dlss_g.dll": (b"MZ", {"ext", "nvidia"}),
+        "a/streamline/sl.xefg_pcl.dll": (b"MZ", {"ext", "nvidia"}),
+        "a/nvngx_note.txt": (b"just a name", {"nvidia"}),
+        "a/fatbin.dat": (b"\x00\x00" + bytes.fromhex("50ed55ba") + b"\x00\x00", {"magic"}),
+        "a/wrapper.dat": (b"\x00" + bytes.fromhex("b1436246") + b"\x00", {"magic"}),
+        "a/sec.dat": (b"\x00\x01.nv_fatb\x00\x01", {"nvidia"}),
+        "a/api.dat": (b"\x00nvFatbinCreate\x00", {"nvidia"}),
     }
-    clean = {"b/ok.md": b"No DXBC, DXIL or XFPK packs in here.\n",
+    clean = {"b/ok.md": b"No DXBC, DXIL or XFPK packs in here. The dlssg generator copies nvngx_dlssg.dll and sl.dlss_g.dll at run time.\n"
+                        b"A text file may name .nv_fatb and nvFatbin without being one.\n",
+             "b/dlssg_files.h": b"constexpr const wchar_t* k = L\"nvngx_dlssg.dll\";\n",
              "b/ok.cpp": b"// SHA-256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
                          b"uint32_t mask = 0x80808080; int x = 0x10;\n"}
     ok = True
@@ -295,7 +321,12 @@ def self_test():
                  ("the bundle magic as a code constant is no bundle", b"MZ" + b"F5OWN1\n\0\0" + ptx_own, own_list, False),
                  ("decoder constants (3 zstd magics) pass", b"MZ" + (bytes.fromhex("28b52ffd") + bytes(8)) * 3, own_list, False),
                  ("a zstd payload (40 frames) fails", b"MZ" + (bytes.fromhex("28b52ffd") + bytes(8)) * 40, own_list, True),
-                 ("compressed payload fails",b"MZ" + os.urandom(200 * 1024), own_list, True)]
+                 ("compressed payload fails",b"MZ" + os.urandom(200 * 1024), own_list, True),
+                 ("a CUDA fatbin fails", b"MZ" + b"\x00" + bytes.fromhex("50ed55ba") + b"\x00", own_list, True),
+                 ("a CUDA fatbin wrapper fails", b"MZ" + b"\x00" + bytes.fromhex("b1436246") + b"\x00", own_list, True),
+                 ("an .nv_fatb section fails", b"MZ" + b"\x00.nv_fatb\x00", own_list, True),
+                 ("the nvFatbin API name fails", b"MZ" + b"\x00nvFatbinAddPTX\x00", own_list, True),
+                 ("a DLL with only wide file names (nvngx_dlssg.dll) passes", b"MZ" + "nvngx_dlssg.dll".encode("utf-16-le"), own_list, False)]
         for name, data, lst, want_fail in cases:
             with open(dll, "wb") as f:
                 f.write(data)

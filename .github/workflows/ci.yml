@@ -21,6 +21,16 @@ jobs:
           sparse-checkout: inc/xess_fg
           sparse-checkout-cone-mode: false
 
+      # NVIDIA's public Streamline SDK, headers only (MIT; the version OptiScaler pins). The dlssg generator compiles against them;
+      # Streamline itself (sl.*.dll, nvngx_dlssg.dll) is the player's own and never part of the build.
+      - uses: actions/checkout@v5
+        with:
+          repository: NVIDIA-RTX/Streamline
+          ref: v2.11.1
+          path: _streamline
+          sparse-checkout: /include/
+          sparse-checkout-cone-mode: false
+
       - name: Audit self test
         run: python tools/audit.py --self-test
 
@@ -35,7 +45,7 @@ jobs:
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-          ./build.ps1 -VsPath $vs -XessInc "$PWD\_xess\inc\xess_fg"
+          ./build.ps1 -VsPath $vs -XessInc "$PWD\_xess\inc\xess_fg" -StreamlineInc "$PWD\_streamline\include"
 
       - name: Audit the DLL (only what we compile in)
         run: python tools/audit.py --dll build/f5low.dll

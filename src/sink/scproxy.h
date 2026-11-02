@@ -145,7 +145,7 @@ inline void Summary(FILE* out)
     }
     GapStats(out, "gaps between the library's Present calls", g_presentGaps);
     for (const auto& [name, e] : g_ms)
-        fprintf(out, "time in %-28s total %9.3f ms  avg %8.4f ms  worst %8.3f ms\n", name.c_str(), e.first, e.first / g_count[name], e.second);
+        fprintf(out, "time in %-28s total %9.3f ms  avg %8.4f ms  worst %8.3f ms\n", name.c_str(), e.first, g_count[name] ? e.first / g_count[name] : 0.0, e.second);
     if (g_log)
         fclose(g_log), g_log = nullptr;
     g_done = true;
