@@ -502,7 +502,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 std::lock_guard<std::mutex> l(g_outMu);
                 g_outGaps.push_back(static_cast<double>(t - lastRelease) * 1000.0 / Freq());
             }
-            if (Collect())
+            if (Collect() && EnvSet("XEFG_CUDA_PACELOG"))
             {
                 std::lock_guard<std::mutex> l(g_outMu);
                 g_outTimes.push_back(static_cast<double>(t) * 1000.0 / Freq());

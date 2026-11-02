@@ -840,7 +840,7 @@ int main(int argc, char** argv)
                 fps = scn.stepFps;
             if (!due.QuadPart || nowT.QuadPart - due.QuadPart > fq.QuadPart / 4)
                 due = nowT;
-            due.QuadPart += static_cast<LONGLONG>(static_cast<double>(fq.QuadPart) / fps);
+            due.QuadPart += static_cast<LONGLONG>(static_cast<double>(fq.QuadPart) / (std::max)(fps, 1.0));
             if (scn.hitchFrame >= 0 && on && inOn == scn.hitchFrame)
                 due.QuadPart += static_cast<LONGLONG>(scn.hitchMs * static_cast<double>(fq.QuadPart) / 1000.0);
             // the jitter moves this frame's wake-up, not the schedule: no drift

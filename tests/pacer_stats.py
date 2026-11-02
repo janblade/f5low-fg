@@ -10,7 +10,7 @@
       reads <outdir>/results.jsonl, writes results.csv and results.md (one table per generator and scenario).
 
 Own generator, from the "pace:" records (t = the present's time, QPC ms; ready = the app frame's ready stamp):
-  gaps      = time between consecutive presents (dropped ones are not presents), app frames after --skip, three last left out
+  gaps      = time between consecutive presents, app frames after --skip, three last left out
   lat_last  = per app frame: time its LAST present (the app's own frame) went out - its ready stamp
   lat_first = per app frame: time its FIRST presented generated frame went out - its ready stamp
 dlssg: the sink lists only present times. Gaps are exact; latency is approximate - presents are grouped in bursts of `mult` and
@@ -60,7 +60,7 @@ def own_metrics(text, skip):
         return {"notes": "no pace: lines (PaceLog=1 and XEFG_CUDA_LOG=1; did the own generator run?)"}
     frames = sorted({r[1] for r in recs})
     keep = set(frames[skip:-3]) if len(frames) > skip + 3 else set(frames)
-    shown = sorted((r for r in recs if "drop" not in r[6] and r[1] in keep), key=lambda r: r[0])
+    shown = sorted((r for r in recs if r[1] in keep), key=lambda r: r[0])
     gaps = [b[0] - a[0] for a, b in zip(shown, shown[1:])]
     out = gap_stats(gaps)
     by = {}
@@ -70,7 +70,7 @@ def own_metrics(text, skip):
     for f, rs in by.items():
         if f not in keep:
             continue
-        ok = [r for r in rs if "drop" not in r[6]]
+        ok = rs
         total = rs[0][3]
         real = [r for r in ok if r[2] == total]
         gen = sorted((r for r in ok if r[2] < total), key=lambda r: r[2])
@@ -80,9 +80,7 @@ def own_metrics(text, skip):
             first.append(gen[0][0] - gen[0][4])
     out.update({"lat_last_mean": mean(last), "lat_last_p99": pct(last, 0.99), "lat_first_mean": mean(first), "lat_first_p99": pct(first, 0.99)})
     kr = [r for r in recs if r[1] in keep]
-    out["cuts"] = sum(1 for r in kr if "cut" in r[6])
-    out["drops"] = sum(1 for r in kr if "drop" in r[6])
-    out["late_pct"] = 100.0 * sum(1 for r in kr if "late" in r[6] and "drop" not in r[6]) / max(1, len(kr))
+    out["late_pct"] = 100.0 * sum(1 for r in kr if "late" in r[6]) / max(1, len(kr))
     out["frames"] = len(keep)
     return out
 
@@ -121,7 +119,6 @@ def dlssg_metrics(text, app_text, mult, skip):
             out.update({"lat_last_mean": mean(best[0]), "lat_last_p99": pct(best[0], 0.99), "lat_first_mean": mean(best[1]),
                         "lat_first_p99": pct(best[1], 0.99)})
             out["notes"] = f"dlssg latency approximate (burst shift {best[2]:+d}, from the app's Present call)"
-    out["cuts"] = out["drops"] = 0
     return out
 
 
@@ -178,7 +175,7 @@ def cmd_run(argv):
 
 
 COLS = ["gen", "scenario", "mult", "config", "exit", "gap_n", "gap_mean", "gap_sd", "gap_p99", "gap_max", "hitch2x", "lat_last_mean",
-        "lat_last_p99", "lat_first_mean", "lat_first_p99", "cuts", "drops", "late_pct", "pm_n", "pm_mean", "pm_sd", "pm_p99", "pm_max",
+        "lat_last_p99", "lat_first_mean", "lat_first_p99", "late_pct", "pm_n", "pm_mean", "pm_sd", "pm_p99", "pm_max",
         "pm_shown_pct", "probe", "notes"]
 
 
@@ -200,8 +197,8 @@ def cmd_report(argv):
     keys = sorted({(r["gen"], r["scenario"]) for r in rows}, key=lambda k: (k[0], k[1]))
     for gen, sc in keys:
         md += [f"## {gen} - {sc}", "",
-               "| mult | config | gap sd | p99 | max | >2x | d sd | lat last | d last | lat 1st | d 1st | cuts | drops | late% | pm sd | pm p99 | shown% | notes |",
-               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+               "| mult | config | gap sd | p99 | max | >2x | d sd | lat last | d last | lat 1st | d 1st | late% | pm sd | pm p99 | shown% | notes |",
+               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         sub = [r for r in rows if r["gen"] == gen and r["scenario"] == sc]
         for r in sorted(sub, key=lambda r: (r["mult"], r["config"] != "off", r["config"])):
             base = next((b for b in sub if b["mult"] == r["mult"] and b["config"] == "off"), None)
@@ -211,10 +208,10 @@ def cmd_report(argv):
                     return ""
                 return f"{r[key] - base[key]:+.2f}"
 
-            md.append("| {}x | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            md.append("| {}x | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 r["mult"], r["config"], f(r.get("gap_sd")), f(r.get("gap_p99")), f(r.get("gap_max")), f(r.get("hitch2x"), 0),
                 dl("gap_sd"), f(r.get("lat_last_mean")), dl("lat_last_mean"), f(r.get("lat_first_mean")), dl("lat_first_mean"),
-                f(r.get("cuts"), 0), f(r.get("drops"), 0), f(r.get("late_pct"), 1), f(r.get("pm_sd")), f(r.get("pm_p99")),
+                f(r.get("late_pct"), 1), f(r.get("pm_sd")), f(r.get("pm_p99")),
                 f(r.get("pm_shown_pct"), 1), r.get("notes", "") if int(r.get("exit") or 0) == 0 else "exit " + str(r["exit"]) + " " + r.get("notes", "")))
         md.append("")
     (d / "results.md").write_text("\n".join(md), encoding="utf-8")

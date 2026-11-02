@@ -16,8 +16,9 @@
 # -Path / -Gate  the own generator's run path and Gate=: the clock pacer runs on -Path cuda (Show) and with -Gate 1 (release thread);
 #             -Path d3d12 -Gate 0 (default) uses the schedule pacer, the only one PaceLead acts in.
 # -DlssgPath  folder with Streamline + nvngx_dlssg (XEFG_CUDA_DLSSGPATH) for -Gens dlssg.
-# PresentMon (H:\Tools\PresentMon, else on PATH) is used when found, if the session may start an ETW trace (administrator or the
-# Performance Log Users group); -NoPresentMon skips it. Needs Python for the analysis (python -I tests\pacer_stats.py).
+# PresentMon (-PresentMon <exe>, default H:\Tools\PresentMon\PresentMon-2.6.0-x64.exe, else presentmon on PATH) is used when found, if
+# the session may start an ETW trace (administrator or the Performance Log Users group); -NoPresentMon skips it. It runs with
+# --stop_existing_session: any other PresentMon/ETW session of the machine is ended by every run. Needs Python for the analysis (python -I tests\pacer_stats.py).
 #
 # Output (-Out, default build\pacer_ab\<stamp>): runs\<id>\{f5low.log, repro.out.txt, presentmon.csv}, results.jsonl, results.csv,
 # results.md. Every run is analysed as soon as it ends (python -I tests\pacer_stats.py run ...); `report <Out>` rebuilds the tables.
@@ -33,6 +34,7 @@ param([Parameter(Mandatory)][string]$Dll,
       [int]$Gate = 0,
       [string]$DlssgPath = '',
       [string]$Python = 'python',
+      [string]$PresentMon = 'H:\Tools\PresentMon\PresentMon-2.6.0-x64.exe',
       [switch]$NoPresentMon,
       [switch]$DryRun)
 $ErrorActionPreference = 'Stop'
@@ -49,7 +51,7 @@ $fbLog = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'f5low\f5low.log' 
 
 $pm = $null
 if (-not $NoPresentMon) {
-    $pm = @('H:\Tools\PresentMon\PresentMon-2.6.0-x64.exe', (Get-Command presentmon -ErrorAction SilentlyContinue).Source) |
+    $pm = @($PresentMon, (Get-Command presentmon -ErrorAction SilentlyContinue).Source) |
         Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 }
 
