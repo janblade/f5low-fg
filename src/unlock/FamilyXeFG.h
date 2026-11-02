@@ -324,6 +324,17 @@ inline Report Locate(const ImageView& xeFgImage, const ImageView& xeLlImage, uin
     return report;
 }
 
+// XL1 as another component left it: the same site already holding the byte this family would write (`count`), e.g. OptiScaler's own MFG
+// unlock on the shared libxell. Found once or not at all (state, rva of the pattern's start). Only XL1 may be treated this way: a
+// libxess_fg whose sites are already patched may have contexts sized by the old ceiling.
+inline LocateResult LocateXellLifted(const ImageView& xeLlImage, uint8_t count)
+{
+    char bytes[6] = "\x83\xFB\x00\x76\x07";
+    bytes[2] = static_cast<char>(count);
+    const MaskedPattern pattern { std::string_view(bytes, 5), "xxxxx" };
+    return FindUniqueFromExportThunk(xeLlImage, "xellSetGeneratedFramesCount", pattern);
+}
+
 inline std::vector<PatchOperation> BuildOperations(const Report& report, const ImageView& xeFgImage,
                                                    const ImageView& xeLlImage)
 {

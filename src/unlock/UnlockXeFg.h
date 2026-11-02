@@ -4,7 +4,7 @@
 // handles passed in is never touched. XL1 (libxell) only lifts the refusal of generated-frame counts above 3.
 //
 // Order matters (evidence 2026-11-03): Intel sizes every per-generated-frame buffer from U3 (the default interpolation ceiling) when
-// the context / model is CREATED, so Apply must run right after the private copy is loaded and before the first xefgSwapChain* call
+// the context / model is CREATED, so Apply must run right after f5low loaded the library and before the first xefgSwapChain* call
 // on it. All or none: nothing is written unless all six sites were found uniquely with the bytes expected; an unknown build is
 // refused with the reason (which site, in which state).
 #pragma once
@@ -23,6 +23,7 @@ struct Result
     bool ok = false;        // the six sites were patched
     uint8_t count = 0;      // interpolated frames the unlock allows (5 = 6x)
     std::string reason;     // when !ok: why (the first site that did not locate, or what was missing)
+    bool xl1Lifted = false; // XL1 was already in place (another component), only the libxess_fg sites were written
     bool fatal = false;     // a write failed and could not be undone: the modules are partially patched, the library must not run
 };
 
@@ -55,15 +56,54 @@ inline Result Apply(HMODULE fg, HMODULE ll, int count)
     for (const auto& p : report.patches)
         detail::Log("unlock: XeFG: %s (%s): %s", p.name.c_str(), p.module == MfgUnlock::FamilyXeFG::Module::XeFG ? "libxess_fg" : "libxell",
                     std::string(MfgUnlock::FamilyXeFG::LocateStateName(p.state)).c_str());
+    // XL1 (and only XL1) already holding the byte we would write: another component lifted libxell's gate (OptiScaler's own MFG unlock on
+    // the shared libxell). Nothing to write there; the rest of the unlock goes on. A libxess_fg already patched is never accepted.
+    bool xl1Lifted = false;
+    if (!report.Complete())
+    {
+        size_t missing = 0, xl1 = report.patches.size();
+        for (size_t i = 0; i < report.patches.size(); ++i)
+            if (report.patches[i].state != MfgUnlock::LocateState::Found)
+            {
+                ++missing;
+                if (report.patches[i].module == MfgUnlock::FamilyXeFG::Module::XeLL)
+                    xl1 = i;
+            }
+        if (missing == 1 && xl1 < report.patches.size())
+        {
+            MfgUnlock::LocateResult lifted {};
+            if (detail::Guarded([&] { lifted = MfgUnlock::FamilyXeFG::LocateXellLifted(llImage, n); }) && lifted.state == MfgUnlock::LocateState::Found)
+            {
+                auto& p = report.patches[xl1];
+                p.state = MfgUnlock::LocateState::Found;
+                p.rva = lifted.rva + 2;
+                p.expected = p.replacement;
+                report.failure.clear();
+                xl1Lifted = true;
+                detail::Log("unlock: XeFG: XL1 already lifted by another component (libxell holds count %u already) - not written", n);
+                if (!detail::Guarded([&] { ops = MfgUnlock::FamilyXeFG::BuildOperations(report, fgImage, llImage); }))
+                    return fail("provider memory could not be read while locating");
+            }
+        }
+    }
     if (!report.Complete())
         return fail("this libxess_fg / libxell build is not recognised by the unlock: " + report.failure);
     if (ops.size() != report.patches.size())
         return fail("could not build the patch transaction");
-    // F5LOW_TEST_XEFG_SKIP=U4 (tests only): leaves the named site (by the start of its name) unpatched, to see what it changes
     std::vector<std::string> names;
     for (const auto& p : report.patches)
         names.push_back(p.name);
-    if (char skip[16]; GetEnvironmentVariableA("F5LOW_TEST_XEFG_SKIP", skip, sizeof(skip)) && skip[0])
+    if (xl1Lifted)
+        for (size_t i = ops.size(); i-- > 0;)
+            if (report.patches[i].module == MfgUnlock::FamilyXeFG::Module::XeLL)
+            {
+                ops.erase(ops.begin() + static_cast<std::ptrdiff_t>(i));
+                names.erase(names.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+    // F5LOW_TEST_XEFG_SKIP=U4 (tests only): leaves the named site (by the start of its name) unpatched, to see what it changes
+    char skip[16] = {};
+    const DWORD skipLen = GetEnvironmentVariableA("F5LOW_TEST_XEFG_SKIP", skip, sizeof(skip));
+    if (skipLen > 0 && skipLen < sizeof(skip))
     {
         for (size_t i = ops.size(); i-- > 0;)
             if (names[i].compare(0, strlen(skip), skip) == 0)
@@ -83,6 +123,7 @@ inline Result Apply(HMODULE fg, HMODULE ll, int count)
     }
     res.ok = true;
     res.count = n;
+    res.xl1Lifted = xl1Lifted;
     detail::Log("unlock: XeFG: applied, up to %u interpolated frames (%ux), in memory in libxess_fg / libxell", n, n + 1u);
     return res;
 }

@@ -4,7 +4,7 @@
 //   1. every site (U1-U5, XL1) is found exactly once, and Locate changes nothing (the module is byte-identical = the "unlock off" state);
 //   2. the patch plan's expected bytes are what the file holds and the replacements carry the requested count;
 //   3. Apply (count 5) changes exactly the planned bytes, nothing else in either image;
-//   4. a second Apply on the patched modules is refused (unknown shape), nothing further changes; counts outside 3..5 are refused.
+//   4. a second Apply on the patched modules is refused (unknown shape), nothing further changes; counts outside 3..5 are refused; a libxell already holding the count (XL1 lifted by another component) is accepted.
 // This patches inside Intel's DLLs in memory (the test's own mapping only).
 #include "../src/unlock/UnlockXeFg.h"
 
@@ -122,6 +122,47 @@ int wmain(int argc, wchar_t** argv)
     // 4
     const unlock::xefg::Result b = unlock::xefg::Apply(fg, ll, 5);
     Check(!b.ok && Snap(fg) == fg1 && Snap(ll) == ll1, "a second Apply is refused and changes nothing");
+    // 5. XL1 already holding the count another component wrote (OptiScaler's own unlock on the shared libxell): treated as applied, not
+    //    rewritten, the libxess_fg sites still patched; a libxell holding another count (4) is refused and nothing is written.
+    {
+        const auto mapCopy = [&](const wchar_t* src, const wchar_t* tag, std::wstring& tmpPath) -> HMODULE {
+            wchar_t dir[MAX_PATH] = {};
+            GetTempPathW(MAX_PATH, dir);
+            tmpPath = std::wstring(dir) + L"xefg_unlock_test_" + tag + L"_" + std::to_wstring(GetCurrentProcessId()) + L".dll";
+            return CopyFileW(src, tmpPath.c_str(), FALSE) ? LoadLibraryExW(tmpPath.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES) : nullptr;
+        };
+        size_t xl1Rva = 0;
+        for (const auto& p : rep.patches)
+            if (p.module == MfgUnlock::FamilyXeFG::Module::XeLL)
+                xl1Rva = p.rva;
+        for (const int other : { 5, 4 })
+        {
+            std::wstring pf, pl;
+            HMODULE fg2 = mapCopy(argv[1], other == 5 ? L"fg5" : L"fg4", pf), ll2 = mapCopy(argv[2], other == 5 ? L"ll5" : L"ll4", pl);
+            if (!fg2 || !ll2 || !xl1Rva)
+            {
+                Check(false, "copies of the files could be mapped");
+                continue;
+            }
+            const auto fgA = Snap(fg2);
+            DWORD old = 0;
+            VirtualProtect(reinterpret_cast<uint8_t*>(ll2) + xl1Rva, 1, PAGE_EXECUTE_READWRITE, &old);
+            reinterpret_cast<uint8_t*>(ll2)[xl1Rva] = static_cast<uint8_t>(other);
+            VirtualProtect(reinterpret_cast<uint8_t*>(ll2) + xl1Rva, 1, old, &old);     // the locators want the code page read-only again
+            const auto llA = Snap(ll2);
+            const unlock::xefg::Result pre = unlock::xefg::Apply(fg2, ll2, 5);
+            std::vector<size_t> d3, d4;
+            const size_t nf = Diff(fgA, Snap(fg2), d3), nl2 = Diff(llA, Snap(ll2), d4);
+            if (other == 5)
+                Check(pre.ok && pre.xl1Lifted && nl2 == 0 && nf == n1, "pre-patched libxell (count 5): XL1 treated as applied, not rewritten, libxess_fg patched");
+            else
+                Check(!pre.ok && nl2 == 0 && nf == 0, "libxell holding another count (4): refused, nothing written");
+            FreeLibrary(fg2);
+            FreeLibrary(ll2);
+            DeleteFileW(pf.c_str());
+            DeleteFileW(pl.c_str());
+        }
+    }
     std::puts(g_ok ? "ALL PASS" : "FAILED");
     return g_ok ? 0 : 1;
 }
