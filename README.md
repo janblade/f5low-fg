@@ -7,7 +7,7 @@ pluggable frame generators:
 |---|---|---|
 | own (XeFG Tensor) | our kernels (D3D12 command lists + NVAPI cubins); Intel's native modules, weights and root constants read from the player's `libxess_fg.dll` into memory at every start (nothing written to disk; no translation, no `dxcompiler.dll`) | NVIDIA |
 | intel | Intel's `libxess_fg.dll` | any |
-| dlssg | NVIDIA DLSS-G through a private, renamed copy of the player's Streamline (copied from OptiScaler's `Streamline` folder at run time); NVIDIA's own maximum for now | NVIDIA RTX 40+ |
+| dlssg | NVIDIA DLSS-G through a private, renamed copy of the player's Streamline (copied from OptiScaler's `Streamline` folder at run time); 2x to 6x on RTX 20 to 50: native on RTX 50, unlocked in memory on RTX 20/30/40 (`src/unlock/`); never falls back to another generator | NVIDIA RTX 20+ |
 | fsr | AMD FidelityFX frame generation | any |
 
 Every vendor library is loaded at runtime from the player's PC. This repo holds only our own code.
@@ -18,6 +18,7 @@ Status: being set up (private). Layout planned:
 src/core/        XeFG-API surface OptiScaler drives, pacer, gate, presenter, interop, log/ini/version
 src/generators/  own, dlssg (+ stubs for intel, fsr)
 src/sink/        the present sink and logging DXGI proxies (dlssg now, intel later)
+src/unlock/      OptiScaler's MFG unlock families (structural locators, patch transaction, RTX 20 PTX rewrite), applied in memory to f5low's own DLSS-G copy
 tools/           recipe builder, audit, harness
 ```
 
@@ -52,6 +53,14 @@ GPL-3.0, the same as OptiScaler (see LICENSE), with an additional permission und
 `libxell.dll`, `libxess.dll`) and NVIDIA / AMD vendor runtime libraries without those libraries falling under the GPL.
 Vendor libraries are never part of this repo; they are loaded at runtime from the player's PC and keep their own
 licences. `tools/make_kit.ps1` builds the release kit (f5low.dll + Intel's `libxess_fg.dll` + both licences).
+
+## Credits
+
+`src/unlock/` is OptiScaler-NR's MFG unlock (`OptiScaler/framegen/mfgunlock`, GPL-3.0 like this repo), ported file by file; each header says
+which OptiScaler-NR commit it comes from and what differs. Its sl.dlss_g frame-count clamp and software-pacing approach is adapted from
+KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT), which adapted the MFG Unlock ReShade addon by Dreamt and mavismmg: the MIT notice is in
+`licenses/MFGUnlock_LICENSE.txt`. The x64 length decoder in `src/unlock/hde/` is Hacker Disassembler Engine 64 C by Vyacheslav Patkov (its
+licence text is in the files).
 
 ## Exports
 

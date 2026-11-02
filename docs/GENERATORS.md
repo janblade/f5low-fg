@@ -6,8 +6,8 @@ shares: the swap chain the game sees, frame input staging, pacing, presentation,
 the UI/letterbox rules. A **generator** only makes the in-between frames.
 
 Two generators run: **own** (XeFG Tensor) and **dlssg** (NVIDIA DLSS-G through a private copy of the player's Streamline,
-RTX 40 and newer, at NVIDIA's native maximum: the unlock to 6x and RTX 20/30 are later stories). `intel` and `fsr` are
-registered and selectable, report "not available yet" in the log, and run `own`; their design is below (see "What is ready").
+RTX 20 and newer, 2x to 6x on every tier: native on RTX 50, unlocked in memory on RTX 20/30/40, see "dlssg" below). `intel` and `fsr`
+are registered and selectable, report "not available yet" in the log, and run `own`; their design is below (see "What is ready").
 
 ## Choosing a generator
 
@@ -17,11 +17,12 @@ other settings). Values, case insensitive: `own` (default), `intel`, `dlssg`, `f
 `f5low: generator "<value>" is unknown (own, intel, dlssg, fsr) - running own` and runs `own`.
 
 A generator that is not available logs one line and the host runs `own`: `f5low: generator <name> not available yet, running own`
-for `intel` and `fsr` (`src/generators/stubs.h`, `GenCaps::available = false`), and for `dlssg`
-`f5low: generator dlssg not available (<reason>), running own` with the reason from `DlssgGenerator::Caps()` or the setup
-(see "dlssg" below); the same reason leads the `f5lowGetStatus` text of the own generator that runs instead (`dlssg unavailable:
-<reason> - own generator (...)`). On a GPU `own` cannot run on, the host then offers no frame generation. The generator that
-runs is logged once at context creation: `f5low: generator own (XeFG Tensor)` or `f5low: generator dlssg (DLSS-G)`.
+for `intel` and `fsr` (`src/generators/stubs.h`, `GenCaps::available = false`). **`dlssg` never falls back**: when the player picks it and it
+cannot start (no NVIDIA GPU, below RTX 20, no usable Streamline, a DLSS-G build the unlock does not recognise, slInit failing),
+`f5low: generator dlssg not available (<reason>) - frame generation is off (no fallback to own)` is logged, `f5lowGetStatus` says 3 with
+`dlssg unavailable: <reason>`, `xefgSwapChainD3D12CreateContext` returns `XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE` and no own context is
+made. Switching to XeFG Tensor is the player's choice, never automatic. The generator that runs is logged once at context creation:
+`f5low: generator own (XeFG Tensor)` or `f5low: generator dlssg (DLSS-G)`.
 
 ## What each vendor library owns
 
@@ -125,11 +126,13 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   in OptiScaler's F5Low plan). XeLL: the library's own calls pass through.
 - **dlssg** (built, `src/generators/dlssg.h`, `dlssg_files.h`): NVIDIA DLSS-G through Streamline's public API. Sink shape.
   - *Routing.* `Generator=dlssg` in `D3D12CreateContext` builds a `DlssgGenerator` (an `IGenerator`: `Caps()` = name, available,
-    reason, `maxGenerated`, `presentsItself = true`, `anyGpu = false`). Not available below RTX 40 (sm < 89) or without an NVIDIA GPU
-    (`DLSS-G needs RTX 40 or newer (RTX 20/30 come later)`), without a usable Streamline, or when `slInit` / DLSS-G fail to load: one log
-    line, the reason in `f5lowGetStatus`, and `own` runs. Otherwise the context is an `xdlssg::Ctx` (not `Own`); `f5lowGetStatus`
+    reason, `maxGenerated` (5 on every tier), `presentsItself = true`, `anyGpu = false`). Not available below RTX 20 (sm < 75) or without an
+    NVIDIA GPU (`DLSS-G needs RTX 20 or newer`), without a usable Streamline, when the unlock does not recognise the DLSS-G build, or when
+    `slInit` / DLSS-G fail to load: one log line, the reason in `f5lowGetStatus` (status 3) and an error from CreateContext; nothing else
+    runs. Otherwise the context is an `xdlssg::Ctx` (not `Own`); `f5lowGetStatus`
     says 1 with `dlssg generator (...)`. `XEFG_CUDA_FORWARD` wins over everything. `xefgSwapChainGetProperties` reports
-    `numFramesToGenerateMax` as read from Streamline at create (5 on an RTX 5070 Ti with NVIDIA 310.9; NVIDIA's own value, no unlock).
+    `numFramesToGenerateMax` as read from Streamline at create (5 on an RTX 5070 Ti with NVIDIA 310.9: native, nothing patched; 5 after the
+    unlock on the other tiers).
   - *Streamline.* One per process, loaded from a private renamed copy so the game's own Streamline and its upscaler are never
     touched (a build with the original names broke the game's upscaler in NBA 2K27: OptiScaler hooks every module named like
     `sl.interposer.dll` / `sl.common.dll` / ..., one set of originals per process). Search order, first folder with a complete set:
@@ -156,9 +159,35 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   - *Tests.* `tests\repro_test.cpp` with `REPRO_BAR=1 REPRO_FRONT=1 REPRO_FPS=30 F5LOW_SINK_STATS=1 SINK_PROBE=1 XEFG_CUDA_LOG=1` (the
     DLL logs the sink's gaps, copy time and the moving bar's steps to f5low.log when the context is destroyed); `tests\dlssg_spike.cpp`
     (`build_dlssg_spike.ps1`) is the same check without the DLL. The exe and the NVIDIA files stay outside the repo.
-  - *Later.* Story 2: the unlock to 6x on RTX 40 and 50 in memory (structural locators, keyed by module SHA-256); story 3: RTX 20/30 with
-    kernels rebuilt in memory from the player's `nvngx_dlssg.dll`; story 4: OptiScaler side (generator choice, Reflex cap, Streamline
-    hand-over). Nothing NVIDIA-derived is ever written to disk or committed (`tools/audit.py` has an `nvidia` rule).
+  - *The unlock (RTX 20/30/40, `src/unlock/`).* OptiScaler's built-in MFG unlock, ported (the headers are the ones of OptiScaler-NR
+    `OptiScaler/framegen/mfgunlock` at 745e49431, each file says what differs) and applied to f5low's PRIVATE copy only, in memory, before
+    `slInit`: f5low loads `<f5low_streamline>\nvngx_dlssg.dll` and `sl.xefg_dlss_g.dll` itself, by full path, and patches those two module
+    handles; Streamline's own load of the same paths gets the same handles (logged). The game's own DLSS-G modules (any other handle of
+    those base names) are listed in the log and never touched. Nothing is written to disk. The tier comes from the GPU's compute capability
+    (`F5LOW_TEST_GPU_SM=NN` in tests picks any tier on any card, and forces the families the way OptiScaler's RTX 20/30 "On" mode does):
+
+    | GPU | tier | what is patched in our copy |
+    |---|---|---|
+    | RTX 50 and newer (sm >= 100) | none | nothing: DLSS-G generates up to 5 natively |
+    | RTX 40 (sm 89) | Ada | the advertise and validate gates of nvngx_dlssg, the sl.dlss_g frame-count clamp and flip metering, the Ada midpoint fix in the kernel containers |
+    | RTX 30 (sm 80-88) | Ampere | the Ada set minus the midpoint fix, plus the architecture the module reports (`NVSDK_NGX_GetGPUArchitecture` and the three `*_GetFeatureRequirements` minimums) and every kernel container retargeted to sm_86 |
+    | RTX 20 (sm 75-79) | Turing | the Ampere architecture sites with Turing's value, and the kernels rewritten to sm_75 PTX text as they are loaded (CUDA module-load hook, below) |
+
+    All sites are found structurally (unwind functions, export names, instruction shapes; no addresses, no NVIDIA bytes in this repo) and
+    the transaction is all or none across both modules: if a family does not locate (an unknown nvngx_dlssg or sl.dlss_g build), nothing is
+    written and the context fails with `this DLSS-G build is not recognised by the unlock: <family>` (status 3, no fallback); on RTX 50
+    nothing is located or patched at all. After the unlock `numFramesToGenerateMax` is 5 (6x) on every tier. Log lines start with `unlock:`.
+    The RTX 20 hook is a small inline hook of our own on nvcuda's `cuModuleLoadData`, `cuModuleLoadFatBinary`, `cuModuleLoadDataEx` and
+    `cuLibraryLoadData` (it follows nvcuda's export stubs to the functions behind them, which is what `cuGetProcAddress` hands out); it
+    rewrites a load only when the container lies inside OUR nvngx_dlssg, everything else passes through to the real function. It is
+    refused (status 3) on a driver whose functions have a prologue it cannot copy. Tests: `tests/build_mfgunlock_tests.ps1`
+    (`mfgunlock_core_smoke` on synthetic images, `mfgunlock_check`, `mfgunlock_fatbin_refs`, `mfgunlock_turing_probe` and `unlock_hook_probe` on
+    the player's own `nvngx_dlssg.dll` / `sl.dlss_g.dll`, passed as arguments and never copied into the repo).
+  - *Credits.* The sl.dlss_g frame-count clamp and software-pacing approach is adapted from KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT, from
+    the RenoDX MFG Unlock addon by Dreamt and mavismmg): the notice is in `licenses/MFGUnlock_LICENSE.txt`.
+  - *Later.* Story 2b: kernels tuned for RTX 20/30; story 3: tester proof on real RTX 40/30/20 cards; story 4: OptiScaler side (generator
+    choice, Reflex cap, Streamline hand-over). Nothing NVIDIA-derived is ever written to disk or committed (`tools/audit.py` has an `nvidia`
+    rule).
 - **fsr**: FidelityFX FG from the DLLs OptiScaler ships (path from OptiScaler). Frames-only shape through the
   dispatch (`outputs[]`, `numGeneratedFrames`, `frameID` +1 each frame); the sink shape only if the dispatch path
   turns out unusable on its own. Opens F5Low on AMD and Intel GPUs.
