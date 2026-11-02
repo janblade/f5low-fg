@@ -30,6 +30,7 @@
 //   REPRO_INTERP2=n switch to n halfway through the frames on
 //   REPRO_RESIZEBUF=1  ResizeBuffers right after the first Present at the new render size (while the DLL's rebuild for it
 //                   may still be pending), and again 3 frames later
+//   REPRO_PRELOAD=path  loads that libxess_fg.dll before CreateContext (intel generator: the unlock must be skipped)
 //   REPRO_FRONT=1   keep the window in front (DLSS-G, Generator=dlssg, generates only for the foreground window)
 //   REPRO_BAR=1    the picture is a bright-yellow bar (120 px wide, full height) moving 12 px per app frame on a dark ground, motion
 //                   vectors (-8, 0) to match: with SINK_PROBE the sink reads row 540 of every frame shown, so the steps between
@@ -404,6 +405,10 @@ int main(int argc, char** argv)
     LARGE_INTEGER qf, qa, qb;
     QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&qa);
+    // REPRO_PRELOAD=<libxess_fg.dll>: that library is loaded in this process BEFORE CreateContext (a Generator=intel run must then skip its
+    // unlock: the library may already have contexts, see generators/intel.h)
+    if (char pre[1024]; GetEnvironmentVariableA("REPRO_PRELOAD", pre, sizeof(pre)))
+        printf("REPRO_PRELOAD %s: %p\n", pre, static_cast<void*>(LoadLibraryA(pre)));
     const int createRc = xefgSwapChainD3D12CreateContext(g_dev, &h);
     QueryPerformanceCounter(&qb);
     printf("CreateContext: %d (took %.1f ms on this thread)\n", createRc, 1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart));

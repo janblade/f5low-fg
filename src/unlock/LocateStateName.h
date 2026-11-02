@@ -1,5 +1,5 @@
-// Ported from OptiScaler-NR OptiScaler/framegen/mfgunlock/FamilyXeFG.h at 745e49431 (origin/release/0.1.36): only LocateStateName
-// (the XeFG family itself is not ported; FamilyRtx40.h uses this one function through the FamilyXeFG namespace).
+// Ported from OptiScaler-NR OptiScaler/framegen/mfgunlock/FamilyXeFG.h at 745e49431 (origin/release/0.1.36): only LocateStateName.
+// FamilyXeFG.h (the XeFG family, ported next to it) and FamilyRtx40.h both use this one function, through the FamilyXeFG namespace.
 #pragma once
 
 #include "Locator.h"

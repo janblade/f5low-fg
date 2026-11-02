@@ -880,35 +880,6 @@ std::wstring RealLibraryPath(const char** from)
     return folder + L"libxess_fg.dll";
 }
 
-// Where Generator=intel looks for the player's libxess_fg.dll / libxell.dll to copy (generators/intel.h), in order:
-// F5LOW_XEFG_DIR, the folder of XEFG_CUDA_INTEL_LIBRARY (what the own generator reads libxess_fg from), next to this DLL, the folder
-// above it (OptiScaler's).
-std::vector<std::pair<std::wstring, const char*>> IntelDirs()
-{
-    std::vector<std::pair<std::wstring, const char*>> v;
-    const auto envDir = [](const wchar_t* name) {
-        std::wstring s;
-        if (const DWORD need = GetEnvironmentVariableW(name, nullptr, 0))
-        {
-            s.resize(need);
-            s.resize(GetEnvironmentVariableW(name, s.data(), need));
-        }
-        return s;
-    };
-    if (const std::wstring d = envDir(L"F5LOW_XEFG_DIR"); !d.empty())
-        v.push_back({ d, "F5LOW_XEFG_DIR" });
-    if (std::wstring lib = envDir(L"XEFG_CUDA_INTEL_LIBRARY"); !lib.empty())
-    {
-        if (const size_t cut = lib.find_last_of(L'\\'); cut != std::wstring::npos)
-            v.push_back({ lib.substr(0, cut), "XEFG_CUDA_INTEL_LIBRARY" });
-    }
-    v.push_back({ g_dir, "next to this DLL" });
-    std::wstring up = g_dir;
-    if (const size_t cut = up.find_last_of(L'\\'); cut != std::wstring::npos)
-        v.push_back({ up.substr(0, cut), "the folder above this DLL" });
-    return v;
-}
-
 FARPROC Real(const char* name)
 {
     static std::once_flag once;
@@ -931,14 +902,25 @@ FARPROC Real(const char* name)
         return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;                                           \
     const xefg_swapchain_result_t r = fn(__VA_ARGS__)
 
-// The same for a call on a context handle (the handle parameter is always called h): a Generator=intel context goes to the PRIVATE
-// libxess_fg copy (generators/intel.h), every other handle to the shared real library as above.
+// The same for a call on a context handle (the handle parameter is always called h): a Generator=intel context goes to the library f5low
+// loaded for it (generators/intel.h), looked up once per call site; a proc it lacks is an error, never a fall-back to the shared real
+// library. Every other handle goes to the shared real library as above (cached per export, as before).
 #define FORWARDH(name, ...)                                                                        \
-    auto fn = reinterpret_cast<decltype(&name)>(xintel::Proc(h, #name));                            \
-    if (!fn)                                                                                        \
-        fn = reinterpret_cast<decltype(&name)>(Real(#name));                                        \
-    if (!fn)                                                                                        \
-        return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;                                           \
+    decltype(&name) fn = nullptr;                                                                   \
+    if (xintel::Find(h))                                                                            \
+    {                                                                                               \
+        static auto fnIntel = reinterpret_cast<decltype(&name)>(xintel::Proc(#name));               \
+        if (!fnIntel)                                                                               \
+            return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;                                       \
+        fn = fnIntel;                                                                               \
+    }                                                                                               \
+    else                                                                                            \
+    {                                                                                               \
+        static auto fnReal = reinterpret_cast<decltype(&name)>(Real(#name));                        \
+        if (!fnReal)                                                                                \
+            return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;                                       \
+        fn = fnReal;                                                                                \
+    }                                                                                               \
     const xefg_swapchain_result_t r = fn(__VA_ARGS__)
 
 const char* ResName(int t)
@@ -1084,12 +1066,13 @@ xefg_swapchain_result_t xefgSwapChainSetEnabled(xefg_swapchain_handle_t h, uint3
     }
     if (auto ic = xintel::Find(h))
     {
+        FORWARDH(xefgSwapChainSetEnabled, h, e);
+        if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
             std::lock_guard<std::mutex> lk(ic->mu);
             ic->enabled = e != 0;
-            ic->ApplyBurst();       // the sink expects the burst before the library starts it
+            ic->ApplyBurst();       // only once the library took it
         }
-        FORWARDH(xefgSwapChainSetEnabled, h, e);
         Log("SetEnabled %u -> %d (intel)", e, r);
         return r;
     }
@@ -1464,7 +1447,9 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         xefgown::IntelGenerator ig;
         std::string why;
         std::shared_ptr<xintel::Ctx> c;
-        if (xintel::Lib* lib = xintel::Get(g_dir, IntelDirs(), why))
+        const char* srcFrom = "";
+        const std::wstring srcPath = RealLibraryPath(&srcFrom);     // exactly where the own generator reads libxess_fg from
+        if (xintel::Lib* lib = xintel::Get(srcPath, srcFrom, g_self, why))
         {
             Log("intel: %s", lib->how.c_str());
             Log("intel: %s", lib->unlockNote.c_str());
@@ -1492,7 +1477,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         if (c)
         {
             *ph = c->h;
-            SetStatus(1, "intel generator (XeFG from a private libxess_fg copy, up to " + std::to_string(c->maxGen) + " generated; " + c->lib->unlockNote + "), D3D12");
+            SetStatus(1, "intel generator (XeFG from libxess_fg, up to " + std::to_string(c->maxGen) + " generated; " + c->lib->unlockNote + "), D3D12");
             Log("f5low: generator intel (%s)", ig.Caps().name);
             Log("D3D12CreateContext device=%p -> Generator=intel: h=%p, the library makes up to %u generated frames, the sink paces its burst (spaced)",
                 static_cast<void*>(d), static_cast<void*>(*ph), c->maxGen);

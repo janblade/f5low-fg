@@ -129,24 +129,26 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     `Real()` library. **No fallback**: when the library cannot start (no libxess_fg found, copy or load failed, CreateContext refused),
     `f5low: generator intel not available (<reason>) - frame generation is off (no fallback to own)`, `f5lowGetStatus` 3
     `intel unavailable: <reason>`, `XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE`.
-  - *Private copy.* The player's libxess_fg.dll (and libxell.dll) are copied byte for byte to `<f5low.dll folder>\f5low_xefg\f5low_xefg_fg.dll`
-    / `f5low_xefg_ll.dll` (SHA-256 of the sources in `manifest.txt`; a changed source is copied again, a deleted or altered copy is made again) and
-    loaded by full path, so the process never shares the module with OptiScaler's XeFG output. Source search: `F5LOW_XEFG_DIR`, the folder
-    of `XEFG_CUDA_INTEL_LIBRARY` (what the own generator reads libxess_fg from), next to f5low.dll, the folder above (OptiScaler's); libxell
-    from the same folder, else the first one that has it. The source is logged.
+  - *Library.* No copies on disk. It is the SAME libxess_fg.dll the own generator reads (`RealLibraryPath` in `xefg_cuda.cpp`:
+    `XEFG_CUDA_INTEL_LIBRARY`, next to f5low.dll, the folder above = OptiScaler's), loaded by full path and logged. A source that is f5low
+    itself (our own path, or a module exporting `f5lowGetStatus`) is never loaded.
   - *Unlock.* `unlock/FamilyXeFG.h` (OptiScaler-NR's family, U1-U5 on libxess_fg, XL1 on libxell, structural locators) applied by
-    `unlock/UnlockXeFg.h` to the two private modules right after the load and BEFORE the first XeFG call: Intel sizes every per-generated-frame
-    buffer from U3 (its default interpolation ceiling) when a context is created, so a late patch leaves 3-slot buffers (evidence in the
-    ai-os 2026-11-03 study). All or none; an unknown build is refused with the failing site, and the library then runs unpatched at its own
-    maximum (on an RTX 5070 Ti with 1.3.4.95 and libxell 1.3.2.10 that is 2x: GetProperties says 1). With the unlock `GetProperties` says 5 (6x).
-    `F5LOW_INTEL_UNLOCK=0` turns it off (tests). This patches inside Intel's DLLs in memory, private copies only; nothing is written to disk.
-  - *libxell.* libxess_fg does not import libxell: it calls `GetModuleHandleExA(0, "libxell.dll")` and takes the process' module of that name
-    (OptiScaler's, which must not be patched). The IAT slot of that one import in the private libxess_fg points at a thunk of ours that answers
-    "libxell.dll" with the private libxell and passes every other lookup on. The XeLL context OptiScaler hands over
-    (`xefgSwapChainSetLatencyReduction`) is its libxell's; the private libxell's functions work on it (same build, tested with a 180 fps cap at
-    6x). Intel itself reports the generated frames to XeLL every frame, so `xefgCudaXellCountsRenderedOnly` stays 0.
+    `unlock/UnlockXeFg.h` right after f5low loaded the library and BEFORE the first XeFG call: Intel sizes every per-generated-frame buffer
+    from U3 (its default interpolation ceiling) when a context is created, so a late patch leaves 3-slot buffers (evidence in the ai-os
+    2026-11-03 study). If libxess_fg.dll was ALREADY loaded in the process before f5low (a context may exist), nothing is patched: Intel's
+    own maximum, with the reason in the log. All or none; an unknown build is refused with the failing site and the library then runs
+    unpatched at its own maximum (on an RTX 5070 Ti with 1.3.4.95 and libxell 1.3.2.10 that is 2x: GetProperties says 1; with the
+    unlock it says 5 = 6x). A failed rollback (a partially patched module) refuses the library outright: status 3. The count is 3 to 5.
+    `F5LOW_INTEL_UNLOCK=0|off|false|no` turns it off (tests); `F5LOW_TEST_XEFG_SKIP=U4` leaves one site unpatched (tests). This patches
+    inside Intel's DLLs in memory; nothing is written to disk.
+  - *libxell.* libxess_fg does not import libxell: it calls `GetModuleHandleExA(0, "libxell.dll")` at run time, so it uses the libxell the
+    process already has (OptiScaler's or the game's) = the one that made the XeLL context OptiScaler hands over. XL1 is patched in that
+    module in memory (one log line says so; it only lifts libxell's refusal of generated-frame counts above 3). If no libxell.dll is loaded
+    when the context is created, the one next to libxess_fg is loaded by full path. If the XL1 site is not found (or a libxell was patched
+    before), XL1 and the libxess_fg unlock are skipped together. Intel reports the generated frames to XeLL itself every frame, so
+    `xefgCudaXellCountsRenderedOnly` stays 0.
   - *Sink.* `InitFromSwapChainDesc` hands Intel a `SinkFactory` (spaced mode); `SetEnabled` / `SetNumInterpolatedFrames` set the sink's burst
-    (generated + 1). `InitFromSwapChain` (a chain the game made) cannot be sunk: the library presents on it itself (logged).
+    (generated + 1; the factory remembers it, so a re-created chain starts with it). `InitFromSwapChain` (a chain the game made) cannot be sunk: the library presents on it itself (logged).
   - *Pacing today.* The sink's burst spacing (the same as dlssg's). Not built: driving the release times from the own generator's schedule
     (frame k of an app frame at base + lead + (k - 1) * step, `PaceLead` auto, `pace_lead.h`). It would take: (1) a wrapper chain on the game's
     side (like dlssg's `MarkerChain`) that stamps the app Present time and the app interval; (2) a schedule entry in the sink replacing its
@@ -154,8 +156,7 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     (3) a feed for `PaceLead`: the sink knows when each staging copy finished (its fence), so "late" = copy done after the planned release,
     the same event Own gives it; (4) a harness A/B (`pacer_ab.ps1 -Gens own,intel`, which today only knows own and dlssg).
   - *Tests.* `tests/build_mfgunlock_tests.ps1` builds `xefg_unlock_test.exe <libxess_fg.dll> <libxell.dll>` (sites found once, Locate changes
-    nothing, Apply changes exactly the planned bytes); the harness: `repro_test` with `F5LOW_GENERATOR=intel REPRO_INTERP=n F5LOW_XEFG_DIR=<folder with
-    Intel's files> F5LOW_SINK_STATS=1 SINK_PROBE=1 REPRO_BAR=1 REPRO_FRONT=1 XEFG_CUDA_LOG=1` and Intel's libxell.dll as the second argument
+    nothing, Apply changes exactly the planned bytes); the harness: `repro_test` with `F5LOW_GENERATOR=intel REPRO_INTERP=n XEFG_CUDA_INTEL_LIBRARY=<OptiScaler-style folder>\libxess_fg.dll F5LOW_SINK_STATS=1 SINK_PROBE=1 REPRO_BAR=1 REPRO_FRONT=1 XEFG_CUDA_LOG=1` and Intel's libxell.dll as the second argument
     (Intel's library wants an XeLL context before the swap chain is made); `SINK_PROBE_DUMP=1` also logs the bar's x per frame shown.
 - **dlssg** (built, `src/generators/dlssg.h`, `dlssg_files.h`): NVIDIA DLSS-G through Streamline's public API. Sink shape.
   - *Routing.* `Generator=dlssg` in `D3D12CreateContext` builds a `DlssgGenerator` (an `IGenerator`: `Caps()` = name, available,

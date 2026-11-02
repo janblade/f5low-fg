@@ -4,7 +4,7 @@
 //   1. every site (U1-U5, XL1) is found exactly once, and Locate changes nothing (the module is byte-identical = the "unlock off" state);
 //   2. the patch plan's expected bytes are what the file holds and the replacements carry the requested count;
 //   3. Apply (count 5) changes exactly the planned bytes, nothing else in either image;
-//   4. a second Apply on the patched modules is refused (unknown shape), nothing further changes.
+//   4. a second Apply on the patched modules is refused (unknown shape), nothing further changes; counts outside 3..5 are refused.
 // This patches inside Intel's DLLs in memory (the test's own mapping only).
 #include "../src/unlock/UnlockXeFg.h"
 
@@ -85,6 +85,11 @@ int wmain(int argc, wchar_t** argv)
         for (const auto& p : r4.patches)
             c4 += p.replacement.size() == 1 && std::to_integer<unsigned>(p.replacement[0]) == 4;
         Check(r4.Complete() && c4 == 4, "count 4 plans the byte 4");
+    }
+    // a count below XeFG's own ceiling (or above 5) is refused, not clamped, and nothing is written
+    {
+        const unlock::xefg::Result lo = unlock::xefg::Apply(fg, ll, 2), hi = unlock::xefg::Apply(fg, ll, 6);
+        Check(!lo.ok && !hi.ok && !lo.fatal && !hi.fatal && Snap(fg) == fg0 && Snap(ll) == ll0, "counts 2 and 6 are refused, nothing written");
     }
     // 3
     const unlock::xefg::Result a = unlock::xefg::Apply(fg, ll, 5);
