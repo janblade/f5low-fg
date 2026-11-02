@@ -2055,7 +2055,7 @@ private:
     {
         if (paceLeadAuto)
         {
-            leadNeed[leadNeedAt++ % kLeadWindow] = leadFrameLate > 0 ? static_cast<double>(f.lead) * 1000.0 / freq() + leadFrameLate + kLeadMargin : 0.0;
+            leadNeed[leadNeedAt++ % kLeadWindow] = leadFrameLate > 0 ? static_cast<double>(f.lead) * 1000.0 / freq() + std::min(leadFrameLate, kLeadMaxStep) + kLeadMargin : 0.0;
             leadNeedN = std::min(leadNeedN + 1, kLeadWindow);
             leadRingMax = kLeadFloor;
             for (size_t i = 0; i < leadNeedN; ++i)
@@ -4230,6 +4230,7 @@ private:
     double leadFrameLate = 0, leadRingMax = 0;      // the worst late of the batch in hand; the window's maximum (stats)
     static constexpr size_t kLeadWindow = 128;
     static constexpr double kLeadMargin = 1.0;
+    static constexpr double kLeadMaxStep = 2.0;     // a late event raises the lead by 3 ms at most: its late includes the game's own jitter (jitter2 2x: lead swung 3 -> 8.2 ms of an 8.3 ms step, late 6.4 %)
     std::array<double, kLeadWindow> leadNeed {};
     size_t leadNeedAt = 0, leadNeedN = 0;
     std::mutex paceMu;
