@@ -1,4 +1,4 @@
-// xefg_own.h - the native (non-forwarding) implementation behind f5low.dll's exports (built from xefg_cuda.cpp).
+﻿// xefg_own.h - the native (non-forwarding) implementation behind f5low.dll's exports (built from xefg_cuda.cpp).
 //
 // One Own per xefg_swapchain handle. It runs the graph pack (tools/cuda/xefg_pack.h: the 38-dispatch XeFG
 // network) on the application's frames and presents the generated frames between them: 2x to 6x
@@ -457,6 +457,13 @@ public:
     bool flipMetering = true;                   // FlipMetering=0 in f5low.ini: no NVIDIA driver flip metering (Meter)
     uint32_t flipLeadUs = 2500;                 // FlipLeadUs= in f5low.ini (0-8000): metered frames after the first go this early
     bool flipLeadAuto = true;                   // FlipLeadUs=auto (default): flipLeadUs, but at most kFlipLeadShare of the frame spacing
+    // PaceLead in f5low.ini (schedule pacer, Target): generated frame k goes out at base + lead + (k - 1) steps instead of base + k
+    // steps. Generating takes a millisecond or two, so the first one need not wait a whole step. auto (default): the lead
+    // adapts (leadMs); a number of ms: fixed (0.5-50); 0/off: one full step as before.
+    bool paceLeadAuto = true;
+    double paceLeadFixedMs = 0;
+    // PaceLog=1: one record per present, written to the log when the presenter stops (PaceDump; tests/pacer_ab.ps1).
+    bool paceLog = false;
     // The gated swap chain: room for two app frames' presents at 6x. At 7 queued the presenter blocked on the waitable object
     // until the gate let old frames out, took the next app frame late (ready stamp 37 vs 14 ms old) and CUDA started late:
     // the generated frames came 22 ms later and the clock's delay followed (harness 6x at 30 fps).
@@ -1384,7 +1391,8 @@ private:
         float jc[2] {}, jp[2] {}, mvs[2] {};
         UINT64 done[kMaxInterp] {};         // CUDA path: generated frame k is in ringC[set][k - 1] at fence value done[k - 1]
         uint32_t set = 0;                   // the ring set (frame parity)
-        long long base = 0, step = 0;       // its schedule (QPC): frame k at base + k * step (Target)
+        long long base = 0, step = 0;       // its schedule (QPC): frame k at base + lead + (k - 1) * step (Target)
+        long long lead = 0;                 // PaceLead: frame 1's wait after base (QPC, at most step); 0: one whole step. Frozen per frame
         long long cstep = 0;                // the clock's spacing for its frames (QPC; ClockTarget)
         bool clock = false;                 // paced by the clock
         bool spread = false;                // passes 2.. start at releases (PresentGenGated): the clock's need from pass 1 only
@@ -1449,6 +1457,37 @@ private:
             XLog("app stall: frame %llu, the game's own time before Present %.1f ms, our part %.1f, GPU backpressure %.1f "
                  "(retired %llu), presenter queue %.1f", static_cast<unsigned long long>(frame), game, locked, retire,
                  static_cast<unsigned long long>(retireFence->GetCompletedValue()), waitQ);
+    }
+
+    // PaceLog: one record per present of a frame that generates, kept in memory (a log line each would perturb the pacing) and
+    // written by PaceDump. t: the present's time (QPC), ready: the app frame's ready stamp, target: the time it was aimed at.
+    enum : uint8_t { kPaceLate = 4 };
+    struct PaceRec
+    {
+        long long t, ready, target;
+        uint64_t frame;
+        uint8_t k, n, flags;
+    };
+    void PaceRecord(long long t, long long ready, long long target, uint64_t frame, uint32_t k, uint32_t n, uint8_t flags)
+    {
+        if (!paceLog || n < 2)           // n: presents in the batch (generated + the app's own)
+            return;
+        std::lock_guard<std::mutex> l(paceMu);
+        if (paceRecs.size() < 400000)
+            paceRecs.push_back({ t, ready, target, frame, static_cast<uint8_t>(k), static_cast<uint8_t>(n), flags });
+    }
+    // "pace: t=<ms> frame=<app frame> k=<present>/<of> ready=<ms> target=<ms> flags=<late|->": ms are QPC milliseconds.
+    void PaceDump()
+    {
+        std::vector<PaceRec> recs;
+        {
+            std::lock_guard<std::mutex> l(paceMu);
+            recs.swap(paceRecs);
+        }
+        const double q = 1000.0 / freq();
+        for (const PaceRec& r : recs)
+            XLog("pace: t=%.3f frame=%llu k=%u/%u ready=%.3f target=%.3f flags=%s", r.t * q, static_cast<unsigned long long>(r.frame), r.k,
+                 static_cast<unsigned>(r.n), r.ready * q, r.target * q, r.flags & kPaceLate ? "late," : "-");
     }
 
     // The application's own frame time, smoothed, ms: from our Present returning to its next call. The time
@@ -1561,6 +1600,8 @@ private:
         wQuit = true;
         if (watcher.joinable())
             watcher.join();
+        if (paceLog)
+            PaceDump();
         // Nothing may wait on frames that will not be taken any more.
         if (consumedFence)
             consumedFence->Signal(appFrame);
@@ -1737,6 +1778,9 @@ private:
         lastAnyPresent = t;
         if (k == n + 1)
             lastReal = t;
+        if (paceLog)
+            PaceRecord(t, showing ? showing->ready : jobBase, target, j.frame, k, n + 1,
+                       static_cast<uint8_t>(paced && static_cast<double>(t - target) * 1000.0 / freq() > 0.5 ? kPaceLate : 0));
         return late;
     }
     void Hitch(uint32_t k, uint32_t n, long long before, long long t0, long long target, long long tg, double gpuWaitMs, long long tw0,
@@ -1942,6 +1986,15 @@ private:
             lastNGen = f.nGen;
         }
         f.base = schedBase;
+        f.lead = 0;
+        if (f.nGen && (paceLeadAuto || paceLeadFixedMs > 0))
+        {
+            // Frozen for the whole batch: a lead that changed in the middle of it would space its frames unevenly.
+            leadMs = paceLeadAuto ? (leadMs > 0 ? leadMs : kLeadStart) : paceLeadFixedMs;
+            leadMin = std::min(leadMin, leadMs);
+            leadMax = std::max(leadMax, leadMs);
+            f.lead = static_cast<long long>(leadMs * freq() / 1000.0);
+        }
         f.lag = paceLag;
         f.ready = jobBase;
         f.pickT = pickT;
@@ -1983,7 +2036,27 @@ private:
     // Frame k's present time (PaceTarget, on the frame's own schedule).
     long long Target(const Frame& f, uint32_t k) const
     {
-        return Bound(f.base + static_cast<long long>(k) * f.step, f.step);
+        return Bound(f.base + (f.lead > 0 ? std::min(f.step, f.lead) : f.step) + static_cast<long long>(k - 1) * f.step, f.step);
+    }
+    // PaceLead=auto, after a generated frame's present (Show, schedule pacer): late = ms our own GPU work held it past its time.
+    // Late: the lead grows by that at once, at most to one step; a batch with none late eases it down (LeadEase).
+    void LeadAfterPresent(const Frame& f, double late)
+    {
+        if (late > 0.5)
+        {
+            ++statLeadLate;
+            leadAnyLate = true;
+            if (paceLeadAuto)
+                leadMs = std::min(leadMs + late, static_cast<double>(f.step) * 1000.0 / freq());
+        }
+    }
+    // Down by 1/32 of the way to the floor, at least 20 us, per batch: slow, since the cost of a late frame is a
+    // hitch, the cost of a lead too long is only latency.
+    void LeadEase()
+    {
+        if (paceLeadAuto && !leadAnyLate && leadMs > kLeadFloor)
+            leadMs = std::max(kLeadFloor, leadMs - std::max(0.02, (leadMs - kLeadFloor) / 32));
+        leadAnyLate = false;
     }
     // Half a step after the last present at the soonest, two steps after it at the latest: a frame the game handed over
     // after a stutter has its schedule set from that late frame, and it waited lag + a step more with its picture ready.
@@ -2322,11 +2395,19 @@ private:
                     firstRelease = lastRelease;
                 statClkSlips += late > 0.5;
             }
-            else if (!D3d() && late > 0.5)  // not a hair's breadth, which undid the fall below every frame
-                paceLag = std::min(std::max(paceLag, f.lag + late), readyInterval * maxLag);
+            else
+            {
+                if (f.lead > 0)
+                    LeadAfterPresent(f, late);
+                if (!D3d() && late > 0.5)   // not a hair's breadth, which undid the fall below every frame
+                    paceLag = std::min(std::max(paceLag, f.lag + late), readyInterval * maxLag);
+            }
             if (++genCount == 1 || genCount % 600 == 0)
                 XLog("present: %u frames generated", genCount);
         }
+
+        if (f.lead > 0 && !f.clock && !DisplayPaced(j))
+            LeadEase();
 
         // 3. The application's frame, and cur -> prev.
         {
@@ -2628,6 +2709,9 @@ private:
                 }
                 const long long t = Now();
                 GateRelease(it.v);
+                if (paceLog)
+                    PaceRecord(t, f.ready, slot, f.j.frame, it.k, f.nGen + 1,
+                               static_cast<uint8_t>(f.clock && static_cast<double>(t - slot) * 1000.0 / freq() > 0.5 ? kPaceLate : 0));
                 std::lock_guard<std::mutex> l(clkMu);
                 if (last)
                 {
@@ -3314,6 +3398,12 @@ private:
             XLog("stats: flip metering on for %u of 120 app frames, %.2f ms per batch, status %d, feedback 0x%x, %u calls", statFlipMetered,
                  flipBatchMs, flipStatus, flipFeedback, flipCalls);
         statFlipMetered = 0;
+        if (leadMs > 0)
+            XLog("stats: pace lead %.2f ms (%.2f - %.2f over the 120 app frames, %s), %u generated frames late", leadMs, leadMin, leadMax,
+                 paceLeadAuto ? "auto" : "fixed", statLeadLate);
+        leadMin = 1e9;
+        leadMax = 0;
+        statLeadLate = 0;
         statFrames = statLate = statEarly = statGaps = statJobs = statFirstN = 0;
         statGap = statGap2 = statGapMax = statAppCall = statAppWait = statGpuWait = statStampAge = statBehind = statFirstLate = statArriveToPick = statArriveToReady = 0;
     }
@@ -4125,6 +4215,14 @@ private:
     // Gate=1: the clock above is shared with the release thread (clkMu: clkBatch, clkVar, readyInterval, clkCorr, clkTarget,
     // clkLast and the clock's stats).
     std::mutex clkMu;
+    // PaceLead (Frame::lead): the auto lead in ms (presenter thread), its range and late frames per 120 app frames, and whether a
+    // generated frame of the batch in hand was late.
+    static constexpr double kLeadStart = 3.0, kLeadFloor = 3.0;
+    double leadMs = 0, leadMin = 1e9, leadMax = 0;
+    unsigned statLeadLate = 0;
+    bool leadAnyLate = false;
+    std::mutex paceMu;
+    std::vector<PaceRec> paceRecs;
     // Flip metering (Meter, presenter thread); meteredFrame (app frame + 1 whose batch the driver meters) is read by the
     // release thread too.
     SetFlipConfigFn flipFn = nullptr;
