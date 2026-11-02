@@ -37,6 +37,12 @@
 //   REPRO_HIST=1   after every frame with frame generation on, GetLastPresentStatus: a histogram of frames presented per app frame
 //                   and the number of times the window had lost the foreground, printed at the end
 //   REPRO_FPS=n     the app produces n frames per second, not as fast as the GPU lets it
+//   REPRO_RAMP=a,b,secs  the app's fps ramps from a to b over secs seconds, starting with frame generation on (a before it)
+//   REPRO_HITCH=frame,ms  one long app frame: ms extra before frame number `frame` of the frames on (REPRO_FPS needed)
+//   REPRO_CAPSTEP=frame,fps  from frame number `frame` of the frames on the app runs at fps (a frame-cap change)
+//   REPRO_JITTER=ms  every app frame leaves up to +-ms early or late (uniform, seeded: the same on every run); the mean is kept
+//   REPRO_PACELOG=1  after the run, one line per app frame on: "app: frame=N t=<QPC ms before Present> ret=<QPC ms after it>"
+//                   (with the DLL's PaceLog / sink pace lines tests/pacer_ab.ps1 gets latencies from them)
 //   REPRO_MENU=N    two N-frame stretches (from a quarter and from five eighths of the frames on) with frame generation
 //                   still enabled but no tags, no SetPresentId and no frame constants: Cyberpunk's pause menu
 //   REPRO_FS=1      exclusive fullscreen from a third of the frames on until two thirds (SetFullscreenState + ResizeBuffers)
@@ -47,6 +53,7 @@
 // Exit code: 0 ok, 1 setup failed, 2 debug-layer messages, 3 a Present failed / the device was removed.
 
 #include <windows.h>
+#include <timeapi.h>
 #include <shellapi.h>
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
@@ -66,6 +73,7 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "winmm.lib")
 
 static ID3D12Device* g_dev;
 static ID3D12CommandQueue* g_q;
@@ -260,6 +268,40 @@ int main(int argc, char** argv)
     const bool fsTest = EnvInt("REPRO_FS", 0) == 1;
     const int appFps = EnvInt("REPRO_FPS", 0);
     const int menuLen = EnvInt("REPRO_MENU", 0);
+    // Pacing scenarios (tests/pacer_ab.ps1): the app's frame rate over the frames on. All need REPRO_FPS (the base rate).
+    struct Scn
+    {
+        double rampA = 0, rampB = 0, rampSecs = 0;
+        int hitchFrame = -1;
+        double hitchMs = 0;
+        int stepFrame = -1;
+        double stepFps = 0;
+        double jitterMs = 0;
+    } scn;
+    {
+        char v[64] = {};
+        if (GetEnvironmentVariableA("REPRO_RAMP", v, sizeof(v)))
+            sscanf_s(v, "%lf,%lf,%lf", &scn.rampA, &scn.rampB, &scn.rampSecs);
+        if (GetEnvironmentVariableA("REPRO_HITCH", v, sizeof(v)))
+            sscanf_s(v, "%d,%lf", &scn.hitchFrame, &scn.hitchMs);
+        if (GetEnvironmentVariableA("REPRO_CAPSTEP", v, sizeof(v)))
+            sscanf_s(v, "%d,%lf", &scn.stepFrame, &scn.stepFps);
+        if (GetEnvironmentVariableA("REPRO_JITTER", v, sizeof(v)))
+            scn.jitterMs = atof(v);
+    }
+    const bool paceLog = EnvInt("REPRO_PACELOG", 0) == 1;
+    // REPRO_TIMER1=1: the app raises the timer resolution to 1 ms (timeBeginPeriod), as most games do; without it the
+    // REPRO_FPS limiter's Sleep(1) can oversleep up to 15.6 ms unless a loaded DLL raised it (DLSS-G does).
+    if (EnvInt("REPRO_TIMER1", 0) == 1)
+        printf("timeBeginPeriod(1): %u\n", timeBeginPeriod(1));
+    struct AppRec
+    {
+        int frame;
+        double t0, t1, waitMs = 0, idleMs = 0;
+    };
+    std::vector<AppRec> appRecs;
+    uint32_t jitterState = 0x9E3779B9u;      // xorshift32: the same jitter on every run
+    LARGE_INTEGER onStart {};                // QPC of the first frame on
     bool fsOn = false;
     const UINT rw = static_cast<UINT>(EnvInt("REPRO_RW", 1280)), rh = static_cast<UINT>(EnvInt("REPRO_RH", 720));
     if (debugLayer)
@@ -570,8 +612,11 @@ int main(int argc, char** argv)
                 DispatchMessageA(&msg);
             takeFront();
         }
+        LARGE_INTEGER w0, w1;
+        QueryPerformanceCounter(&w0);
         if (wait)
             WaitForSingleObject(wait, 1000);
+        QueryPerformanceCounter(&w1);
         if (xellSleepFn)
             xellSleepFn(xell, static_cast<uint32_t>(frame));
         if (xellMarker)
@@ -694,6 +739,13 @@ int main(int argc, char** argv)
         LARGE_INTEGER p0;
         QueryPerformanceCounter(&p0);
         const HRESULT hr = sc->Present(0, fsOn ? 0 : DXGI_PRESENT_ALLOW_TEARING);     // no tearing flag in exclusive fullscreen
+        if (paceLog && on)
+        {
+            LARGE_INTEGER p1;
+            QueryPerformanceCounter(&p1);
+            const double k = 1000.0 / static_cast<double>(qf.QuadPart);
+            appRecs.push_back({ frame, static_cast<double>(p0.QuadPart) * k, static_cast<double>(p1.QuadPart) * k, static_cast<double>(w1.QuadPart - w0.QuadPart) * k });
+        }
         if (timeIt)
             printf("frame %d: Present took %.2f ms\n", frame, ms(p0));
         if (xellMarker)
@@ -760,21 +812,50 @@ int main(int argc, char** argv)
             (void)drc;
         }
         if (!noIdle)
+        {
+            LARGE_INTEGER i0, i1;
+            QueryPerformanceCounter(&i0);
             Idle();
+            QueryPerformanceCounter(&i1);
+            if (paceLog && on && !appRecs.empty() && appRecs.back().frame == frame)
+                appRecs.back().idleMs = static_cast<double>(i1.QuadPart - i0.QuadPart) * 1000.0 / static_cast<double>(qf.QuadPart);
+        }
         if (appFps > 0)
         {
-            // REPRO_FPS=n: the app produces n frames per second, not as fast as the GPU lets it
+            // REPRO_FPS=n: the app produces n frames per second, not as fast as the GPU lets it. The scenarios (REPRO_RAMP, _CAPSTEP,
+            // _HITCH, _JITTER) change the rate over the frames on.
             static LARGE_INTEGER due {};
             LARGE_INTEGER nowT, fq;
             QueryPerformanceFrequency(&fq);
             QueryPerformanceCounter(&nowT);
+            if (on && !onStart.QuadPart)
+                onStart = nowT;
+            double fps = appFps;
+            if (scn.rampSecs > 0)
+            {
+                const double s = on ? static_cast<double>(nowT.QuadPart - onStart.QuadPart) / static_cast<double>(fq.QuadPart) : 0.0;
+                fps = scn.rampA + (scn.rampB - scn.rampA) * (std::min)(1.0, s / scn.rampSecs);
+            }
+            if (scn.stepFrame >= 0 && on && inOn >= scn.stepFrame && scn.stepFps > 0)
+                fps = scn.stepFps;
             if (!due.QuadPart || nowT.QuadPart - due.QuadPart > fq.QuadPart / 4)
                 due = nowT;
-            due.QuadPart += fq.QuadPart / appFps;
+            due.QuadPart += static_cast<LONGLONG>(static_cast<double>(fq.QuadPart) / (std::max)(fps, 1.0));
+            if (scn.hitchFrame >= 0 && on && inOn == scn.hitchFrame)
+                due.QuadPart += static_cast<LONGLONG>(scn.hitchMs * static_cast<double>(fq.QuadPart) / 1000.0);
+            // the jitter moves this frame's wake-up, not the schedule: no drift
+            LONGLONG jit = 0;
+            if (scn.jitterMs > 0 && on)
+            {
+                jitterState ^= jitterState << 13;
+                jitterState ^= jitterState >> 17;
+                jitterState ^= jitterState << 5;
+                jit = static_cast<LONGLONG>((static_cast<double>(jitterState) / 4294967295.0 * 2.0 - 1.0) * scn.jitterMs * static_cast<double>(fq.QuadPart) / 1000.0);
+            }
             for (;;)
             {
                 QueryPerformanceCounter(&nowT);
-                const double left = static_cast<double>(due.QuadPart - nowT.QuadPart) * 1000.0 / static_cast<double>(fq.QuadPart);
+                const double left = static_cast<double>(due.QuadPart + jit - nowT.QuadPart) * 1000.0 / static_cast<double>(fq.QuadPart);
                 if (left <= 0)
                     break;
                 if (left > 2.0)
@@ -824,6 +905,9 @@ int main(int argc, char** argv)
             printf("frame %d: presented %u, frame generation on %u\n", frame, st.framesPresented, st.isFrameGenEnabled);
         }
     }
+    if (paceLog)
+        for (const AppRec& ar : appRecs)
+            printf("app: frame=%d t=%.3f ret=%.3f wait=%.3f idle=%.3f\n", ar.frame, ar.t0, ar.t1, ar.waitMs, ar.idleMs);
     if (EnvInt("REPRO_HIST", 0) == 1)
     {
         printf("frames presented per app frame (while on):");

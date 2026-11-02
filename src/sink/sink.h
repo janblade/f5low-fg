@@ -90,6 +90,7 @@ inline bool Collect() { return scproxy::g_enabled || g_stats; }
 inline std::vector<double> g_outGaps;       // ms between the real Present calls, over the whole run (survives the chain)
 inline std::mutex g_outMu;
 inline std::mutex g_linkMu;                 // the factory <-> sink link (SinkFactory::last, SinkSwapChain::owner)
+inline std::vector<double> g_outTimes;      // QPC ms of each real Present call's return (XEFG_CUDA_PACELOG lists them; tests/pacer_ab.ps1)
 inline std::vector<double> g_copyGpuMs;     // GPU ms of each staging copy (timestamps around it)
 inline std::vector<std::pair<uint64_t, int>> g_probe;    // SINK_PROBE (harness): frame number, x of the first bright-yellow pixel in row 540 (-1 none)
 
@@ -100,6 +101,7 @@ inline void ResetGaps()
 {
     std::lock_guard<std::mutex> l(g_outMu);
     g_outGaps.clear();
+    g_outTimes.clear();
     g_copyGpuMs.clear();
     g_probe.clear();
 }
@@ -116,6 +118,12 @@ inline std::vector<std::string> StatsLines()
         lines.push_back(buf);
     if (!scproxy::GapText(buf, sizeof(buf), "sink: GPU time per staging copy (values, not gaps)", g_copyGpuMs).empty())
         lines.push_back(buf);
+    if (EnvSet("XEFG_CUDA_PACELOG"))
+        for (const double t : g_outTimes)
+        {
+            snprintf(buf, sizeof(buf), "sink: pace t=%.3f", t);
+            lines.push_back(buf);
+        }
     if (g_probe.empty())
         return lines;
     // The test pattern's bar moves the same distance each frame: the steps between shown frames say whether they are in order
@@ -493,6 +501,11 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             {
                 std::lock_guard<std::mutex> l(g_outMu);
                 g_outGaps.push_back(static_cast<double>(t - lastRelease) * 1000.0 / Freq());
+            }
+            if (Collect() && EnvSet("XEFG_CUDA_PACELOG"))
+            {
+                std::lock_guard<std::mutex> l(g_outMu);
+                g_outTimes.push_back(static_cast<double>(t) * 1000.0 / Freq());
             }
             lastRelease = t;
             std::lock_guard<std::mutex> l(mu);

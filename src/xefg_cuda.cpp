@@ -770,6 +770,27 @@ double MaxDelaySetting()
     return std::isfinite(v) ? std::clamp(v, 0.25, 3.0) : 1.5;
 }
 
+// PaceLog=1 (XEFG_CUDA_PACELOG, else f5low.ini): a record per present in the log when the presenter stops (needs Log=1; tests/pacer_ab.ps1).
+bool PaceFlag(const char* env, const char* key)
+{
+    const std::string v = Setting(env, key, "0");
+    return v == "1" || v == "on" || v == "true" || v == "yes";
+}
+
+// PaceLead= (XEFG_CUDA_PACELEAD): the D3D12 path's schedule sends generated frame 1 this long after the app frame is ready, not
+// a whole step after it (xefg_own.h, Target; pace_lead.h). auto (default): starts at 3 ms and follows how long generating takes;
+// a number of ms (0.5-50): fixed; 0 or off: a whole step. Not on the CUDA path (paceLag and the clock pacer already react to
+// late frames there). Returns the fixed ms (0: off); auto sets *autoLead.
+double PaceLeadSetting(bool* autoLead)
+{
+    const std::string v = Setting("XEFG_CUDA_PACELEAD", "PaceLead", "auto");
+    *autoLead = v == "auto" || v.empty();
+    if (*autoLead || v == "off")
+        return 0;
+    const double ms = atof(v.c_str());
+    return ms > 0 && std::isfinite(ms) ? std::clamp(ms, 0.5, 50.0) : 0;
+}
+
 std::shared_ptr<xefgown::Own> FindOwn(xefg_swapchain_handle_t h)
 {
     std::lock_guard<std::mutex> lk(g_ownLock);
@@ -1436,6 +1457,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->clockPacer = ClockSetting();
         o->maxDelay = MaxDelaySetting();
         o->gate = GateSetting();
+        o->paceLog = PaceFlag("XEFG_CUDA_PACELOG", "PaceLog") && OpenLog();     // nothing to record where nothing is logged
+        o->paceLeadFixedMs = PaceLeadSetting(&o->paceLeadAuto);
         // FlipMetering=0 (XEFG_CUDA_FLIPMETERING=0): no NVIDIA driver flip metering (xefg_own.h, Meter).
         o->flipMetering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "1") != "0";
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):
@@ -1488,6 +1511,9 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             "%.2f, max delay %.2f app frames",
             static_cast<void*>(d), static_cast<void*>(*ph), pack.c_str(), need, have, path.c_str(), o->noEarly ? 0 : 1,
             o->clockPacer ? "clock" : "schedule", o->gate ? " + gate" : "", o->maxLag, o->maxDelay);
+        const std::string leadMode = o->paceLeadAuto ? std::string("auto (3.0 ms start)")
+                                     : o->paceLeadFixedMs > 0 ? "fixed " + std::to_string(o->paceLeadFixedMs).substr(0, 5) + " ms" : std::string("off");
+        Log("pace lead: %s%s", leadMode.c_str(), path == "d3d12" || leadMode == "off" ? "" : " (inactive: CUDA path)");
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
     const std::string fwdText = fwdReason.empty() ? std::string("forwarding to Intel XeFG") : fwdReason;

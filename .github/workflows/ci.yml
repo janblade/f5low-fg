@@ -57,5 +57,12 @@ jobs:
           ./build/mfgunlock_core_smoke.exe
           if ($LASTEXITCODE -ne 0) { throw "mfgunlock_core_smoke failed" }
 
+      # The PaceLead rule (src/pace_lead.h) on the host: no GPU
+      - name: Pace lead test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_pace_lead_test.ps1 -VsPath $vs
+
       - name: Audit the DLL (only what we compile in)
         run: python tools/audit.py --dll build/f5low.dll
