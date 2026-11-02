@@ -218,7 +218,58 @@ int main()
         const auto r = MfgUnlock::PtxTuring::BuildFromContainer(c.data());
         CHECK(r.ok && r.sourceArch == 120 && r.mma == 1);
     }
-    if (g_fail)
+    // F: RetargetTo on the forms the Ampere family leaves: the padded ".target sm_86 " (it replaced ".target sm_120") and a plain one
+    {
+        std::string why;
+        std::string padded = ".version 8.7\n.target sm_86 \n.address_size 64\n";
+        CHECK(MfgUnlock::PtxTuring::RetargetTo(padded, "86", why) && padded == ".version 8.7\n.target sm_86 \n.address_size 64\n");
+        std::string from120 = ".version 8.7\n.target sm_120 \n.address_size 64\n";
+        CHECK(MfgUnlock::PtxTuring::RetargetTo(from120, "86", why) && from120.find(".target sm_86 \n") != std::string::npos);
+        std::string to75 = ".version 8.7\n.target sm_86 \n";
+        CHECK(MfgUnlock::PtxTuring::RetargetTo(to75, "75", why) && to75 == ".version 8.7\n.target sm_75 \n");
+        std::string twice = ".target sm_89\n.target sm_89\n";
+        CHECK(!MfgUnlock::PtxTuring::RetargetTo(twice, "86", why));
+        // a padded container as the Ampere family leaves it (source PTX text with the trailing space) builds
+        const Bytes c = Container({ Entry(1, 86, ".version 8.7\n.target sm_86 \n.address_size 64\n.visible .entry k()\n{\nret;\n}\n", false), Entry(2, 122, "ELF", false) });
+        CHECK(NvapiFatbin::Rewrite(c.data(), c.size(), 86).ok);
+    }
+    // G: a size that would overflow `fatSize + 16` is refused, not wrapped
+    {
+        Bytes c = Container({ Entry(1, 89, Ptx("sm_89"), false) });
+        Put<uint64_t>(c, 8, ~0ull - 8); // fatSize near 2^64
+        CHECK(!NvapiFatbin::Rewrite(c.data(), c.size(), 86).ok);
+        c = Container({ Entry(1, 89, Ptx("sm_89"), false) });
+        CHECK(!NvapiFatbin::Rewrite(c.data(), 8, 86).ok); // smaller than a container header
+    }
+    // H: the create flow with a fake driver call: when the repeat with the shipped image happens, and when it must not
+    {
+        int calls = 0, lastOurs = -1;
+        uint64_t handle = 0;
+        const auto snapshot = [&] { return handle; };
+        const auto written = [&](uint64_t before) { return handle != before; };
+        // 1. our image accepted: one call, no repeat
+        auto a = NvapiFatbin::CreateWithFallback(true, "", [&](bool ours) { ++calls; lastOurs = ours; handle = 7; return 0; }, snapshot, written);
+        CHECK(a.status == 0 && a.rewritten && !a.failed && !a.retried && calls == 1 && lastOurs == 1);
+        // 2. no rewritten image: one call with the shipped image, counted as failed with the reason
+        calls = 0;
+        a = NvapiFatbin::CreateWithFallback(false, "no single source PTX", [&](bool ours) { ++calls; lastOurs = ours; return 0; }, snapshot, written);
+        CHECK(a.status == 0 && !a.rewritten && a.failed && !a.retried && calls == 1 && lastOurs == 0 && a.why == "no single source PTX");
+        // 3. our image refused without writing the handle: repeated once with the shipped one, whose status is returned
+        calls = 0;
+        handle = 0;
+        a = NvapiFatbin::CreateWithFallback(true, "", [&](bool ours) { ++calls; lastOurs = ours; return ours ? -5 : 0; }, snapshot, written);
+        CHECK(a.status == 0 && !a.rewritten && a.failed && a.retried && calls == 2 && lastOurs == 0 && a.why.find("-5") != std::string::npos);
+        // 4. our image refused but the handle was written: NOT repeated (no handle is lost), the error goes back
+        calls = 0;
+        handle = 0;
+        a = NvapiFatbin::CreateWithFallback(true, "", [&](bool ours) { ++calls; lastOurs = ours; handle = 9; return -5; }, snapshot, written);
+        CHECK(a.status == -5 && a.failed && !a.retried && calls == 1 && lastOurs == 1);
+        // 5. both refuse: the second status is returned
+        calls = 0;
+        handle = 0;
+        a = NvapiFatbin::CreateWithFallback(true, "", [&](bool ours) { ++calls; return ours ? -5 : -7; }, snapshot, written);
+        CHECK(a.status == -7 && a.failed && a.retried && calls == 2);
+    }    if (g_fail)
     {
         std::printf("nvapi_fatbin_test: %d FAILED\n", g_fail);
         return 1;

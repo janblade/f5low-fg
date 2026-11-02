@@ -468,6 +468,7 @@ struct Source
     std::string ptx;                  // the PTX text as shipped (NUL and padding removed)
     std::string failure;
     int sourceArch = 0;
+    bool sourceCompressed = false;    // the source entry was stored LZ4-compressed
     std::vector<uint8_t> header;      // the container header (16 bytes), as shipped
     std::vector<uint8_t> entryHeader; // the source entry's header, as shipped
 };
@@ -496,7 +497,7 @@ inline Source ExtractSourcePtx(const uint8_t* container, bool fromRetargeted, si
     }
 
     const uint64_t fatSize = Load<uint64_t>(container + 8);
-    if (fatSize == 0 || fatSize > (256ull << 20) || (size != 0 && fatSize + 0x10 > size))
+    if (fatSize == 0 || fatSize > (256ull << 20) || (size != 0 && (size < 0x10 || fatSize > size - 0x10)))
     {
         result.failure = "implausible fatbin size";
         return result;
@@ -569,6 +570,7 @@ inline Source ExtractSourcePtx(const uint8_t* container, bool fromRetargeted, si
         return result;
     }
     result.sourceArch = source->arch;
+    result.sourceCompressed = source->compressed != 0 && source->uncompressed != 0;
     result.header.assign(container, container + 0x10);
     result.entryHeader.assign(source->at, source->at + source->headerSize);
 

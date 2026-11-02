@@ -724,7 +724,8 @@ using namespace detail;
 namespace nvapi
 {
 inline bool Install(int targetSm, HMODULE ngx, HMODULE plugin, std::string& why);
-inline void LogSummary(const char* tierName);
+inline void LogSummary(const char* tierName, bool final);
+inline bool InstallTestE9Hook(std::string& why);
 } // namespace nvapi
 
 // F5LOW_NVAPI_COUNT=1 (tests): the NVAPI hook also on tiers that need no rewrite, counting only
@@ -750,6 +751,9 @@ inline Result Apply(const std::wstring& dir, Tier tier)
     g_done = true;
     Result r;
     r.tier = tier;
+    if (char t[8]; GetEnvironmentVariableA("F5LOW_TEST_E9_QI", t, sizeof t))
+        if (std::string why; !nvapi::InstallTestE9Hook(why))
+            Log("unlock: TEST: the E9 hook on nvapi_QueryInterface was not placed: %s", why.c_str());
     const auto fail = [&](const std::string& why) {
         r.ok = false;
         r.reason = why;
@@ -765,9 +769,12 @@ inline Result Apply(const std::wstring& dir, Tier tier)
         Log("unlock: %s: nothing to patch (DLSS-G generates up to 5 natively on this card)", TierName(tier));
         if (NvapiCountWanted())
         {
+            // Count-only (tests): our two files are loaded here, by full path as below, so their import tables can be reached
             std::string why;
-            if (!nvapi::Install(0, nullptr, nullptr, why))
-                Log("unlock: dlssg kernels: NVAPI count hook not installed: %s", why.c_str());
+            const HMODULE ngxModule = LoadLibraryW(longpath::Plain(dir + L"\\nvngx_dlssg.dll").c_str());
+            const HMODULE plModule = LoadLibraryW(longpath::Plain(dir + L"\\sl.xefg_dlss_g.dll").c_str());
+            if (!ngxModule || !nvapi::Install(0, ngxModule, plModule, why))
+                Log("unlock: dlssg kernels: NVAPI count hook not installed: %s", ngxModule ? why.c_str() : "cannot load nvngx_dlssg");
         }
         return r;
     }
@@ -814,6 +821,26 @@ inline Result Apply(const std::wstring& dir, Tier tier)
         Log("unlock: RTX 20: nvcuda's module loaders (cuModuleLoadData/FatBinary/DataEx, cuLibraryLoadData) are hooked; only containers of OUR nvngx_dlssg are rewritten for sm_75, everything else passes through");
     }
 
+    // The kernels DLSS-G creates through NVAPI (its only way: it makes no CUDA calls): RTX 30 retargeted to sm_86, RTX 20 rewritten to
+    // sm_75 (NvapiKernels.h). In place BEFORE the patches, because the patched module advertises a feature whose kernels only load this way;
+    // a hook that cannot be placed fails the unlock like the CUDA loaders do. F5LOW_NVAPI_DISABLE=1 (tests) leaves it out.
+    {
+        char off[8];
+        const int target = tier == Tier::Ampere ? 86 : tier == Tier::Turing ? 75 : 0;
+        if (GetEnvironmentVariableA("F5LOW_NVAPI_DISABLE", off, sizeof off))
+            Log("unlock: %s: TEST: the NVAPI kernel hook is disabled (F5LOW_NVAPI_DISABLE)", TierName(tier));
+        else if (target != 0 || NvapiCountWanted())
+        {
+            std::string why;
+            if (!nvapi::Install(target, g_ngx, g_plugin, why))
+            {
+                turingRewriteWanted.store(false, std::memory_order_release);
+                return fail("this DLSS-G build is not recognised by the unlock: the NVAPI kernel creation cannot be reached (" + why + ")");
+            }
+            Log("unlock: %s: NVAPI kernel creation wrapped for OUR nvngx_dlssg / sl.dlss_g only (id 0xAD1A677D)", TierName(tier));
+        }
+    }
+
     const auto ngxApplied = g_ngxSet.Apply(ngx.operations);
     if (!ngxApplied.applied)
     {
@@ -830,21 +857,6 @@ inline Result Apply(const std::wstring& dir, Tier tier)
         g_ngxSet.Restore();
         turingRewriteWanted.store(false, std::memory_order_release);
         return fail("patch transaction failed in sl.dlss_g (nvngx_dlssg restored)");
-    }
-
-    // The kernels DLSS-G creates through NVAPI (its only way: it makes no CUDA calls): RTX 30 retargeted to sm_86, RTX 20 rewritten
-    // to sm_75. Not fatal when the hook cannot be placed: the CUDA module-load rewrite above stays in place.
-    {
-        std::string why;
-        const int target = tier == Tier::Ampere ? 86 : tier == Tier::Turing ? 75 : 0;
-        if (target != 0 || NvapiCountWanted())
-        {
-            if (nvapi::Install(target, g_ngx, g_plugin, why))
-                Log("unlock: %s: NVAPI kernel creation hooked (id 0xAD1A677D; only calls from OUR nvngx_dlssg / sl.dlss_g are wrapped)%s", TierName(tier),
-                    target == 0 ? ", count only" : "");
-            else
-                Log("unlock: %s: WARNING the NVAPI kernel creation cannot be hooked (%s): DLSS-G's kernels reach the driver as shipped", TierName(tier), why.c_str());
-        }
     }
 
     r.ok = true;
@@ -869,7 +881,7 @@ inline Result Apply(const std::wstring& dir, Tier tier)
 inline void LogAfterStart()
 {
     std::lock_guard lk(g_mu);
-    nvapi::LogSummary(g_ngx ? TierName(g_result.tier) : "native");
+    nvapi::LogSummary(g_ngx ? TierName(g_result.tier) : "native", false);
     if (!g_done || !g_ngx)
         return;
     ListModules(L"nvngx_dlssg.dll", g_ngx, "DLSS-G module:");
@@ -889,7 +901,7 @@ inline void LogAfterStart()
 
 inline void LogCudaTotals()
 {
-    nvapi::LogSummary(g_ngx ? TierName(g_result.tier) : "native");
+    nvapi::LogSummary(g_ngx ? TierName(g_result.tier) : "native", true);
     if (g_done && turingRewriteWanted.load())
         Log("unlock: RTX 20 CUDA rewrite: %u module loads seen, %u from our module, %u containers rewritten to sm_75, %u left as shipped (%u loads from other callers passed through)",
             cudaSeen.load(), cudaInOurs.load(), cudaRewritten.load(), cudaLeft.load(), cudaOthers.load());

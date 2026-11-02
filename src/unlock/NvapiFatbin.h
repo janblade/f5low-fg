@@ -25,7 +25,8 @@ struct Built
     std::string failure;
     int sourceArch = 0;
     unsigned mma = 0, minMax = 0, cvt = 0; // Turing rewrite counters
-    uint64_t sourceFlags = 0;        // the source entry's flags field (logged once: the compression bits matter)
+    uint64_t sourceFlags = 0;        // the source entry's flags field (logged once)
+    bool sourceCompressed = false;   // the source entry was LZ4-compressed (logged with the flags: how the flag bit was confirmed)
 };
 
 namespace detail
@@ -34,7 +35,10 @@ template <typename T> inline void Store(std::vector<uint8_t>& bytes, size_t at, 
 {
     std::memcpy(bytes.data() + at, &value, sizeof(T));
 }
-// FATBIN_FLAG_COMPRESS_LZ4 / _ZSTD of the public layout: the new image is stored plain
+// The entry-flag bits that say "payload is compressed". Observed (f5low.log, "first container" line): the shipped LZ4-compressed PTX
+// entries of DLSS-G 310.9 carry flags 0x2041, with 0x2000 set and 0x1000 clear, so 0x2000 is the LZ4 bit here. 0x1000 is cleared as
+// well only as a precaution (the bit the public fatbin layouts use for the other codec); it was never seen set. A new entry is stored
+// plain, with the compressed and uncompressed size fields 0, which is also what the driver accepted on the forced-tier runs.
 constexpr uint64_t kCompressionFlags = 0x1000 | 0x2000;
 } // namespace detail
 
@@ -77,6 +81,7 @@ inline Built Rewrite(const uint8_t* image, size_t size, int targetSm)
         return built;
     }
     built.sourceArch = source.sourceArch;
+    built.sourceCompressed = source.sourceCompressed;
     if (source.entryHeader.size() >= 0x30)
         std::memcpy(&built.sourceFlags, source.entryHeader.data() + 0x28, sizeof(built.sourceFlags));
     if (!MfgUnlock::PtxTuring::RetargetTo(source.ptx, targetSm == 86 ? "86" : "75", built.failure))
@@ -97,5 +102,49 @@ inline Built Rewrite(const uint8_t* image, size_t size, int targetSm)
     built.image = MakeContainer(source, source.ptx, static_cast<uint32_t>(targetSm));
     built.ok = true;
     return built;
+}
+
+// ---- the create call's decision flow (host-testable: the driver call and the handle check come in as callables) ------------------------
+struct Attempt
+{
+    int status = 0;          // what the caller gets back
+    bool rewritten = false;  // the driver took our image
+    bool failed = false;     // the container was left as shipped (or its create failed), `why` says why
+    bool retried = false;    // the real create was called a second time, with the shipped image
+    std::string why;
+};
+
+// `haveMade`: the rewritten container exists (else `why` is the reason). real(true) calls the driver's create with OUR image, real(false)
+// with the shipped one. snapshot()/written(before) tell whether the call wrote the output handle. The real create is called a second
+// time ONLY when the first call returned an error and did not write the handle: a call that wrote a handle (even with an error) is
+// never repeated, so no handle is created and lost.
+template <class Real, class Snapshot, class Written>
+inline Attempt CreateWithFallback(bool haveMade, std::string why, Real&& real, Snapshot&& snapshot, Written&& written)
+{
+    Attempt a;
+    if (!haveMade)
+    {
+        a.failed = true;
+        a.why = std::move(why);
+        a.status = real(false);
+        return a;
+    }
+    const uint64_t before = snapshot();
+    a.status = real(true);
+    if (a.status == 0)
+    {
+        a.rewritten = true;
+        return a;
+    }
+    a.failed = true;
+    a.why = "the driver refused the rewritten image (status " + std::to_string(a.status) + ")";
+    if (written(before))
+    {
+        a.why += "; it wrote the handle, so the create was not repeated";
+        return a;
+    }
+    a.retried = true;
+    a.status = real(false);
+    return a;
 }
 } // namespace NvapiFatbin
