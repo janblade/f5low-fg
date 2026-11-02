@@ -7,7 +7,7 @@ the UI/letterbox rules. A **generator** only makes the in-between frames.
 
 Three generators run: **own** (XeFG Tensor), **dlssg** (NVIDIA DLSS-G through a private copy of the player's Streamline,
 RTX 20 and newer, 2x to 6x on every tier: native on RTX 50, unlocked in memory on RTX 20/30/40, see "dlssg" below) and **intel**
-(Intel's libxess_fg from a private copy, unlocked in memory to 6x, see "intel" below). `fsr` is registered and selectable, reports
+(Intel's libxess_fg, the one the own generator reads, unlocked in memory to 6x, see "intel" below). `fsr` is registered and selectable, reports
 "not available yet" in the log, and runs `own`; its design is below (see "What is ready").
 
 ## Choosing a generator
@@ -125,8 +125,8 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 - **intel** (built, `src/generators/intel.h`, `src/unlock/FamilyXeFG.h` + `UnlockXeFg.h`): Intel's libxess_fg makes the frames, our sink
   paces them. Present-sink shape, spaced mode. Any D3D12 GPU Intel's library runs on.
   - *Routing.* `Generator=intel` in `D3D12CreateContext` builds an `xintel::Ctx` (not `Own`). The handle is the library's own handle; every XeFG
-    entry point of `xefg_cuda.cpp` calls the PRIVATE library for such a handle (`FORWARDH`), the other handles still go to the shared
-    `Real()` library. **No fallback**: when the library cannot start (no libxess_fg found, copy or load failed, CreateContext refused),
+    entry point of `xefg_cuda.cpp` calls the library f5low loaded for it for such a handle (`FORWARDH`; a proc it lacks is an error, never a fall-back), the other handles still go to the shared
+    `Real()` library. **No fallback**: when the library cannot start (no libxess_fg found, the load failed, a failed rollback of the unlock, CreateContext refused),
     `f5low: generator intel not available (<reason>) - frame generation is off (no fallback to own)`, `f5lowGetStatus` 3
     `intel unavailable: <reason>`, `XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE`.
   - *Library.* No copies on disk. It is the SAME libxess_fg.dll the own generator reads (`RealLibraryPath` in `xefg_cuda.cpp`:
@@ -135,16 +135,23 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   - *Unlock.* `unlock/FamilyXeFG.h` (OptiScaler-NR's family, U1-U5 on libxess_fg, XL1 on libxell, structural locators) applied by
     `unlock/UnlockXeFg.h` right after f5low loaded the library and BEFORE the first XeFG call: Intel sizes every per-generated-frame buffer
     from U3 (its default interpolation ceiling) when a context is created, so a late patch leaves 3-slot buffers (evidence in the ai-os
-    2026-11-03 study). If libxess_fg.dll was ALREADY loaded in the process before f5low (a context may exist), nothing is patched: Intel's
-    own maximum, with the reason in the log. All or none; an unknown build is refused with the failing site and the library then runs
+    2026-11-03 study). Whether libxess_fg.dll was ALREADY loaded in the process before f5low is decided by handle (the process' module
+    list before the load against the handle the load returns: 8.3 names, junctions and `\\?\` prefixes do not matter); then a context may exist
+    and nothing is patched: Intel's own maximum, with the reason in the log. One exception: the module f5low's own forwarding (`Real()`)
+    loaded itself, when no context was ever made through it, counts as f5low's own and is patched. **The patched module is shared:** it is THE
+    module of that path, so a later loader in the process (the player switching OptiScaler's FG output to XeFG at run time) gets a library that
+    reports 6x; the log line "module shared" says so when the unlock applies. All or none; an unknown build is refused with the failing site and the library then runs
     unpatched at its own maximum (on an RTX 5070 Ti with 1.3.4.95 and libxell 1.3.2.10 that is 2x: GetProperties says 1; with the
     unlock it says 5 = 6x). A failed rollback (a partially patched module) refuses the library outright: status 3. The count is 3 to 5.
     `F5LOW_INTEL_UNLOCK=0|off|false|no` turns it off (tests); `F5LOW_TEST_XEFG_SKIP=U4` leaves one site unpatched (tests). This patches
     inside Intel's DLLs in memory; nothing is written to disk.
   - *libxell.* libxess_fg does not import libxell: it calls `GetModuleHandleExA(0, "libxell.dll")` at run time, so it uses the libxell the
     process already has (OptiScaler's or the game's) = the one that made the XeLL context OptiScaler hands over. XL1 is patched in that
-    module in memory (one log line says so; it only lifts libxell's refusal of generated-frame counts above 3). If no libxell.dll is loaded
-    when the context is created, the one next to libxess_fg is loaded by full path. If the XL1 site is not found (or a libxell was patched
+    module in memory (one log line says so; it only lifts libxell's refusal of generated-frame counts above 3; f5low takes a reference on it so
+    it is not unloaded and loaded again unpatched). XL1 already holding exactly the byte this family writes (another component, e.g.
+    OptiScaler's own MFG unlock on the shared libxell, lifted it) counts as applied ("already lifted by another component"); the same is
+    never accepted for libxess_fg U1-U5. If no libxell.dll is loaded
+    when the context is created, the one next to libxess_fg is loaded by full path. If the XL1 site is not found (or the libxell holds another count
     before), XL1 and the libxess_fg unlock are skipped together. Intel reports the generated frames to XeLL itself every frame, so
     `xefgCudaXellCountsRenderedOnly` stays 0.
   - *Sink.* `InitFromSwapChainDesc` hands Intel a `SinkFactory` (spaced mode); `SetEnabled` / `SetNumInterpolatedFrames` set the sink's burst

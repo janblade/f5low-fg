@@ -405,6 +405,13 @@ int main(int argc, char** argv)
     LARGE_INTEGER qf, qa, qb;
     QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&qa);
+    // REPRO_FORWARD_FIRST=1: a call on a null handle before CreateContext, which f5low forwards to the shared libxess_fg (loading it): a
+    // Generator=intel run must still unlock (the module is f5low's own, no context was made through it)
+    if (EnvInt("REPRO_FORWARD_FIRST", 0) == 1)
+    {
+        LOADFN(dll, xefgSwapChainGetPipelineBuildStatus);
+        printf("forwarded call before CreateContext: %d\n", xefgSwapChainGetPipelineBuildStatus ? xefgSwapChainGetPipelineBuildStatus(nullptr) : -99);
+    }
     // REPRO_PRELOAD=<libxess_fg.dll>: that library is loaded in this process BEFORE CreateContext (a Generator=intel run must then skip its
     // unlock: the library may already have contexts, see generators/intel.h)
     if (char pre[1024]; GetEnvironmentVariableA("REPRO_PRELOAD", pre, sizeof(pre)))
