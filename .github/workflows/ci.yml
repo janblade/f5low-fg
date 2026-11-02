@@ -64,5 +64,12 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_pace_lead_test.ps1 -VsPath $vs
 
+      # The NVAPI kernel container rewrite (src/unlock/NvapiFatbin.h) on synthetic fatbin containers: no GPU, no NVIDIA file
+      - name: NVAPI fatbin test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_nvapi_fatbin_test.ps1 -VsPath $vs
+
       - name: Audit the DLL (only what we compile in)
         run: python tools/audit.py --dll build/f5low.dll

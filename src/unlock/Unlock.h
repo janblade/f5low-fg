@@ -720,6 +720,20 @@ inline void ListModules(const wchar_t* name, HMODULE ours, const char* label)
 } // namespace detail
 using namespace detail;
 
+// NvapiKernels.h (included at the end): DLSS-G's kernel creation through NVAPI, rewritten for RTX 20/30
+namespace nvapi
+{
+inline bool Install(int targetSm, HMODULE ngx, HMODULE plugin, std::string& why);
+inline void LogSummary(const char* tierName);
+} // namespace nvapi
+
+// F5LOW_NVAPI_COUNT=1 (tests): the NVAPI hook also on tiers that need no rewrite, counting only
+inline bool NvapiCountWanted()
+{
+    char v[8];
+    return GetEnvironmentVariableA("F5LOW_NVAPI_COUNT", v, sizeof v) != 0;
+}
+
 inline std::mutex g_mu;
 inline Result g_result;
 inline bool g_done = false;
@@ -749,6 +763,12 @@ inline Result Apply(const std::wstring& dir, Tier tier)
         r.nothingPatched = true;
         g_result = r;
         Log("unlock: %s: nothing to patch (DLSS-G generates up to 5 natively on this card)", TierName(tier));
+        if (NvapiCountWanted())
+        {
+            std::string why;
+            if (!nvapi::Install(0, nullptr, nullptr, why))
+                Log("unlock: dlssg kernels: NVAPI count hook not installed: %s", why.c_str());
+        }
         return r;
     }
 
@@ -812,6 +832,21 @@ inline Result Apply(const std::wstring& dir, Tier tier)
         return fail("patch transaction failed in sl.dlss_g (nvngx_dlssg restored)");
     }
 
+    // The kernels DLSS-G creates through NVAPI (its only way: it makes no CUDA calls): RTX 30 retargeted to sm_86, RTX 20 rewritten
+    // to sm_75. Not fatal when the hook cannot be placed: the CUDA module-load rewrite above stays in place.
+    {
+        std::string why;
+        const int target = tier == Tier::Ampere ? 86 : tier == Tier::Turing ? 75 : 0;
+        if (target != 0 || NvapiCountWanted())
+        {
+            if (nvapi::Install(target, g_ngx, g_plugin, why))
+                Log("unlock: %s: NVAPI kernel creation hooked (id 0xAD1A677D; only calls from OUR nvngx_dlssg / sl.dlss_g are wrapped)%s", TierName(tier),
+                    target == 0 ? ", count only" : "");
+            else
+                Log("unlock: %s: WARNING the NVAPI kernel creation cannot be hooked (%s): DLSS-G's kernels reach the driver as shipped", TierName(tier), why.c_str());
+        }
+    }
+
     r.ok = true;
     g_result = r;
     // The status lines, in OptiScaler's format
@@ -834,6 +869,7 @@ inline Result Apply(const std::wstring& dir, Tier tier)
 inline void LogAfterStart()
 {
     std::lock_guard lk(g_mu);
+    nvapi::LogSummary(g_ngx ? TierName(g_result.tier) : "native");
     if (!g_done || !g_ngx)
         return;
     ListModules(L"nvngx_dlssg.dll", g_ngx, "DLSS-G module:");
@@ -853,8 +889,11 @@ inline void LogAfterStart()
 
 inline void LogCudaTotals()
 {
+    nvapi::LogSummary(g_ngx ? TierName(g_result.tier) : "native");
     if (g_done && turingRewriteWanted.load())
         Log("unlock: RTX 20 CUDA rewrite: %u module loads seen, %u from our module, %u containers rewritten to sm_75, %u left as shipped (%u loads from other callers passed through)",
             cudaSeen.load(), cudaInOurs.load(), cudaRewritten.load(), cudaLeft.load(), cudaOthers.load());
 }
 } // namespace unlock
+
+#include "NvapiKernels.h"

@@ -183,7 +183,18 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     refused (status 3) on a driver whose functions have a prologue it cannot copy. Tests: `tests/build_mfgunlock_tests.ps1`
     (`mfgunlock_core_smoke` on synthetic images, `mfgunlock_check`, `mfgunlock_fatbin_refs`, `mfgunlock_turing_probe` and `unlock_hook_probe` on
     the player's own `nvngx_dlssg.dll` / `sl.dlss_g.dll`, passed as arguments and never copied into the repo).
-  - *Credits.* The sl.dlss_g frame-count clamp and software-pacing approach is adapted from KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT, from
+  - *The NVAPI kernel path (RTX 20/30, `src/unlock/NvapiKernels.h`, `NvapiFatbin.h`).* DLSS-G makes no CUDA calls: it creates its ~80 kernels
+    through NVAPI (`nvapi_QueryInterface` id 0xAD1A677D, device + image + size) and launches them as D3D12 compute work. Every image is a CUDA
+    fatbin container with PTX for Ada/Blackwell, which an RTX 20/30 driver cannot use (the CUDA module-load hook above never fires). On
+    those tiers `nvapi_QueryInterface` gets one inline hook; when OUR nvngx_dlssg / sl.dlss_g ask for that id they get a wrapper (every other
+    caller the real function). The wrapper replaces the container by a new one with a single, uncompressed PTX image for the card, built
+    from the shipped one's own headers: RTX 30 the source PTX with `.target sm_86`, RTX 20 the same through the sm_75 rewrite of
+    `PtxTuring.h`. The source is the Blackwell PTX when the container has one, else the Ada PTX, or the sm_86 PTX the Ampere family already
+    retargeted in memory. A container that cannot be rewritten, or that the driver refuses, goes to the real create as shipped (counted; the
+    first reason is logged). The new containers stay alive for the process. RTX 40 and newer: no hook (`F5LOW_NVAPI_COUNT=1` installs it
+    count-only, for tests). One log line at the end: `dlssg kernels: <tier> path, N of M retargeted|rewritten, K passed through, F failed
+    (<first reason>), took X ms` (the driver's JIT happens inside the create, so X is mostly JIT: a second start is faster through the
+    driver's cache). Test without a GPU: `tests/build_nvapi_fatbin_test.ps1` (synthetic containers).  - *Credits.* The sl.dlss_g frame-count clamp and software-pacing approach is adapted from KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT, from
     the RenoDX MFG Unlock addon by Dreamt and mavismmg): the notice is in `licenses/MFGUnlock_LICENSE.txt`.
   - *Later.* Story 2b: kernels tuned for RTX 20/30; story 3: tester proof on real RTX 40/30/20 cards; story 4: OptiScaler side (generator
     choice, Reflex cap, Streamline hand-over). Nothing NVIDIA-derived is ever written to disk or committed (`tools/audit.py` has an `nvidia`

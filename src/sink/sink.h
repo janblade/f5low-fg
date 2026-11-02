@@ -93,6 +93,10 @@ inline std::mutex g_linkMu;                 // the factory <-> sink link (SinkFa
 inline std::vector<double> g_outTimes;      // QPC ms of each real Present call's return (XEFG_CUDA_PACELOG lists them; tests/pacer_ab.ps1)
 inline std::vector<double> g_copyGpuMs;     // GPU ms of each staging copy (timestamps around it)
 inline std::vector<std::pair<uint64_t, int>> g_probe;    // SINK_PROBE (harness): frame number, x of the first bright-yellow pixel in row 540 (-1 none)
+// SINK_PROBE_DUMP=<file> (harness): row 540 of the first frames shown, to compare two runs pixel by pixel (written with the statistics):
+// u32 rows, u32 bytes per row, then per row u64 frame number + the row bytes. At most kProbeRows rows.
+inline constexpr size_t kProbeRows = 1500;
+inline std::vector<std::pair<uint64_t, std::vector<uint8_t>>> g_probeRows;
 
 inline size_t g_depthStat = 0;              // the last sink's deepest queue and how often the library had to wait for room (set when it is released)
 inline unsigned g_fullStat = 0;
@@ -104,6 +108,7 @@ inline void ResetGaps()
     g_outTimes.clear();
     g_copyGpuMs.clear();
     g_probe.clear();
+    g_probeRows.clear();
 }
 
 // The statistics as text lines: the harness prints them, the DLL logs them.
@@ -126,6 +131,23 @@ inline std::vector<std::string> StatsLines()
         }
     if (g_probe.empty())
         return lines;
+    if (char dumpPath[MAX_PATH]; !g_probeRows.empty() && GetEnvironmentVariableA("SINK_PROBE_DUMP", dumpPath, sizeof dumpPath))
+    {
+        std::sort(g_probeRows.begin(), g_probeRows.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (FILE* fp = nullptr; fopen_s(&fp, dumpPath, "wb") == 0 && fp)
+        {
+            const uint32_t rows = static_cast<uint32_t>(g_probeRows.size()), bytes = static_cast<uint32_t>(g_probeRows[0].second.size());
+            fwrite(&rows, 4, 1, fp);
+            fwrite(&bytes, 4, 1, fp);
+            for (const auto& r : g_probeRows)
+            {
+                fwrite(&r.first, 8, 1, fp);
+                fwrite(r.second.data(), 1, r.second.size(), fp);
+            }
+            fclose(fp);
+            lines.push_back("sink probe: " + std::to_string(rows) + " rows of row 540 written to " + dumpPath);
+        }
+    }
     // The test pattern's bar moves the same distance each frame: the steps between shown frames say whether they are in order
     std::sort(g_probe.begin(), g_probe.end());
     std::map<int, unsigned> steps;
@@ -388,6 +410,12 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 probe->Unmap(0, &none);
             }
             std::lock_guard<std::mutex> l(g_outMu);
+            if (g_probeRows.size() < kProbeRows && EnvSet("SINK_PROBE_DUMP") && SUCCEEDED(probe->Map(0, &rr, &p)))
+            {
+                const uint8_t* row = static_cast<const uint8_t*>(p) + a * probePitch;
+                g_probeRows.push_back({ probeN[a], std::vector<uint8_t>(row, row + probePitch) });
+                probe->Unmap(0, &none);
+            }
             g_probe.push_back({ probeN[a], x });
             probePending[a] = false;
         }

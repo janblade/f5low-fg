@@ -428,8 +428,8 @@ inline Rewrite RewriteText(std::string_view text)
     return result;
 }
 
-// Replaces the number in ".target sm_NNN" by 75. Requires exactly one directive and a plain number.
-inline bool RetargetToTuring(std::string& ptx, std::string& failure)
+// Replaces the number in ".target sm_NNN" by `sm`. Requires exactly one directive and a plain number.
+inline bool RetargetTo(std::string& ptx, const char* sm, std::string& failure)
 {
     constexpr std::string_view needle = ".target sm_";
     const size_t at = ptx.find(needle);
@@ -447,8 +447,12 @@ inline bool RetargetToTuring(std::string& ptx, std::string& failure)
         failure = ".target architecture is not a plain number";
         return false;
     }
-    ptx.replace(at + needle.size(), end - (at + needle.size()), "75");
+    ptx.replace(at + needle.size(), end - (at + needle.size()), sm);
     return true;
+}
+inline bool RetargetToTuring(std::string& ptx, std::string& failure)
+{
+    return RetargetTo(ptx, "75", failure);
 }
 
 // f5low: the two container magics are put together from halves at run time (volatile), so a compare never carries them as one 4-byte
@@ -457,13 +461,27 @@ inline volatile uint32_t kMagicHalves[4] = { 0xBA55, 0xED50, 0x4662, 0x43B1 };
 inline const uint32_t kFatbinMagic = (kMagicHalves[0] << 16) | kMagicHalves[1];
 inline const uint32_t kFatbinWrapperMagic = (kMagicHalves[2] << 16) | kMagicHalves[3];
 
-// Reads a fatbin container (or a fatbinary wrapper pointing at one) and returns the sm_75 PTX for it.
+// What ExtractSourcePtx hands back: the text of the container's source PTX and the entry it came from.
+struct Source
+{
+    bool ok = false;
+    std::string ptx;                  // the PTX text as shipped (NUL and padding removed)
+    std::string failure;
+    int sourceArch = 0;
+    std::vector<uint8_t> header;      // the container header (16 bytes), as shipped
+    std::vector<uint8_t> entryHeader; // the source entry's header, as shipped
+};
+
+// Reads a fatbin container (or a fatbinary wrapper pointing at one) and returns the text of its source PTX.
 // The source is the Blackwell PTX when the container has one, otherwise the Ada PTX; every image in the container
 // must be sm_89 or sm_120, which is the shape of nvngx_dlssg's kernels. Anything else is not ours and is rejected.
-inline Rewrite BuildFromContainer(const uint8_t* container)
+// f5low: `fromRetargeted` (the NVAPI kernel path, NvapiFatbin.h) also takes a container the Ampere family already retargeted in
+// memory: its source PTX is then the single PTX image of arch 86 and the other images carry a parked arch; images of any arch
+// are tolerated and only the source is looked at. `size` (0 = unknown) bounds the container when it is handed in by size.
+inline Source ExtractSourcePtx(const uint8_t* container, bool fromRetargeted, size_t size = 0)
 {
     using namespace detail;
-    Rewrite result;
+    Source result;
     if (container == nullptr)
     {
         result.failure = "null image";
@@ -478,17 +496,21 @@ inline Rewrite BuildFromContainer(const uint8_t* container)
     }
 
     const uint64_t fatSize = Load<uint64_t>(container + 8);
-    if (fatSize == 0 || fatSize > (256ull << 20))
+    if (fatSize == 0 || fatSize > (256ull << 20) || (size != 0 && fatSize + 0x10 > size))
     {
         result.failure = "implausible fatbin size";
         return result;
     }
 
-    const uint8_t* source = nullptr;
-    uint32_t sourceHeader = 0, sourceCompressed = 0;
-    uint64_t sourcePayload = 0, sourceUncompressed = 0;
-    int sourceArch = 0;
-    unsigned sourcePtxCount[2] = {};
+    struct Image
+    {
+        const uint8_t* at;
+        uint32_t headerSize;
+        uint32_t compressed;
+        uint64_t payload, uncompressed;
+        int arch;
+    };
+    std::vector<Image> ptx;
 
     size_t at = 0x10;
     const size_t end = 0x10 + static_cast<size_t>(fatSize);
@@ -505,44 +527,62 @@ inline Rewrite BuildFromContainer(const uint8_t* container)
             result.failure = "malformed fatbin entry";
             return result;
         }
-        if ((kind != 1 && kind != 2) || (arch != 89 && arch != 120))
+        if (!fromRetargeted && ((kind != 1 && kind != 2) || (arch != 89 && arch != 120)))
         {
             result.failure = "container has an image that is not sm_89/sm_120";
             return result;
         }
         if (kind == 1)
-        {
-            ++sourcePtxCount[arch == 120 ? 1 : 0];
-            if (arch == 120 || sourceArch != 120)
-            {
-                source = container + at + headerSize;
-                sourceHeader = headerSize;
-                sourceCompressed = compressed;
-                sourcePayload = payload;
-                sourceUncompressed = uncompressed;
-                sourceArch = static_cast<int>(arch);
-            }
-        }
+            ptx.push_back({ container + at, headerSize, compressed, payload, uncompressed, static_cast<int>(arch) });
         at += headerSize + payload;
     }
-    (void)sourceHeader;
-    if (source == nullptr || sourcePtxCount[sourceArch == 120 ? 1 : 0] != 1)
+
+    // Blackwell first (it also carries the corrected interpolation), then Ada; a container that was retargeted in memory has its
+    // source at 86. Exactly one PTX image of the chosen arch.
+    const Image* source = nullptr;
+    for (const int wanted : { 86, 120, 89 })
+    {
+        if (wanted == 86 && !fromRetargeted)
+            continue;
+        unsigned count = 0;
+        const Image* found = nullptr;
+        for (const Image& image : ptx)
+            if (image.arch == wanted)
+            {
+                found = &image;
+                ++count;
+            }
+        if (count == 1)
+        {
+            source = found;
+            break;
+        }
+        if (count > 1)
+        {
+            result.failure = "container has no single source PTX";
+            return result;
+        }
+    }
+    if (source == nullptr)
     {
         result.failure = "container has no single source PTX";
         return result;
     }
-    result.sourceArch = sourceArch;
+    result.sourceArch = source->arch;
+    result.header.assign(container, container + 0x10);
+    result.entryHeader.assign(source->at, source->at + source->headerSize);
 
+    const uint8_t* body = source->at + source->headerSize;
     std::vector<uint8_t> text;
-    if (sourceCompressed != 0 && sourceUncompressed != 0)
+    if (source->compressed != 0 && source->uncompressed != 0)
     {
-        if (sourceUncompressed > (64ull << 20) || sourceCompressed > sourcePayload ||
-            sourcePayload < 2 || (source[0] == 0x28 && source[1] == 0xB5))
+        if (source->uncompressed > (64ull << 20) || source->compressed > source->payload || source->payload < 2 ||
+            (body[0] == 0x28 && body[1] == 0xB5))
         {
             result.failure = "PTX payload is not LZ4";
             return result;
         }
-        if (!Lz4Decompress(source, sourceCompressed, text, static_cast<size_t>(sourceUncompressed)))
+        if (!Lz4Decompress(body, source->compressed, text, static_cast<size_t>(source->uncompressed)))
         {
             result.failure = "PTX LZ4 decode failed";
             return result;
@@ -550,18 +590,33 @@ inline Rewrite BuildFromContainer(const uint8_t* container)
     }
     else
     {
-        text.assign(source, source + sourcePayload);
+        text.assign(body, body + source->payload);
     }
 
     size_t length = 0;
     while (length < text.size() && text[length] != 0)
         ++length;
-    std::string ptx(reinterpret_cast<const char*>(text.data()), length);
-    if (!RetargetToTuring(ptx, result.failure))
+    result.ptx.assign(reinterpret_cast<const char*>(text.data()), length);
+    result.ok = true;
+    return result;
+}
+
+// The sm_75 PTX for a container (see ExtractSourcePtx): retargeted and rewritten.
+inline Rewrite BuildFromContainer(const uint8_t* container)
+{
+    Rewrite result;
+    Source source = ExtractSourcePtx(container, false);
+    if (!source.ok)
+    {
+        result.failure = source.failure;
+        return result;
+    }
+    result.sourceArch = source.sourceArch;
+    if (!RetargetToTuring(source.ptx, result.failure))
         return result;
 
-    Rewrite rewritten = RewriteText(ptx);
-    rewritten.sourceArch = sourceArch;
+    Rewrite rewritten = RewriteText(source.ptx);
+    rewritten.sourceArch = source.sourceArch;
     return rewritten;
 }
 } // namespace MfgUnlock::PtxTuring
