@@ -30,10 +30,26 @@
 //   REPRO_INTERP2=n switch to n halfway through the frames on
 //   REPRO_RESIZEBUF=1  ResizeBuffers right after the first Present at the new render size (while the DLL's rebuild for it
 //                   may still be pending), and again 3 frames later
+//   REPRO_FRONT=1   keep the window in front (DLSS-G, Generator=dlssg, generates only for the foreground window)
+//   REPRO_BAR=1    the picture is a bright-yellow bar (120 px wide, full height) moving 12 px per app frame on a dark ground, motion
+//                   vectors (-8, 0) to match: with SINK_PROBE the sink reads row 540 of every frame shown, so the steps between
+//                   shown frames say whether they are in order (docs/GENERATORS.md)
+//   REPRO_HIST=1   after every frame with frame generation on, GetLastPresentStatus: a histogram of frames presented per app frame
+//                   and the number of times the window had lost the foreground, printed at the end
+//   REPRO_FPS=n     the app produces n frames per second, not as fast as the GPU lets it
+//   REPRO_MENU=N    two N-frame stretches (from a quarter and from five eighths of the frames on) with frame generation
+//                   still enabled but no tags, no SetPresentId and no frame constants: Cyberpunk's pause menu
+//   REPRO_FS=1      exclusive fullscreen from a third of the frames on until two thirds (SetFullscreenState + ResizeBuffers)
+//   REPRO_RECREATE_GEN=name  with REPRO_RECREATE_AT: F5LOW_GENERATOR is set to name before the new context is made
+//                   (own <-> dlssg without a restart)
+//   Generator=dlssg: F5LOW_SINK_STATS=1 (the DLL logs the sink's statistics to f5low.log when the context is destroyed) and
+//                   SINK_PROBE=1 (reads row 540 of every frame shown: the moving bar's steps say whether frames are in order)
 // Exit code: 0 ok, 1 setup failed, 2 debug-layer messages, 3 a Present failed / the device was removed.
 
 #include <windows.h>
 #include <shellapi.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
@@ -204,9 +220,32 @@ static void XefgLog(const char* message, xefg_swapchain_logging_level_t level, v
 
 #define LOADFN(m, name) auto name = reinterpret_cast<decltype(&::name)>(GetProcAddress(m, #name))
 
+// A crash inside a library under test: where (module + offset) and, for an access violation, what it touched.
+static LONG WINAPI CrashReport(EXCEPTION_POINTERS* ep)
+{
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != 0xC0000094 && code != 0xC000001D)
+        return EXCEPTION_CONTINUE_SEARCH;
+    HMODULE m = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress), &m))
+        GetModuleFileNameA(m, name, sizeof(name));
+    printf("CRASH 0x%08lx at %p = %s + 0x%llx, thread %lu", code, ep->ExceptionRecord->ExceptionAddress, name,
+           static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - reinterpret_cast<uintptr_t>(m)),
+           GetCurrentThreadId());
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        printf(", %s address %p", ep->ExceptionRecord->ExceptionInformation[0] ? "wrote" : "read",
+               reinterpret_cast<void*>(ep->ExceptionRecord->ExceptionInformation[1]));
+    printf("\n");
+    fflush(stdout);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0); // every line reaches the file even when a hang is killed
+    AddVectoredExceptionHandler(1, CrashReport);
     if (argc < 2)
     {
         printf("usage: repro_test <xefg dll> [libxell.dll]\n");
@@ -217,6 +256,11 @@ int main(int argc, char** argv)
     const bool lateTag = EnvInt("REPRO_LATE_TAG", 0) == 1;
     const bool gbv = EnvInt("REPRO_GBV", 0) == 1, noIdle = EnvInt("REPRO_NOIDLE", 0) == 1, toggle = EnvInt("REPRO_TOGGLE", 0) == 1;
     const bool removeDevice = EnvInt("REPRO_REMOVE", 0) == 1, resizeBuf = EnvInt("REPRO_RESIZEBUF", 0) == 1;
+    const bool bar = EnvInt("REPRO_BAR", 0) == 1;
+    const bool fsTest = EnvInt("REPRO_FS", 0) == 1;
+    const int appFps = EnvInt("REPRO_FPS", 0);
+    const int menuLen = EnvInt("REPRO_MENU", 0);
+    bool fsOn = false;
     const UINT rw = static_cast<UINT>(EnvInt("REPRO_RW", 1280)), rh = static_cast<UINT>(EnvInt("REPRO_RH", 720));
     if (debugLayer)
     {
@@ -433,6 +477,23 @@ int main(int argc, char** argv)
     wc.lpszClassName = "repro_test";
     RegisterClassA(&wc);
     HWND wnd = CreateWindowA("repro_test", "repro_test", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 960, 540, nullptr, nullptr, wc.hInstance, nullptr);
+    // REPRO_FRONT=1: keep the window in front (DLSS-G generates only for the foreground window); a synthetic Alt press lets a
+    // background process take the focus
+    const bool keepFront = EnvInt("REPRO_FRONT", 0) == 1;
+    INPUT alt[2] {};
+    alt[0].type = alt[1].type = INPUT_KEYBOARD;
+    alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU;
+    alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    unsigned refocus = 0;
+    auto takeFront = [&] {
+        if (keepFront && GetForegroundWindow() != wnd)
+        {
+            ++refocus;
+            SendInput(2, alt, sizeof(INPUT));
+            SetForegroundWindow(wnd);
+        }
+    };
+    takeFront();
     DXGI_SWAP_CHAIN_DESC1 sd {};
     sd.Width = static_cast<UINT>(EnvInt("REPRO_W", 1920));     // REPRO_W / REPRO_H: the output (back buffer) size
     sd.Height = static_cast<UINT>(EnvInt("REPRO_H", 1080));
@@ -469,8 +530,8 @@ int main(int argc, char** argv)
     g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al));
     g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&cl));
     ID3D12CommandList* ls[] = { cl };
-    Fill(cl, mv, 4, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [](UINT, UINT, uint8_t* t) {
-        const uint16_t v[2] = { Half(-4.0f), Half(0.0f) }; // a steady pan, 4 px per frame
+    Fill(cl, mv, 4, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [bar](UINT, UINT, uint8_t* t) {
+        const uint16_t v[2] = { Half(bar ? -8.0f : -4.0f), Half(0.0f) }; // a steady pan, 4 px per frame (REPRO_BAR: 8 render px = the bar's 12 output px)
         memcpy(t, v, 4);
     });
     Fill(cl, depth, 4, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [rw](UINT x, UINT, uint8_t* t) {
@@ -488,6 +549,7 @@ int main(int argc, char** argv)
     UINT64 ringFence[3] {};
     std::vector<ID3D12Resource*> ringUploads[3];
     int failures = 0;
+    unsigned hist[16] {};       // REPRO_HIST: app frames by the number of frames presented for them
     xefg_swapchain_frame_constant_data_t fc {};
     fc.motionVectorScaleX = fc.motionVectorScaleY = 1.0f;
     fc.frameRenderTime = 8.0f;
@@ -496,8 +558,18 @@ int main(int argc, char** argv)
         const bool on = frame >= framesOff;
         // REPRO_TOGGLE: off again on the first frame, back on 10 frames later (OptiScaler's UpdateTarget), tags only while on.
         const bool toggledOff = toggle && frame > framesOff && frame < framesOff + 10;
+        const int inOn = frame - framesOff, menu1 = framesOn / 4, menu2 = 5 * framesOn / 8;
+        const bool inMenu = menuLen > 0 && ((inOn >= menu1 && inOn < menu1 + menuLen) || (inOn >= menu2 && inOn < menu2 + menuLen));
+        if (menuLen > 0 && (inOn == menu1 || inOn == menu2 || inOn == menu1 + menuLen || inOn == menu2 + menuLen))
+            printf("frame %d: %s the menu\n", frame, inMenu ? "into" : "out of");
         if (frame == framesOff || (toggle && frame == framesOff + 10))
             printf("frame %d: SetEnabled 1: %d\n", frame, xefgSwapChainSetEnabled(h, 1));
+        if (frame % 30 == 0)
+        {
+            for (MSG msg; PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE);)
+                DispatchMessageA(&msg);
+            takeFront();
+        }
         if (wait)
             WaitForSingleObject(wait, 1000);
         if (xellSleepFn)
@@ -525,7 +597,17 @@ int main(int argc, char** argv)
         ID3D12CommandAllocator* fa = noIdle ? ring[ri] : al;
         fa->Reset();
         cl->Reset(fa, nullptr);
-        Fill(cl, bb, 4, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT, [frame](UINT x, UINT y, uint8_t* t) {
+        const UINT barX = static_cast<UINT>(frame * 12) % sd.Width;
+        Fill(cl, bb, 4, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT, [frame, bar, barX](UINT x, UINT y, uint8_t* t) {
+            if (bar)
+            {
+                const bool in = x >= barX && x < barX + 120;
+                t[0] = in ? 230 : 26;
+                t[1] = in ? 204 : 30;
+                t[2] = in ? 51 : 38;
+                t[3] = 255;
+                return;
+            }
             const UINT s = x + static_cast<UINT>(frame) * 4;
             t[0] = static_cast<uint8_t>(s);
             t[1] = static_cast<uint8_t>(y);
@@ -556,7 +638,7 @@ int main(int argc, char** argv)
             if (timeIt)
                 printf("frame %d: tags took %.2f ms\n", frame, ms(t0));
         };
-        if (on && !toggledOff && !lateTag)
+        if (on && !toggledOff && !inMenu && !lateTag)
             tag();
         cl->Close();
         g_q->ExecuteCommandLists(1, ls);
@@ -566,13 +648,14 @@ int main(int argc, char** argv)
             ringFence[ri] = g_fv;
             ringUploads[ri].swap(g_uploads);
         }
-        if (on && !toggledOff && lateTag)
+        if (on && !toggledOff && !inMenu && lateTag)
             tag();
         if (xellMarker)
             xellMarker(xell, static_cast<uint32_t>(frame), 3); // render submit end
-        if (xefgSwapChainSetPresentId)
+        if (xefgSwapChainSetPresentId && !inMenu)
             xefgSwapChainSetPresentId(h, static_cast<uint32_t>(frame));
-        xefgSwapChainTagFrameConstants(h, static_cast<uint32_t>(frame), &fc);
+        if (!inMenu)
+            xefgSwapChainTagFrameConstants(h, static_cast<uint32_t>(frame), &fc);
         if (frame == framesOff)
             printf("frame %d: SetNumInterpolatedFrames %u: %d\n", frame, maxInterp, xefgSwapChainSetNumInterpolatedFrames(h, maxInterp));
         if (frame == framesOff + framesOn / 2 && interp2 > 0)
@@ -610,7 +693,7 @@ int main(int argc, char** argv)
             }
         LARGE_INTEGER p0;
         QueryPerformanceCounter(&p0);
-        const HRESULT hr = sc->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+        const HRESULT hr = sc->Present(0, fsOn ? 0 : DXGI_PRESENT_ALLOW_TEARING);     // no tearing flag in exclusive fullscreen
         if (timeIt)
             printf("frame %d: Present took %.2f ms\n", frame, ms(p0));
         if (xellMarker)
@@ -623,6 +706,27 @@ int main(int argc, char** argv)
             const HRESULT rr = sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, sd.Flags);
             printf("frame %d: ResizeBuffers 0x%08lx, %.2f ms\n", frame, static_cast<unsigned long>(rr), ms(r0));
         }
+        // REPRO_FS=1: exclusive fullscreen from a third of the frames on until two thirds (SetFullscreenState, then ResizeBuffers as a
+        // game does on the resulting WM_SIZE)
+        if (fsTest && (frame == framesOff + framesOn / 3 || frame == framesOff + 2 * framesOn / 3))
+        {
+            const bool enter = frame == framesOff + framesOn / 3;
+            if (enter)
+            {
+                SetForegroundWindow(wnd);       // DXGI refuses (NOT_CURRENTLY_AVAILABLE) for a window that is not the foreground one
+                SetFocus(wnd);
+            }
+            for (MSG msg; PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE);)
+            {
+                TranslateMessage(&msg);
+                DispatchMessageA(&msg);
+            }
+            const HRESULT fr = sc->SetFullscreenState(enter ? TRUE : FALSE, nullptr);
+            fsOn = enter && SUCCEEDED(fr);
+            printf("frame %d: SetFullscreenState(%d): 0x%08lx\n", frame, enter ? 1 : 0, static_cast<unsigned long>(fr));
+            const HRESULT rr = sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, sd.Flags);
+            printf("frame %d: ResizeBuffers after it: 0x%08lx\n", frame, static_cast<unsigned long>(rr));
+        }
         // REPRO_RECREATE_AT=n: a swap chain recreate at frame n (destroy the context, make a new one the way a game's resolution or
         // mode change does), while the first build may still be running
         if (EnvInt("REPRO_RECREATE_AT", -1) == frame)
@@ -634,6 +738,11 @@ int main(int argc, char** argv)
             const int drc = xefgSwapChainDestroy(h);
             QueryPerformanceCounter(&c1);
             h = nullptr;
+            if (char gen[32]; GetEnvironmentVariableA("REPRO_RECREATE_GEN", gen, sizeof(gen)))
+            {
+                SetEnvironmentVariableA("F5LOW_GENERATOR", gen);
+                printf("frame %d: F5LOW_GENERATOR=%s for the new context\n", frame, gen);
+            }
             const int crc = xefgSwapChainD3D12CreateContext(g_dev, &h);
             xefgSwapChainSetLatencyReduction(h, xell);
             const int irc = xefgSwapChainD3D12InitFromSwapChainDesc(h, wnd, &sd, nullptr, g_q, fac, &ip);
@@ -652,6 +761,28 @@ int main(int argc, char** argv)
         }
         if (!noIdle)
             Idle();
+        if (appFps > 0)
+        {
+            // REPRO_FPS=n: the app produces n frames per second, not as fast as the GPU lets it
+            static LARGE_INTEGER due {};
+            LARGE_INTEGER nowT, fq;
+            QueryPerformanceFrequency(&fq);
+            QueryPerformanceCounter(&nowT);
+            if (!due.QuadPart || nowT.QuadPart - due.QuadPart > fq.QuadPart / 4)
+                due = nowT;
+            due.QuadPart += fq.QuadPart / appFps;
+            for (;;)
+            {
+                QueryPerformanceCounter(&nowT);
+                const double left = static_cast<double>(due.QuadPart - nowT.QuadPart) * 1000.0 / static_cast<double>(fq.QuadPart);
+                if (left <= 0)
+                    break;
+                if (left > 2.0)
+                    Sleep(1);
+                else
+                    YieldProcessor();
+            }
+        }
         const HRESULT removed = g_dev->GetDeviceRemovedReason();
         if (FAILED(hr) || removed != S_OK)
         {
@@ -680,12 +811,26 @@ int main(int argc, char** argv)
                        static_cast<double>(shown) / s, s);
             }
         }
+        if (on && !inMenu && EnvInt("REPRO_HIST", 0) == 1)
+        {
+            xefg_swapchain_present_status_t ps {};
+            xefgSwapChainGetLastPresentStatus(h, &ps);
+            ++hist[std::min<uint32_t>(ps.framesPresented, 15)];
+        }
         if (on && (frame == framesOff + 1 || frame == framesOff + framesOn - 1))
         {
             xefg_swapchain_present_status_t st {};
             xefgSwapChainGetLastPresentStatus(h, &st);
             printf("frame %d: presented %u, frame generation on %u\n", frame, st.framesPresented, st.isFrameGenEnabled);
         }
+    }
+    if (EnvInt("REPRO_HIST", 0) == 1)
+    {
+        printf("frames presented per app frame (while on):");
+        for (int i = 0; i < 16; ++i)
+            if (hist[i])
+                printf("  %d: %u", i, hist[i]);
+        printf("; the window had to take the foreground back %u times\n", refocus);
     }
     printf("%d frames off, %d on: %s\n", framesOff, framesOn, failures ? "FAILED" : "no Present failure, device alive");
     {

@@ -5,9 +5,9 @@ f5low.dll is a frame generation **host**. OptiScaler drives it through Intel's X
 shares: the swap chain the game sees, frame input staging, pacing, presentation, latency reporting (XeLL calls),
 the UI/letterbox rules. A **generator** only makes the in-between frames.
 
-Today one generator runs: **own** (XeFG Tensor). `intel`, `dlssg` and `fsr` are registered and selectable, report
-"not available yet" in the log, and run `own`. This note is the paper design for them; the host is not ready for any of them yet (see
-"What is ready").
+Two generators run: **own** (XeFG Tensor) and **dlssg** (NVIDIA DLSS-G through a private copy of the player's Streamline,
+RTX 40 and newer, at NVIDIA's native maximum: the unlock to 6x and RTX 20/30 are later stories). `intel` and `fsr` are
+registered and selectable, report "not available yet" in the log, and run `own`; their design is below (see "What is ready").
 
 ## Choosing a generator
 
@@ -16,11 +16,12 @@ Today one generator runs: **own** (XeFG Tensor). `intel`, `dlssg` and `fsr` are 
 other settings). Values, case insensitive: `own` (default), `intel`, `dlssg`, `fsr`; anything else logs
 `f5low: generator "<value>" is unknown (own, intel, dlssg, fsr) - running own` and runs `own`.
 
-A generator that is not available logs one line, `f5low: generator <name> not available yet, running own`, and the host
-runs `own`. Today that is `intel`, `dlssg` and `fsr` (`src/generators/stubs.h`, `GenCaps::available = false`). Once they
-exist the same line, with the reason, also covers a generator that cannot start (library missing, unknown version, init
-failure, wrong GPU); on a GPU `own` cannot run on, the host then offers no frame generation. The generator that runs is
-logged once at context creation: `f5low: generator own (XeFG Tensor)`.
+A generator that is not available logs one line and the host runs `own`: `f5low: generator <name> not available yet, running own`
+for `intel` and `fsr` (`src/generators/stubs.h`, `GenCaps::available = false`), and for `dlssg`
+`f5low: generator dlssg not available (<reason>), running own` with the reason from `DlssgGenerator::Caps()` or the setup
+(see "dlssg" below); the same reason leads the `f5lowGetStatus` text of the own generator that runs instead (`dlssg unavailable:
+<reason> - own generator (...)`). On a GPU `own` cannot run on, the host then offers no frame generation. The generator that
+runs is logged once at context creation: `f5low: generator own (XeFG Tensor)` or `f5low: generator dlssg (DLSS-G)`.
 
 ## What each vendor library owns
 
@@ -37,19 +38,21 @@ logged once at context creation: `f5low: generator own (XeFG Tensor)`.
 
 ## Two backend shapes
 
-Every library falls in one of two shapes. The code carries neither yet; "What is ready" says what each needs.
+Every library falls in one of two shapes. The code carries the present sink (dlssg); the frames-only shape is not built.
 
 **Frames only** (`own`, `fsr` through its dispatch): the host calls the generator once per app frame with the
 inputs and the interpolation points `t = k / (n + 1)`, and gets n frames back on the GPU. The host paces and
 presents them exactly as today.
 
-**Present sink** (`intel`, `dlssg`, and `fsr` if its swap chain turns out to be needed): the library insists on
-presenting. The host gives it a **sink**, a proxy swap chain and factory of ours, and every `Present` the library
-makes becomes a job for our pacer, shown on the real swap chain. The library's own pacing is neutralised by
-handing it an always-signalled latency waitable, so its burst arrives back to back and our pacer spaces it.
-Proven with Intel 1.3.4.95 in the harness (libxess-weights, 2026-10-29/31, sink code not yet imported): real-chain
+**Present sink** (`dlssg` today; `intel`, and `fsr` if its swap chain turns out to be needed): the library insists on
+presenting. The host gives it a **sink** (`src/sink/sink.h`, `scproxy.h`), a proxy swap chain and factory of ours, and every
+`Present` the library makes is queued and shown on the real swap chain by the sink's own thread. The sink has two modes:
+spaced (Intel: the library's own pacing is neutralised by handing it an always-signalled latency waitable, so its burst arrives
+back to back and the sink spaces it) and stable buffers (DLSS-G: it takes its buffers once and draws into
+`buffer[GetCurrentBackBufferIndex()]`; `GetBuffer(i)` is staging texture i and Present returns when the next index's texture is
+out of the queue and copied). Proven with Intel 1.3.4.95 in the harness (libxess-weights, 2026-10-29/31): real-chain
 present gaps at 6x / 30 fps sd 0.29 ms, p99 6.15 ms (Intel presenting itself: sd 2.10, p99 11.86); resize,
-exclusive full screen in and out, and a menu stretch (bursts split by arrival gap) all pass.
+exclusive full screen in and out, and a menu stretch (bursts split by arrival gap) all pass. The dlssg numbers are under "dlssg" below.
 
 ```cpp
 struct GenInputs {            // one app frame, already staged by the host (valid until Release)
@@ -104,24 +107,58 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 ## What is ready
 
-- Ready: `own` behind `IGenerator` / `IPackGenerator`; the selection (above); `intel`, `dlssg`, `fsr` registered as
-  "not available yet" (`GenCaps` only) and falling back to `own`.
+- Ready: `own` behind `IGenerator` / `IPackGenerator`; the selection (above); `dlssg` (present sink, see below); `intel` and `fsr`
+  registered as "not available yet" (`GenCaps` only) and falling back to `own`.
 - Not ready: frames-only backends (`fsr`). The host only knows pack-layout buffers; a backend that takes and returns textures
   needs a texture in/out path in `CopyFrame` / `Show` / `PresentGen` next to them, and a `Generate(GenInputs, t[], out[])`
   entry on `IGenerator`.
-- Not ready: present-sink backends (`intel`, `dlssg`). They need the sink branch in the host (forwarding tags, constants and
-  frame ids to the library, turning the sink's Presents into pacer jobs) and forwarding entry points next to `AttachSink`.
-- Both are stories A2-A4 and will be shaped by the first real backend; expect host changes, not just a new class.
+- Ready for dlssg, not for intel: the present-sink route. A dlssg context is a separate kind of context at the XeFG entry points of
+  `src/xefg_cuda.cpp` (next to the forwarding-to-Intel route: `FindDlssg(h)` in every entry point), not a `class Own` /
+  `IPackGenerator`; `own` runs through exactly the code it ran through before. `intel` will reuse `src/sink/` and the same kind of
+  entry-point branch, with its own sink mode (spaced bursts); its design is the per-backend note below (story A2).
+- Not ready: the frames-only shape (`fsr`), see above. Stories A3-A4 will shape it.
 
 ## Per backend, when it is built (stories A2-A4)
 
 - **intel**: libxess_fg from `XEFG_CUDA_INTEL_LIBRARY` (OptiScaler sets it to XeFGPath or its own copy), then our
   folder, then the folder above. Sink shape. Max = what Intel reports; our unlock never patches this copy (decided
   in OptiScaler's F5Low plan). XeLL: the library's own calls pass through.
-- **dlssg**: Streamline from the player's install, loaded as a renamed private copy so the game's own Streamline
-  (and its upscaler) is never touched (a build that used the original names broke the game's upscaler). Sink
-  shape. Reflex required: the host keeps the driver's interval rule (the driver multiplies the Reflex interval by
-  DLSS-G's multiplier; no per-rendered-frame division). Switching own <-> dlssg without restart.
+- **dlssg** (built, `src/generators/dlssg.h`, `dlssg_files.h`): NVIDIA DLSS-G through Streamline's public API. Sink shape.
+  - *Routing.* `Generator=dlssg` in `D3D12CreateContext` builds a `DlssgGenerator` (an `IGenerator`: `Caps()` = name, available,
+    reason, `maxGenerated`, `presentsItself = true`, `anyGpu = false`). Not available below RTX 40 (sm < 89) or without an NVIDIA GPU
+    (`DLSS-G needs RTX 40 or newer (RTX 20/30 come later)`), without a usable Streamline, or when `slInit` / DLSS-G fail to load: one log
+    line, the reason in `f5lowGetStatus`, and `own` runs. Otherwise the context is an `xdlssg::Ctx` (not `Own`); `f5lowGetStatus`
+    says 1 with `dlssg generator (...)`. `XEFG_CUDA_FORWARD` wins over everything. `xefgSwapChainGetProperties` reports
+    `numFramesToGenerateMax` as read from Streamline at create (5 on an RTX 5070 Ti with NVIDIA 310.9; NVIDIA's own value, no unlock).
+  - *Streamline.* One per process, loaded from a private renamed copy so the game's own Streamline and its upscaler are never
+    touched (a build with the original names broke the game's upscaler in NBA 2K27: OptiScaler hooks every module named like
+    `sl.interposer.dll` / `sl.common.dll` / ..., one set of originals per process). Search order, first folder with a complete set:
+    `F5LOW_STREAMLINE_DIR` (OptiScaler passes its Streamline folder), `DlssgPath=` (f5low.ini) / `XEFG_CUDA_DLSSGPATH`,
+    `<f5low.dll folder>\..\streamline` and `..\Streamline` (`OptiScaler\plugins\f5low.dll` -> `OptiScaler\streamline`). A folder with
+    the plain names (`sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`, `sl.reflex.dll`, `sl.pcl.dll`, `nvngx_dlssg.dll`) is copied
+    byte for byte under the renamed names (`xefg_slinterposer.dll`, `sl.xefg_common.dll`, `sl.xefg_dlss_g.dll`, `sl.xefg_reflex.dll`,
+    `sl.xefg_pcl.dll`, `nvngx_dlssg.dll` unchanged) into `<f5low.dll folder>\f5low_streamline\`, with a manifest of the SHA-256 of
+    each source: a changed source is copied again, a deleted or altered copy is made again, an unchanged one is not touched; files are
+    written under a temporary name and moved into place. A folder that already has the renamed files is used as it is, but only if
+    no plain-named `sl.*.dll` sits next to them (Streamline's plugin scan would load it). Plain-named files are never loaded.
+  - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G paces its own frames (it presents from a
+    thread of its own, with the driver's flip metering) and the sink queues each present and shows it on the real chain, spacing a full
+    burst by the smoothed burst interval (`SetBurst(n + 1)` from the multiplier). Logged once per context: `dlssg: DLSS-G paces its own
+    frames (host pacer handed over)`.
+  - *Latency.* Reflex is required and PCL present markers around the game's `Present` (a thin wrapper chain sets them). The driver
+    multiplies a Reflex interval by DLSS-G's multiplier, so a shown-frame cap through Reflex must not be divided again: OptiScaler
+    asks `xefgCudaDriverMultipliesReflexCap()` (below). XeLL is not used by this generator.
+  - *Inputs.* Motion vectors, depth, HUD-less colour and UI are tagged (typeless formats as typed ones in the DLSS-G options), XeFG's
+    camera becomes `sl::Constants`, the XeFG frame id is Streamline's frame index. A frame presented without new constants (a game
+    in its menu) is shown alone (`eRetainResourcesWhenOff`). DLSS-G generates only while its window is the foreground one.
+  - *Switching.* `own` <-> `dlssg` without a restart: destroy the context, change `F5LOW_GENERATOR` / the ini, create again
+    (`repro_test` `REPRO_RECREATE_AT` + `REPRO_RECREATE_GEN`); Streamline stays loaded for the life of the process.
+  - *Tests.* `tests\repro_test.cpp` with `REPRO_BAR=1 REPRO_FRONT=1 REPRO_FPS=30 F5LOW_SINK_STATS=1 SINK_PROBE=1 XEFG_CUDA_LOG=1` (the
+    DLL logs the sink's gaps, copy time and the moving bar's steps to f5low.log when the context is destroyed); `tests\dlssg_spike.cpp`
+    (`build_dlssg_spike.ps1`) is the same check without the DLL. The exe and the NVIDIA files stay outside the repo.
+  - *Later.* Story 2: the unlock to 6x on RTX 40 and 50 in memory (structural locators, keyed by module SHA-256); story 3: RTX 20/30 with
+    kernels rebuilt in memory from the player's `nvngx_dlssg.dll`; story 4: OptiScaler side (generator choice, Reflex cap, Streamline
+    hand-over). Nothing NVIDIA-derived is ever written to disk or committed (`tools/audit.py` has an `nvidia` rule).
 - **fsr**: FidelityFX FG from the DLLs OptiScaler ships (path from OptiScaler). Frames-only shape through the
   dispatch (`outputs[]`, `numGeneratedFrames`, `frameID` +1 each frame); the sink shape only if the dispatch path
   turns out unusable on its own. Opens F5Low on AMD and Intel GPUs.
@@ -135,10 +172,15 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 - `int __cdecl f5lowGetStatus(char* reason, int reasonSize)` - what the host decided for the most recent context
   (`xefgSwapChainD3D12CreateContext`). Returns `0` not decided yet (no context created) or the own generator is still being built in the background (reason
-  "building its frame generator in the background": the frames pass through, `1` follows by itself), `1` the own generator runs,
+  "building its frame generator in the background": the frames pass through, `1` follows by itself), `1` a generator of ours runs (the own
+  generator, or `dlssg generator (...)` in the reason), `1` also when `Generator=dlssg` could not run and `own` does (the reason then
+  starts `dlssg unavailable: <why> - `),
   `2` handed over to Intel's `libxess_fg` (forwarding), `3` unavailable (own generator failed and no `libxess_fg.dll`
   to forward to). `reason` (may be null; used when `reasonSize > 0`) receives a NUL-terminated one-line UTF-8 text, cut to
   fit, for example `own generator (pack built in memory), D3D12` or
   `own generator unavailable: <what is missing> - forwarding to Intel XeFG`. Thread-safe, callable before any context;
   the state stays after the last context is destroyed.
-- `uint32_t xefgCudaXellCountsRenderedOnly()` - XeLL cap accounting (see `src/xefg_cuda.cpp`).
+- `uint32_t xefgCudaXellCountsRenderedOnly()` - XeLL cap accounting (see `src/xefg_cuda.cpp`); 1 also while a dlssg context runs.
+- `uint32_t xefgCudaDriverMultipliesReflexCap()` - OptiScaler's Reflex frame-cap fix asks once when it loads the library: 1 while a
+  dlssg context runs (the NVIDIA driver multiplies a Reflex interval by DLSS-G's multiplier itself, so the caller gives Reflex the
+  shown-frame cap undivided), else 0. A dlssg run whose OptiScaler never asked logs a warning after 600 presents.

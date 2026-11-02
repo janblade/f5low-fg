@@ -29,6 +29,7 @@
 #include "intel_file_source.h"
 #include "pack_build.h"
 #include "xefg_own.h"
+#include "generators/dlssg.h"
 #include "xefg_version.h"
 #include <xefg_swapchain_debug.h>
 
@@ -695,7 +696,7 @@ std::string PathSetting() { return Setting("XEFG_CUDA_PATH", "Path", "d3d12"); }
 // Which generator makes the in-between frames (generator.h, docs/GENERATORS.md): own (default), intel, dlssg or fsr, case
 // insensitive. F5LOW_GENERATOR, else XEFG_CUDA_GENERATOR, else Generator= in f5low.ini. Anything else runs own, with a log line;
 // so do the ones that are not built yet (xefg_own.h, Own::Create).
-std::string GeneratorSetting()
+std::string GeneratorRaw()
 {
     char v[64] = {};
     std::string s;
@@ -707,6 +708,11 @@ std::string GeneratorSetting()
     s.erase(s.find_last_not_of(" \t\r\n") + 1);
     for (char& c : s)
         c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+std::string GeneratorSetting()
+{
+    const std::string s = GeneratorRaw();
     if (s == "own" || s == "intel" || s == "dlssg" || s == "fsr")
         return s;
     Log("f5low: generator \"%s\" is unknown (own, intel, dlssg, fsr) - running own", s.c_str());
@@ -769,6 +775,36 @@ std::shared_ptr<xefgown::Own> FindOwn(xefg_swapchain_handle_t h)
     std::lock_guard<std::mutex> lk(g_ownLock);
     auto it = g_own.find(h);
     return it == g_own.end() ? nullptr : it->second;
+}
+
+// Generator=dlssg contexts (generators/dlssg.h); the handle is the context's address.
+std::map<xefg_swapchain_handle_t, std::shared_ptr<xdlssg::Ctx>> g_dlssg;
+std::mutex g_dlssgLock;
+std::shared_ptr<xdlssg::Ctx> FindDlssg(xefg_swapchain_handle_t h)
+{
+    std::lock_guard<std::mutex> lk(g_dlssgLock);
+    auto it = g_dlssg.find(h);
+    return it == g_dlssg.end() ? nullptr : it->second;
+}
+// DlssgPath= in f5low.ini, else XEFG_CUDA_DLSSGPATH (a folder with Streamline; generators/dlssg_files.h has the search order). "" = none.
+std::wstring DlssgPathSetting()
+{
+    wchar_t v[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"XEFG_CUDA_DLSSGPATH", v, MAX_PATH))
+    {
+        const std::wstring ini = g_dir + L"\\f5low.ini";
+        GetPrivateProfileStringW(L"f5low", L"DlssgPath", L"", v, MAX_PATH, ini.c_str());
+        if (!v[0])
+            GetPrivateProfileStringW(L"xefg_cuda", L"DlssgPath", L"", v, MAX_PATH, (g_dir + L"\\xefg_cuda.ini").c_str());
+    }
+    return v;
+}
+// F5LOW_STREAMLINE_DIR: the Streamline folder OptiScaler passes ("" = not set).
+std::wstring StreamlineDirEnv()
+{
+    wchar_t v[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"F5LOW_STREAMLINE_DIR", v, MAX_PATH);
+    return v;
 }
 
 // The real library: Intel's libxess_fg.dll, loaded on first use. Where from, first one that exists:
@@ -901,7 +937,7 @@ xefg_swapchain_result_t xefgSwapChainGetVersion(xefg_swapchain_version_t* v)
     const PackRoute route = ResolvePack();
     if (route.built())
         StartPackBuild();
-    if (!route.forward && !(route.built() && g_packStateA.load(std::memory_order_acquire) == kPackFailed))
+    if (!route.forward && (GeneratorRaw() == "dlssg" || !(route.built() && g_packStateA.load(std::memory_order_acquire) == kPackFailed)))
     {
         if (!v)
             return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
@@ -915,6 +951,14 @@ xefg_swapchain_result_t xefgSwapChainGetVersion(xefg_swapchain_version_t* v)
 
 xefg_swapchain_result_t xefgSwapChainGetProperties(xefg_swapchain_handle_t h, xefg_swapchain_properties_t* p)
 {
+    if (auto c = FindDlssg(h))
+    {
+        if (!p)
+            return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+        *p = {};
+        p->maxSupportedInterpolations = c->maxGen;
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (FindOwn(h))
     {
         if (!p)
@@ -934,6 +978,8 @@ xefg_swapchain_result_t xefgSwapChainGetProperties(xefg_swapchain_handle_t h, xe
 xefg_swapchain_result_t xefgSwapChainTagFrameConstants(xefg_swapchain_handle_t h, uint32_t id, const xefg_swapchain_frame_constant_data_t* c)
 {
     SlowApi slow("xefgSwapChainTagFrameConstants");
+    if (auto dg = FindDlssg(h))
+        return c ? dg->Constants(id, *c) : XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
     if (auto o = FindOwn(h))
     {
         if (!c)
@@ -960,6 +1006,13 @@ xefg_swapchain_result_t xefgSwapChainTagFrameConstants(xefg_swapchain_handle_t h
 xefg_swapchain_result_t xefgSwapChainSetEnabled(xefg_swapchain_handle_t h, uint32_t e)
 {
     SlowApi slow("xefgSwapChainSetEnabled");
+    if (auto c = FindDlssg(h))
+    {
+        std::lock_guard<std::mutex> lk(c->mu);
+        c->enabled = e != 0;
+        c->Apply();
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (auto o = FindOwn(h))
     {
         xefgown::Own::XellCall c;
@@ -980,6 +1033,11 @@ xefg_swapchain_result_t xefgSwapChainSetEnabled(xefg_swapchain_handle_t h, uint3
 xefg_swapchain_result_t xefgSwapChainSetPresentId(xefg_swapchain_handle_t h, uint32_t id)
 {
     SlowApi slow("xefgSwapChainSetPresentId");
+    if (auto c = FindDlssg(h))
+    {
+        c->frameId = id;
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     FORWARD(xefgSwapChainSetPresentId, h, id);
@@ -990,6 +1048,13 @@ xefg_swapchain_result_t xefgSwapChainSetPresentId(xefg_swapchain_handle_t h, uin
 xefg_swapchain_result_t xefgSwapChainGetLastPresentStatus(xefg_swapchain_handle_t h, xefg_swapchain_present_status_t* s)
 {
     SlowApi slow("xefgSwapChainGetLastPresentStatus");
+    if (auto c = FindDlssg(h))
+    {
+        if (!s)
+            return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+        c->Status(*s);
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (auto o = FindOwn(h))
     {
         if (!s)
@@ -1008,6 +1073,8 @@ xefg_swapchain_result_t xefgSwapChainGetLastPresentStatus(xefg_swapchain_handle_
 xefg_swapchain_result_t xefgSwapChainSetLoggingCallback(xefg_swapchain_handle_t h, xefg_swapchain_logging_level_t lvl,
                                                         xefg_swapchain_app_log_callback_t cb, void* ud)
 {
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     FORWARD(xefgSwapChainSetLoggingCallback, h, lvl, cb, ud);
@@ -1017,6 +1084,25 @@ xefg_swapchain_result_t xefgSwapChainSetLoggingCallback(xefg_swapchain_handle_t 
 
 xefg_swapchain_result_t xefgSwapChainDestroy(xefg_swapchain_handle_t h)
 {
+    {
+        std::shared_ptr<xdlssg::Ctx> c;
+        {
+            std::lock_guard<std::mutex> lk(g_dlssgLock);
+            if (auto it = g_dlssg.find(h); it != g_dlssg.end())
+            {
+                c = std::move(it->second);
+                g_dlssg.erase(it);
+            }
+        }
+        if (c)
+        {
+            Log("Destroy h=%p (dlssg)", static_cast<void*>(h));
+            c->Shutdown();
+            c.reset();
+            xdlssg::LogSinkStats();
+            return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+        }
+    }
     std::shared_ptr<xefgown::Own> o;
     {
         std::lock_guard<std::mutex> lk(g_ownLock);
@@ -1055,7 +1141,19 @@ __declspec(dllexport) uint32_t xefgCudaXellCountsRenderedOnly()
     for (const auto& o : g_own)
         if (!o.second->xellCountsShown)
             return 1u;
-    return 0u;
+    // DLSS-G tells XeLL nothing either (it runs Reflex in its own Streamline)
+    std::lock_guard<std::mutex> lk2(g_dlssgLock);
+    return g_dlssg.empty() ? 0u : 1u;
+}
+
+// Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask once, when they load the library).
+// 1 while a Generator=dlssg context runs: the NVIDIA driver multiplies a Reflex interval on the device by DLSS-G's multiplier
+// itself (NBA 2K27: 33333 us read back as 99999 us at 3x), so the caller gives real Reflex the shown-frame cap undivided.
+__declspec(dllexport) uint32_t xefgCudaDriverMultipliesReflexCap()
+{
+    xdlssg::g_capAsked.store(true);
+    std::lock_guard<std::mutex> lk(g_dlssgLock);
+    return g_dlssg.empty() ? 0u : 1u;
 }
 
 // Not Intel's API: for OptiScaler. What f5low decided for the most recent context: 0 not decided yet, 1 own generator,
@@ -1080,6 +1178,11 @@ extern "C" __declspec(dllexport) int __cdecl f5lowGetStatus(char* reason, int re
 xefg_swapchain_result_t xefgSwapChainSetLatencyReduction(xefg_swapchain_handle_t h, void* xell)
 {
     SlowApi slow("xefgSwapChainSetLatencyReduction");
+    if (FindDlssg(h))
+    {
+        Log("SetLatencyReduction xell=%p (dlssg: DLSS-G runs Reflex in its own Streamline)", xell);
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (auto o = FindOwn(h))
     {
         o->LinkXell(xell).Send();
@@ -1093,6 +1196,8 @@ xefg_swapchain_result_t xefgSwapChainSetLatencyReduction(xefg_swapchain_handle_t
 xefg_swapchain_result_t xefgSwapChainSetSceneChangeThreshold(xefg_swapchain_handle_t h, float t)
 {
     SlowApi slow("xefgSwapChainSetSceneChangeThreshold");
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (auto o = FindOwn(h))
     {
         o->sceneThreshold = t;
@@ -1105,6 +1210,8 @@ xefg_swapchain_result_t xefgSwapChainSetSceneChangeThreshold(xefg_swapchain_hand
 
 xefg_swapchain_result_t xefgSwapChainGetPipelineBuildStatus(xefg_swapchain_handle_t h)
 {
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     FORWARD(xefgSwapChainGetPipelineBuildStatus, h);
@@ -1115,6 +1222,18 @@ xefg_swapchain_result_t xefgSwapChainGetPipelineBuildStatus(xefg_swapchain_handl
 xefg_swapchain_result_t xefgSwapChainSetNumInterpolatedFrames(xefg_swapchain_handle_t h, uint32_t n)
 {
     SlowApi slow("xefgSwapChainSetNumInterpolatedFrames");
+    if (auto c = FindDlssg(h))
+    {
+        std::lock_guard<std::mutex> lk(c->mu);
+        if (n < 1 || n > c->maxGen)
+        {
+            Log("SetNumInterpolatedFrames %u: DLSS-G takes 1..%u", n, c->maxGen);
+            return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        c->numInterp = n;
+        c->Apply();
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (auto o = FindOwn(h))
     {
         if (n < 1 || n > xefgown::kMaxInterp)
@@ -1140,6 +1259,8 @@ xefg_swapchain_result_t xefgSwapChainSetNumInterpolatedFrames(xefg_swapchain_han
 xefg_swapchain_result_t xefgSwapChainSetUiCompositionState(xefg_swapchain_handle_t h, xefg_swapchain_ui_composition_state_t s)
 {
     SlowApi slow("xefgSwapChainSetUiCompositionState");
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (auto o = FindOwn(h))
     {
         o->uiComposition = s == XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED;
@@ -1154,6 +1275,8 @@ xefg_swapchain_result_t xefgSwapChainSetUiCompositionState(xefg_swapchain_handle
 xefg_swapchain_result_t xefgSwapChainEnableDebugFeature(xefg_swapchain_handle_t h, xefg_swapchain_debug_feature_t f, uint32_t e, void* arg)
 {
     SlowApi slow("xefgSwapChainEnableDebugFeature");
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (auto o = FindOwn(h))
     {
         Log("EnableDebugFeature %d enable=%u (own)", static_cast<int>(f), e);
@@ -1173,6 +1296,54 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
 {
     const auto callStart = std::chrono::steady_clock::now();
     const PackRoute route = ResolvePack();
+    // Generator=dlssg (generators/dlssg.h): DLSS-G through a private renamed Streamline, presenting into our sink. DlssgGenerator::Caps
+    // decides: below RTX 40, no NVIDIA GPU, Streamline missing or slInit failing -> one log line, a reason in f5lowGetStatus, and
+    // the own generator runs. XEFG_CUDA_FORWARD wins over everything (Intel's library does it all).
+    std::string note;           // in front of every status reason of the own route when dlssg was asked for and could not run
+    const bool wantDlssg = !route.forward && d && ph && GeneratorRaw() == "dlssg";
+    if (wantDlssg)
+    {
+        xdlssg::g_log = XLog;
+        xsink::g_stats = xsink::EnvSet("F5LOW_SINK_STATS");     // tests: the sink's statistics into the log
+        xefgown::DlssgGenerator dg(GpuSm(d));
+        std::wstring dir;
+        if (dg.Caps().available)
+        {
+            const xdlssg::Source src = xdlssg::Prepare(g_dir, StreamlineDirEnv(), DlssgPathSetting());
+            if (src.ok)
+            {
+                Log("dlssg: %s", src.how.c_str());
+                dir = src.dir;
+            }
+            else
+                dg.Fail(src.why);
+        }
+        std::shared_ptr<xdlssg::Ctx> c;
+        if (dg.Caps().available)
+        {
+            std::string why;
+            c = xdlssg::Create(d, dir, why);
+            if (c)
+                dg.SetMax(c->maxGen);
+            else
+                dg.Fail(why);
+        }
+        if (c)
+        {
+            *ph = reinterpret_cast<xefg_swapchain_handle_t>(c.get());
+            {
+                std::lock_guard<std::mutex> lk(g_dlssgLock);
+                g_dlssg[*ph] = c;
+            }
+            SetStatus(1, "dlssg generator (DLSS-G through a private Streamline copy, up to " + std::to_string(dg.Caps().maxGenerated) + " generated), D3D12");
+            Log("f5low: generator dlssg (%s)", dg.Caps().name);
+            Log("D3D12CreateContext device=%p -> Generator=dlssg: DLSS-G h=%p, Streamline from %S, DLSS-G paces its own frames", static_cast<void*>(d),
+                static_cast<void*>(*ph), c->sl->dir.c_str());
+            return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+        }
+        note = std::string("dlssg unavailable: ") + dg.Caps().reason + " - ";
+        Log("f5low: generator dlssg not available (%s), running own", dg.Caps().reason);
+    }
     std::string pack = route.forward ? std::string() : route.dir;
     std::string fwdReason;      // why this context forwards (f5lowGetStatus)
     int need = 0, have = 0;
@@ -1245,10 +1416,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     {
         // a pack built on this PC runs on the D3D12 path only (the generator says so once, at its build)
         const std::string path = route.built() ? std::string("d3d12") : PathSetting();
-        auto o = xefgown::Own::Create(d, pack, path, GeneratorSetting());
+        auto o = xefgown::Own::Create(d, pack, path, wantDlssg ? std::string("own") : GeneratorSetting());
         if (!o)
         {
-            SetStatus(3, "own generator unavailable: the context could not be created");
+            SetStatus(3, note + "own generator unavailable: the context could not be created");
             return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
         }
         o->genMode = GenQueueSetting();
@@ -1288,24 +1459,24 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             if (deferred)
             {
                 // status 0 until the first build is done on its own thread; then 1 (or 3: a late failure, no way back to Intel's)
-                const uint64_t serial = SetStatus(0, "building its frame generator in the background");
+                const uint64_t serial = SetStatus(0, note + "building its frame generator in the background");
                 const std::string from = src;
                 o->packPoll = &PackPoll;
                 o->packFit = [have] { return FitReason(have, PackNeedSm(xefgpack::kBuiltDir)); };
                 o->onAbandoned = [serial] { SetStatusIf(serial, 0, "no context (destroyed before its generator was ready)"); };
-                o->deferredDone = [serial, from](bool ok, const std::string& why) {
+                o->deferredDone = [serial, from, note](bool ok, const std::string& why) {
                     if (ok)
                         Log("deferred first build: ready, generation can start");
                     else
                         Log("deferred first build: FAILED - passing frames through: %s", why.c_str());
                     if (ok)
-                        SetStatusIf(serial, 1, "own generator (" + from + "), D3D12");
+                        SetStatusIf(serial, 1, note + "own generator (" + from + "), D3D12");
                     else
-                        SetStatusIf(serial, 3, why.compare(0, 25, "own generator unavailable") == 0 ? why : "own generator unavailable: " + why);
+                        SetStatusIf(serial, 3, note + (why.compare(0, 25, "own generator unavailable") == 0 ? why : "own generator unavailable: " + why));
                 };
             }
             else
-                SetStatus(1, std::string("own generator (") + src + "), D3D12");
+                SetStatus(1, note + "own generator (" + src + "), D3D12");
         }
         Log("D3D12CreateContext device=%p -> own h=%p, pack %s (needs sm_%d, GPU sm_%d), path %s, early %d, pacer %s%s (CUDA path), max lag "
             "%.2f, max delay %.2f app frames",
@@ -1313,15 +1484,15 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             o->clockPacer ? "clock" : "schedule", o->gate ? " + gate" : "", o->maxLag, o->maxDelay);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    const std::string fwdText = fwdReason.empty() ? "forwarding to Intel XeFG" : fwdReason;
+    const std::string fwdText = note + (fwdReason.empty() ? "forwarding to Intel XeFG" : fwdReason);
     if (!Real("xefgSwapChainD3D12CreateContext"))
-        SetStatus(3, fwdReason.empty() ? "libxess_fg.dll not found, nothing to forward to"
-                                       : fwdReason + "; libxess_fg.dll not found");
+        SetStatus(3, note + (fwdReason.empty() ? "libxess_fg.dll not found, nothing to forward to"
+                                               : fwdReason + "; libxess_fg.dll not found"));
     else if (d && ph)
         SetStatus(2, fwdText);
     FORWARD(xefgSwapChainD3D12CreateContext, d, ph);
     if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS && d && ph && Real("xefgSwapChainD3D12CreateContext"))
-        SetStatus(3, "Intel XeFG CreateContext failed (" + std::to_string(static_cast<int>(r)) + ") after hand-over: " + fwdText);
+        SetStatus(3, note + "Intel XeFG CreateContext failed (" + std::to_string(static_cast<int>(r)) + ") after hand-over: " + fwdText);
     Log("D3D12CreateContext device=%p -> %d h=%p", static_cast<void*>(d), r, ph ? static_cast<void*>(*ph) : nullptr);
     return r;
 }
@@ -1329,6 +1500,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
 xefg_swapchain_result_t xefgSwapChainD3D12BuildPipelines(xefg_swapchain_handle_t h, ID3D12PipelineLibrary* lib, uint8_t blocking,
                                                          uint32_t flags)
 {
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (auto o = FindOwn(h))
     {
         o->initFlags = flags;
@@ -1344,6 +1517,14 @@ xefg_swapchain_result_t xefgSwapChainD3D12BuildPipelines(xefg_swapchain_handle_t
 xefg_swapchain_result_t xefgSwapChainD3D12GetProperties(xefg_swapchain_handle_t h, const xefg_swapchain_d3d12_init_params_t* ip,
                                                         uint32_t w, uint32_t ht, DXGI_FORMAT f, xefg_swapchain_properties_t* p)
 {
+    if (auto c = FindDlssg(h))
+    {
+        if (!p)
+            return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+        *p = {};
+        p->maxSupportedInterpolations = c->maxGen;
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (FindOwn(h))
     {
         if (!p)
@@ -1363,6 +1544,11 @@ xefg_swapchain_result_t xefgSwapChainD3D12GetProperties(xefg_swapchain_handle_t 
 xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChain(xefg_swapchain_handle_t h, ID3D12CommandQueue* q,
                                                             const xefg_swapchain_d3d12_init_params_t* ip)
 {
+    if (FindDlssg(h))
+    {
+        Log("D3D12InitFromSwapChain: Generator=dlssg needs InitFromSwapChainDesc (Streamline makes the swap chain)");
+        return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+    }
     if (auto o = FindOwn(h))
     {
         IDXGISwapChain4* app = nullptr;
@@ -1399,6 +1585,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
                                                                 const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, ID3D12CommandQueue* q,
                                                                 IDXGIFactory2* fac, const xefg_swapchain_d3d12_init_params_t* ip)
 {
+    if (auto c = FindDlssg(h))
+        return c->InitFromDesc(wnd, d, fs, q, fac, ip);
     if (auto o = FindOwn(h))
     {
         if (!q || !d || !fac || !ip)
@@ -1455,6 +1643,13 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
 
 xefg_swapchain_result_t xefgSwapChainD3D12GetSwapChainPtr(xefg_swapchain_handle_t h, REFIID riid, void** pp)
 {
+    if (auto c = FindDlssg(h))
+    {
+        std::lock_guard<std::mutex> lk(c->mu);
+        if (!c->chain || !pp)
+            return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;
+        return SUCCEEDED(c->chain->QueryInterface(riid, pp)) ? XEFG_SWAPCHAIN_RESULT_SUCCESS : XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+    }
     if (auto o = FindOwn(h))
     {
         std::lock_guard<std::mutex> lk(o->proxyMu); // a Destroy on another thread may drop the proxy meanwhile (Retire)
@@ -1472,6 +1667,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12TagFrameResource(xefg_swapchain_handle
                                                            const xefg_swapchain_d3d12_resource_data_t* rd)
 {
     SlowApi slow("xefgSwapChainD3D12TagFrameResource");
+    if (auto c = FindDlssg(h))
+        return rd ? c->Tag(cl, id, *rd) : XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
     if (auto o = FindOwn(h))
     {
         if (!rd)
@@ -1504,6 +1701,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12TagFrameResource(xefg_swapchain_handle
 
 xefg_swapchain_result_t xefgSwapChainD3D12SetDescriptorHeap(xefg_swapchain_handle_t h, ID3D12DescriptorHeap* heap, uint32_t off)
 {
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     FORWARD(xefgSwapChainD3D12SetDescriptorHeap, h, heap, off);
@@ -1514,6 +1713,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12SetDescriptorHeap(xefg_swapchain_handl
 xefg_swapchain_result_t xefgSwapChainD3D12UpdateExternalHeapOnResize(xefg_swapchain_handle_t h, ID3D12Heap* bh, uint64_t bo,
                                                                      ID3D12Heap* th, uint64_t to)
 {
+    if (FindDlssg(h))
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     FORWARD(xefgSwapChainD3D12UpdateExternalHeapOnResize, h, bh, bo, th, to);
@@ -1523,6 +1724,14 @@ xefg_swapchain_result_t xefgSwapChainD3D12UpdateExternalHeapOnResize(xefg_swapch
 
 xefg_swapchain_result_t xefgSwapChainD3D12GetInitializationParameters(xefg_swapchain_handle_t h, xefg_swapchain_d3d12_init_params_t* p)
 {
+    if (auto c = FindDlssg(h))
+    {
+        if (!p)
+            return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+        std::lock_guard<std::mutex> lk(c->mu);
+        *p = c->initParams;
+        return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     if (auto o = FindOwn(h))
     {
         if (!p)

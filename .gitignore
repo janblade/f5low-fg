@@ -16,6 +16,7 @@ build/
 cache/
 *.log
 _xess/
+_streamline/
 .claude/
 __pycache__/
 *.pyc

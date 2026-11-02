@@ -7,7 +7,7 @@ pluggable frame generators:
 |---|---|---|
 | own (XeFG Tensor) | our kernels (D3D12 command lists + NVAPI cubins); Intel's native modules, weights and root constants read from the player's `libxess_fg.dll` into memory at every start (nothing written to disk; no translation, no `dxcompiler.dll`) | NVIDIA |
 | intel | Intel's `libxess_fg.dll` | any |
-| dlssg | NVIDIA DLSS-G through Streamline | NVIDIA |
+| dlssg | NVIDIA DLSS-G through a private, renamed copy of the player's Streamline (copied from OptiScaler's `Streamline` folder at run time); NVIDIA's own maximum for now | NVIDIA RTX 40+ |
 | fsr | AMD FidelityFX frame generation | any |
 
 Every vendor library is loaded at runtime from the player's PC. This repo holds only our own code.
@@ -16,7 +16,8 @@ Status: being set up (private). Layout planned:
 
 ```
 src/core/        XeFG-API surface OptiScaler drives, pacer, gate, presenter, interop, log/ini/version
-src/generators/  own/ intel/ dlssg/ fsr/
+src/generators/  own, dlssg (+ stubs for intel, fsr)
+src/sink/        the present sink and logging DXGI proxies (dlssg now, intel later)
 tools/           recipe builder, audit, harness
 ```
 
@@ -54,5 +55,5 @@ licences. `tools/make_kit.ps1` builds the release kit (f5low.dll + Intel's `libx
 
 ## Exports
 
-Besides Intel's `xefgSwapChain*` API: `f5lowGetStatus` (which generator runs and why) and
-`xefgCudaXellCountsRenderedOnly`; see docs/GENERATORS.md.
+Besides Intel's `xefgSwapChain*` API: `f5lowGetStatus` (which generator runs and why),
+`xefgCudaXellCountsRenderedOnly` and `xefgCudaDriverMultipliesReflexCap`; see docs/GENERATORS.md.

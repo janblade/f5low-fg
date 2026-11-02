@@ -1,7 +1,9 @@
 # Builds build\f5low.dll from src\: OptiScaler's F5Low frame generation (OptiScaler\plugins\f5low.dll).
 # Needs Visual Studio 2022 (-VsPath, default D:\DEV\VS2022) and Intel's public XeSS-FG SDK headers, which are not
 # copied here: -XessInc, else $env:F5LOW_XESS_INC, else an OptiScaler-NR checkout next to this repo
-# (..\OptiScaler-NR\external\xess\inc\xess_fg).
+# (..\OptiScaler-NR\external\xess\inc\xess_fg). The dlssg generator also needs NVIDIA's public Streamline SDK headers (headers
+# only, MIT: github.com/NVIDIA-RTX/Streamline, include\): -StreamlineInc, else $env:F5LOW_STREAMLINE_INC, else the same OptiScaler-NR
+# checkout (..\OptiScaler-NR\external\streamline).
 #
 # The DLL carries its version (src\xefg_version.h + this repo's commit count and commit): build from a committed tree,
 # or the version says -dirty.
@@ -20,7 +22,8 @@
 #
 # Also writes build\own_blobs.txt: SHA-256 of every shader container we compile into the DLL and the SHA-256 of every
 # file we put into resource 102 (our generated PTX among them), which tools\audit.py --dll accepts (anything else inside the DLL fails the audit).
-param([string]$EmbedPack = '', [string]$Python = 'python', [string]$XessInc = '', [string]$VsPath = 'D:\DEV\VS2022', [string]$Dxc = '')
+param([string]$EmbedPack = '', [string]$Python = 'python', [string]$XessInc = '', [string]$VsPath = 'D:\DEV\VS2022', [string]$Dxc = '',
+      [string]$StreamlineInc = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path $root 'src'
@@ -38,6 +41,10 @@ $inc = @($XessInc, $env:F5LOW_XESS_INC, (Join-Path $root '..\OptiScaler-NR\exter
     Where-Object { $_ -and (Test-Path (Join-Path $_ 'xefg_swapchain.h')) } | Select-Object -First 1
 if (-not $inc) { throw 'XeSS-FG SDK headers not found (-XessInc, F5LOW_XESS_INC or ..\OptiScaler-NR)' }
 $inc = Resolve-Path $inc
+$slInc = @($StreamlineInc, $env:F5LOW_STREAMLINE_INC, (Join-Path $root '..\OptiScaler-NR\external\streamline')) |
+    Where-Object { $_ -and (Test-Path (Join-Path $_ 'sl.h')) } | Select-Object -First 1
+if (-not $slInc) { throw 'Streamline SDK headers not found (-StreamlineInc, F5LOW_STREAMLINE_INC or ..\OptiScaler-NR\external\streamline)' }
+$slInc = Resolve-Path $slInc
 
 # The version: MAJOR.MINOR.PATCH from the header, BUILD = this repo's commit count, the short commit, -dirty when
 # tracked files have uncommitted changes. Written to _version_build.h for the compiler and to the version resource.
@@ -111,7 +118,7 @@ type nul > _build.log
 rc /nologo /fo _res.res _res.rc >> _build.log 2>&1
 fxc /nologo /T cs_5_0 /E main /O3 /Fh xefg_convert_cs.h /Fo xefg_convert.cso /Vn g_xefgConvertCS "$src\xefg_convert.hlsl" >> _build.log 2>&1
 cl /nologo /c /TC /w /O2 /MT /DNDEBUG /Fo_zstd.obj "$root\third_party\zstd\zstddeclib.c" >> _build.log 2>&1
-cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$out" /I"$src" /I"$inc" /I"$root\third_party\zstd" /LD "$src\xefg_cuda.cpp" "$src\intel_modules.cpp" "$src\pack_build.cpp" "$src\intel_file_source.cpp" _zstd.obj /link /OUT:f5low.dll d3d12.lib dxgi.lib cabinet.lib user32.lib _res.res >> _build.log 2>&1
+cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$out" /I"$src" /I"$inc" /I"$slInc" /I"$root\third_party\zstd" /LD "$src\xefg_cuda.cpp" "$src\intel_modules.cpp" "$src\pack_build.cpp" "$src\intel_file_source.cpp" _zstd.obj /link /OUT:f5low.dll d3d12.lib dxgi.lib cabinet.lib user32.lib _res.res >> _build.log 2>&1
 "@
 Remove-Item 'f5low.dll' -ErrorAction SilentlyContinue
 Set-Content -Path '_build.bat' -Value $cmd -Encoding ascii
