@@ -180,9 +180,14 @@ inline BOOL WINAPI HookGetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE* out
 {
     HMODULE ll = g_privateLl.load();
     if (ll && out && name && !(flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) && _stricmp(name, "libxell.dll") == 0)
+    {
+        static std::atomic<bool> logged { false };
+        if (g_log && !logged.exchange(true))
+            g_log("intel: the private libxess_fg looked up libxell.dll - answered with the private libxell copy");
         // the same refcount behaviour the caller asked for, on OUR copy
         return GetModuleHandleExW((flags & GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT) | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                                   reinterpret_cast<LPCWSTR>(ll), out);
+    }
     return GetModuleHandleExA(flags, name, out);
 }
 

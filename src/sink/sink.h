@@ -148,6 +148,13 @@ inline std::vector<std::string> StatsLines()
             t += "  " + std::to_string(d) + ": " + std::to_string(c);
     t += "  (steps under 0.5% left out)";
     lines.push_back(t);
+    if (EnvSet("SINK_PROBE_DUMP"))      // tests: the bar's x of every frame shown, in order (which k of a burst a deviation hits)
+    {
+        std::string seq = "sink probe x:";
+        for (const auto& pr : g_probe)
+            seq += " " + std::to_string(pr.second);
+        lines.push_back(seq);
+    }
     return lines;
 }
 
