@@ -156,12 +156,21 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     `xefgCudaXellCountsRenderedOnly` stays 0.
   - *Sink.* `InitFromSwapChainDesc` hands Intel a `SinkFactory` (spaced mode); `SetEnabled` / `SetNumInterpolatedFrames` set the sink's burst
     (generated + 1; the factory remembers it, so a re-created chain starts with it). `InitFromSwapChain` (a chain the game made) cannot be sunk: the library presents on it itself (logged).
-  - *Pacing today.* The sink's burst spacing (the same as dlssg's). Not built: driving the release times from the own generator's schedule
-    (frame k of an app frame at base + lead + (k - 1) * step, `PaceLead` auto, `pace_lead.h`). It would take: (1) a wrapper chain on the game's
-    side (like dlssg's `MarkerChain`) that stamps the app Present time and the app interval; (2) a schedule entry in the sink replacing its
-    burst-interval spacing (`sTicks`): release time of burst frame j = stamp + lead + j * interval / (n + 1), reset on resize / menu / n change;
-    (3) a feed for `PaceLead`: the sink knows when each staging copy finished (its fence), so "late" = copy done after the planned release,
-    the same event Own gives it; (4) a harness A/B (`pacer_ab.ps1 -Gens own,intel`, which today only knows own and dlssg).
+  - *Pacing.* `F5LOW_SINK_PACE=schedule` (default; `SinkPace=` in f5low.ini) or `burst`. **schedule**: the sink releases a burst on the own
+    generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
+    proxy chain behind a thin wrapper (`xintel::StampChain`; the call is forwarded untouched, every other method passes through; it holds its
+    context weakly). This was the least invasive place that sees the game's own Present, and the stamp is the game's own timing, free of
+    Intel's variable generation time. The stamps give the smoothed app interval (`pacesched::ReadyInterval`, the own pacer's rule) and each
+    batch's base (`pacesched::NextBase`); the first frame of a burst (the sink's arrival-gap split) takes the oldest unmatched stamp, more than
+    two pending are dropped (the library is behind the game: follow the newest). Frame j of a batch (generated 1..n, then the game's frame) is
+    released at `base + pacelead::Offset(lead, step, j + 1)`, step = interval / (n + 1), the lead frozen per batch (`pacelead::Lead`). The
+    Present waits for the frame's staging copy first (as the own generator's `PresentReal`): a generated frame whose copy ran past its time
+    is "late" and feeds `Lead::Late`/`EndFrame` exactly as Own does. A frame past its time is presented on arrival and followed no
+    sooner than half a step after the last (`pacesched::Bound`; no bunching). First frames (fewer than 6 stamps), no wrapper (the game's own
+    chain from `InitFromSwapChain`), FG off (burst 1) and a changed burst size or resized chain fall back to / restart from the burst
+    spacing; a short burst (a menu) is released on its planned time for frame 0 and as it comes after. dlssg is unchanged (burst spacing).
+    The pieces shared with the own generator are in `src/pace_sched.h` (and `pace_lead.h`). Base: the Present call, not the app frame's GPU-ready
+    stamp as in Own; a late app GPU frame therefore shows up as late generated frames and raises the lead.
   - *Tests.* `tests/build_mfgunlock_tests.ps1` builds `xefg_unlock_test.exe <libxess_fg.dll> <libxell.dll>` (sites found once, Locate changes
     nothing, Apply changes exactly the planned bytes); the harness: `repro_test` with `F5LOW_GENERATOR=intel REPRO_INTERP=n XEFG_CUDA_INTEL_LIBRARY=<OptiScaler-style folder>\libxess_fg.dll F5LOW_SINK_STATS=1 SINK_PROBE=1 REPRO_BAR=1 REPRO_FRONT=1 XEFG_CUDA_LOG=1` and Intel's libxell.dll as the second argument
     (Intel's library wants an XeLL context before the swap chain is made); `SINK_PROBE_DUMP=1` also logs the bar's x per frame shown.

@@ -6,7 +6,10 @@
 #   powershell -File tests\pacer_ab.ps1 -Dll build\f5low.dll -Gens own -Mults 6 -Scenarios steady30,hitch50 -Configs off,auto,lead3 -Seconds 30
 #   powershell -File tests\pacer_ab.ps1 -Dll build\f5low.dll -DryRun               # only list the runs and their environment
 #
-# -Gens       own, dlssg. PaceLead (-Configs) acts in the own generator's pacer only; dlssg runs once per cell with `off`.
+# -Gens       own, dlssg, intel. PaceLead (-Configs) acts in the own generator's pacer only; dlssg runs once per cell with `off`.
+#             intel (Intel's libxess_fg from -IntelLib, unlocked to 6x; repro_test gets the libxell next to it) runs once per cell and
+#             -IntelConfigs entry: schedule (the sink releases on the own generator's D3D12 schedule + PaceLead from the stamped game
+#             Presents, F5LOW_SINK_PACE=schedule, the default) and burst (the sink's measured burst interval, F5LOW_SINK_PACE=burst).
 # -Mults      2, 4, 6 (REPRO_INTERP = mult - 1).
 # -Scenarios  steady30, steady60, ramp30-60 (30 -> 60 fps over half the run), hitch50 (60 fps, one 50 ms frame in the middle),
 #             capstep (60 fps, 30 fps from the middle), jitter2 (60 fps, +-2 ms per frame).
@@ -33,6 +36,8 @@ param([Parameter(Mandatory)][string]$Dll,
       [string]$Path = 'd3d12',
       [int]$Gate = 0,
       [string]$DlssgPath = '',
+      [string]$IntelLib = 'D:\DEV\OptiScaler-NR\_builds\xefg-repro-log20\intel\libxess_fg.dll',
+      [string[]]$IntelConfigs = @('schedule', 'burst'),
       [string]$Python = 'python',
       [string]$PresentMon = 'H:\Tools\PresentMon\PresentMon-2.6.0-x64.exe',
       [switch]$NoPresentMon,
@@ -76,11 +81,11 @@ function Scenario([string]$name, [int]$s) {
 $clear = 'XEFG_CUDA_PACELEAD', 'REPRO_TIMER1', 'XEFG_CUDA_PACELOG',
          'REPRO_FPS', 'REPRO_RAMP', 'REPRO_HITCH', 'REPRO_CAPSTEP', 'REPRO_JITTER', 'REPRO_ON', 'REPRO_OFF', 'REPRO_INTERP', 'REPRO_FRONT',
          'REPRO_PACELOG', 'REPRO_BAR', 'XEFG_CUDA_LOG', 'XEFG_CUDA_PATH', 'XEFG_CUDA_GATE', 'XEFG_CUDA_PROF', 'F5LOW_GENERATOR',
-         'F5LOW_SINK_STATS', 'SINK_PROBE', 'XEFG_CUDA_DLSSGPATH'
+         'F5LOW_SINK_STATS', 'SINK_PROBE', 'XEFG_CUDA_DLSSGPATH', 'XEFG_CUDA_INTEL_LIBRARY', 'F5LOW_SINK_PACE', 'F5LOW_INTEL_UNLOCK'
 
 $runs = @()
 foreach ($g in $Gens) { foreach ($sc in $Scenarios) { foreach ($m in $Mults) {
-    foreach ($c in $(if ($g -eq 'own') { $Configs } else { @('off') })) {
+    foreach ($c in $(if ($g -eq 'own') { $Configs } elseif ($g -eq 'intel') { $IntelConfigs } else { @('off') })) {
         for ($r = 1; $r -le $Repeat; ++$r) { $runs += [pscustomobject]@{ Gen = $g; Scenario = $sc; Mult = $m; Config = $c; Rep = $r } }
     } } } }
 Write-Host ("{0} runs, about {1:N0} minutes; PresentMon: {2}" -f $runs.Count, ($runs.Count * ($Seconds + 12) / 60.0), $(if ($pm) { $pm } else { 'not used' }))
@@ -95,12 +100,18 @@ foreach ($run in $runs) {
                F5LOW_GENERATOR = $run.Gen; REPRO_FRONT = '1'; REPRO_PACELOG = '1'; REPRO_BAR = '1'; REPRO_OFF = '60'
                REPRO_ON = "$($sc.ON)"; REPRO_INTERP = "$($run.Mult - 1)" }
     foreach ($k in $sc.Keys) { if ($k -ne 'ON') { $env_[$k] = $sc[$k] } }
-    foreach ($k in $cfgEnv[$run.Config].Keys) { $env_[$k] = $cfgEnv[$run.Config][$k] }
+    if ($cfgEnv.ContainsKey($run.Config)) { foreach ($k in $cfgEnv[$run.Config].Keys) { $env_[$k] = $cfgEnv[$run.Config][$k] } }
+    $env_['XEFG_CUDA_INTEL_LIBRARY'] = $IntelLib     # the own generator builds its pack from it too; intel runs it
+    if ($run.Gen -eq 'intel') {
+        $env_['F5LOW_SINK_STATS'] = '1'; $env_['SINK_PROBE'] = '1'; $env_['F5LOW_SINK_PACE'] = $run.Config
+    }
     if ($run.Gen -eq 'dlssg') {
         $env_['F5LOW_SINK_STATS'] = '1'; $env_['SINK_PROBE'] = '1'
         if ($DlssgPath) { $env_['XEFG_CUDA_DLSSGPATH'] = $DlssgPath }
     }
     Write-Host ("[{0}/{1}] {2}" -f $n, $runs.Count, $id)
+    # another job's harness run or PresentMon session has the GPU: wait (never kill), up to 60 minutes
+    for ($w = 0; $w -lt 60 -and (Get-Process repro_test, PresentMon* -ErrorAction SilentlyContinue); $w++) { Start-Sleep -Seconds 60 }
     if ($DryRun) { ($env_.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ' | Write-Host; continue }
     New-Item -ItemType Directory -Force $dir | Out-Null
     foreach ($k in $clear) { Remove-Item "env:$k" -ErrorAction SilentlyContinue }
@@ -114,7 +125,9 @@ foreach ($run in $runs) {
         $pmProc = Start-Process -FilePath $pm -ArgumentList $pmArgs -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 1500
     }
-    $p = Start-Process -FilePath $exe -ArgumentList @("`"$Dll`"") -PassThru -NoNewWindow -RedirectStandardOutput "$dir\repro.out.txt" -RedirectStandardError "$dir\repro.err.txt"
+    $reproArgs = @("`"$Dll`"")
+    if ($run.Gen -eq 'intel') { $reproArgs += "`"$(Join-Path (Split-Path -Parent $IntelLib) 'libxell.dll')`"" }     # Intel's library wants an XeLL context
+    $p = Start-Process -FilePath $exe -ArgumentList $reproArgs -PassThru -NoNewWindow -RedirectStandardOutput "$dir\repro.out.txt" -RedirectStandardError "$dir\repro.err.txt"
     if (-not $p.WaitForExit(($Seconds + 150) * 1000)) { $p.Kill(); Write-Warning "$id timed out, killed" }
     $code = if ($p.HasExited) { $p.ExitCode } else { -1 }
     if ($pmProc) { if (-not $pmProc.WaitForExit(15000)) { $pmProc.Kill() } }
