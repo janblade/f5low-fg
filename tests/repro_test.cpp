@@ -42,6 +42,10 @@
 //   REPRO_HITCH=frame,ms  one long app frame: ms extra before frame number `frame` of the frames on (REPRO_FPS needed)
 //   REPRO_CAPSTEP=frame,fps  from frame number `frame` of the frames on the app runs at fps (a frame-cap change)
 //   REPRO_JITTER=ms  every app frame leaves up to +-ms early or late (uniform, seeded: the same on every run); the mean is kept
+//   REPRO_SYNC=n    the app presents with sync interval n (default 0); the tearing flag only with n == 0 (and not in exclusive
+//                   fullscreen). n > 0 is a V-Sync present: the own generator and the sink treat it as display-paced (DisplayPaced,
+//                   sink/release_rule.h); whether Streamline's DLSS-G or Intel's library hand the app's interval on to their own presents
+//                   is up to the library - the sink logs what reaches it ("sink: display-paced (sync interval N ...)" with Log=1)
 //   REPRO_PACELOG=1  after the run, one line per app frame on: "app: frame=N t=<QPC ms before Present> ret=<QPC ms after it>"
 //                   (with the DLL's PaceLog / sink pace lines tests/pacer_ab.ps1 gets latencies from them)
 //   REPRO_MENU=N    two N-frame stretches (from a quarter and from five eighths of the frames on) with frame generation
@@ -266,6 +270,7 @@ int main(int argc, char** argv)
     const bool gbv = EnvInt("REPRO_GBV", 0) == 1, noIdle = EnvInt("REPRO_NOIDLE", 0) == 1, toggle = EnvInt("REPRO_TOGGLE", 0) == 1;
     const bool removeDevice = EnvInt("REPRO_REMOVE", 0) == 1, resizeBuf = EnvInt("REPRO_RESIZEBUF", 0) == 1;
     const bool bar = EnvInt("REPRO_BAR", 0) == 1;
+    const UINT syncInterval = static_cast<UINT>((std::max)(0, (std::min)(4, EnvInt("REPRO_SYNC", 0))));
     const bool fsTest = EnvInt("REPRO_FS", 0) == 1;
     const int appFps = EnvInt("REPRO_FPS", 0);
     const int menuLen = EnvInt("REPRO_MENU", 0);
@@ -751,7 +756,7 @@ int main(int argc, char** argv)
             }
         LARGE_INTEGER p0;
         QueryPerformanceCounter(&p0);
-        const HRESULT hr = sc->Present(0, fsOn ? 0 : DXGI_PRESENT_ALLOW_TEARING);     // no tearing flag in exclusive fullscreen
+        const HRESULT hr = sc->Present(syncInterval, syncInterval == 0 && !fsOn ? DXGI_PRESENT_ALLOW_TEARING : 0);     // no tearing flag in exclusive fullscreen or with V-Sync (REPRO_SYNC)
         if (paceLog && on)
         {
             LARGE_INTEGER p1;

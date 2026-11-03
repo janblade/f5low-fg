@@ -6,7 +6,11 @@
 #   powershell -File tests\pacer_ab.ps1 -Dll build\f5low.dll -Gens own -Mults 6 -Scenarios steady30,hitch50 -Configs off,auto,lead3 -Seconds 30
 #   powershell -File tests\pacer_ab.ps1 -Dll build\f5low.dll -DryRun               # only list the runs and their environment
 #
-# -Gens       own, dlssg, intel. PaceLead (-Configs) acts in the own generator's pacer only; dlssg runs once per cell with `off`.
+# -Gens       own, dlssg, intel. PaceLead (-Configs) acts in the own generator's pacer only; dlssg runs once per cell and -DlssgConfigs entry.
+#             Sink configs (-DlssgConfigs, -IntelConfigs; the same names for both): auto (the DLL's default policy), schedule (alias sched:
+#             F5LOW_SINK_PACE=schedule), burst (F5LOW_SINK_PACE=burst), off (F5LOW_SINK_PACE=off: pass-through for dlssg; the DLL maps it to
+#             burst for intel), nogpu (schedule + F5LOW_SINK_GPUSTAMPS=0: the CPU time of the Present as the base), nolag (schedule +
+#             XEFG_CUDA_MAXLAG=0: no lag), wide / leadN (intel and dlssg: see below).
 #             intel (Intel's libxess_fg from -IntelLib, unlocked to 6x; repro_test gets the libxell next to it) runs once per cell and
 #             -IntelConfigs entry: auto (the default policy: schedule where it is not worse, else burst), schedule (the sink releases on
 #             the own generator's D3D12 schedule + PaceLead from the stamped game Presents, F5LOW_SINK_PACE=schedule), burst (the sink's
@@ -14,6 +18,8 @@
 #             leadN (schedule, a fixed lead of N ms not clamped to a step: F5LOW_TEST_SINK_LEAD_MS=N). -IntelLib '' sets no
 #             XEFG_CUDA_INTEL_LIBRARY: the DLL then finds libxess_fg and libxell in the folder above it (OptiScaler\plugins\f5low.dll).
 # -Mults      2, 4, 6 (REPRO_INTERP = mult - 1).
+# -Sync       the app's sync interval per run (REPRO_SYNC, default 0 = tearing, no V-Sync); 1 = a V-Sync present, which the sink and the own
+#             generator treat as display-paced. A matrix dimension: run ids end in _s<n>, results have a sync column.
 # -Scenarios  steady30, steady60, ramp30-60 (30 -> 60 fps over half the run), hitch50 (60 fps, one 50 ms frame in the middle),
 #             capstep (60 fps, 30 fps from the middle), jitter2 (60 fps, +-2 ms per frame).
 # -Configs    PaceLead: off (XEFG_CUDA_PACELEAD=0: one whole step, as before), auto (the default, no variable), lead3 (fixed 3 ms),
@@ -36,6 +42,8 @@ param([Parameter(Mandatory)][string]$Dll,
       [int[]]$Mults = @(2, 4, 6),
       [string[]]$Scenarios = @('steady30', 'steady60', 'ramp30-60', 'hitch50', 'capstep', 'jitter2'),
       [string[]]$Configs = @('off', 'auto'),
+      [string[]]$DlssgConfigs = @('auto', 'schedule', 'off', 'burst'),
+      [int[]]$Sync = @(0),
       [int]$Seconds = 40,
       [int]$Repeat = 1,
       [string]$Path = 'd3d12',
@@ -88,42 +96,51 @@ function Scenario([string]$name, [int]$s) {
         default     { throw "unknown scenario $name" }
     }
 }
-$clear = 'XEFG_CUDA_PACELEAD', 'REPRO_TIMER1', 'XEFG_CUDA_PACELOG',
+$clear = 'F5LOW_SINK_GPUSTAMPS', 'XEFG_CUDA_MAXLAG', 'REPRO_SYNC', 'XEFG_CUDA_PACELEAD', 'REPRO_TIMER1', 'XEFG_CUDA_PACELOG',
          'REPRO_FPS', 'REPRO_RAMP', 'REPRO_HITCH', 'REPRO_CAPSTEP', 'REPRO_JITTER', 'REPRO_ON', 'REPRO_OFF', 'REPRO_INTERP', 'REPRO_FRONT',
          'REPRO_PACELOG', 'REPRO_BAR', 'XEFG_CUDA_LOG', 'XEFG_CUDA_PATH', 'XEFG_CUDA_GATE', 'XEFG_CUDA_PROF', 'F5LOW_GENERATOR',
          'F5LOW_SINK_STATS', 'SINK_PROBE', 'XEFG_CUDA_DLSSGPATH', 'XEFG_CUDA_INTEL_LIBRARY', 'F5LOW_SINK_PACE', 'F5LOW_INTEL_UNLOCK', 'F5LOW_TEST_SINK_LEADCAP', 'F5LOW_TEST_SINK_LEAD_MS'
 
 $runs = @()
-foreach ($g in $Gens) { foreach ($sc in $Scenarios) { foreach ($m in $Mults) {
-    foreach ($c in $(if ($g -eq 'own') { $Configs } elseif ($g -eq 'intel') { $IntelConfigs } else { @('off') })) {
-        for ($r = 1; $r -le $Repeat; ++$r) { $runs += [pscustomobject]@{ Gen = $g; Scenario = $sc; Mult = $m; Config = $c; Rep = $r } }
-    } } } }
+foreach ($g in $Gens) { foreach ($sc in $Scenarios) { foreach ($m in $Mults) { foreach ($sy in $Sync) {
+    foreach ($c in $(if ($g -eq 'own') { $Configs } elseif ($g -eq 'intel') { $IntelConfigs } else { $DlssgConfigs })) {
+        for ($r = 1; $r -le $Repeat; ++$r) { $runs += [pscustomobject]@{ Gen = $g; Scenario = $sc; Mult = $m; Config = $c; Rep = $r; Sync = $sy } }
+    } } } } }
+
+# The sink's settings for a config name (dlssg and intel): the exact variables the DLL reads (xefg_cuda.cpp SinkPaceCfg, MaxLagSetting)
+function SinkConfig([string]$cfg, [hashtable]$e) {
+    switch -Regex ($cfg) {
+        '^auto$'              { }
+        '^(burst|off|schedule)$' { $e['F5LOW_SINK_PACE'] = $cfg }
+        '^sched$'             { $e['F5LOW_SINK_PACE'] = 'schedule' }
+        '^nogpu$'             { $e['F5LOW_SINK_PACE'] = 'schedule'; $e['F5LOW_SINK_GPUSTAMPS'] = '0' }
+        '^nolag$'             { $e['F5LOW_SINK_PACE'] = 'schedule'; $e['XEFG_CUDA_MAXLAG'] = '0' }
+        '^wide$'              { $e['F5LOW_SINK_PACE'] = 'schedule'; $e['F5LOW_TEST_SINK_LEADCAP'] = 'wide' }
+        '^lead(\d+(\.\d+)?)$' { $e['F5LOW_SINK_PACE'] = 'schedule'; $e['F5LOW_TEST_SINK_LEAD_MS'] = $Matches[1] }
+        default               { throw "unknown sink config $cfg" }
+    }
+}
 Write-Host ("{0} runs, about {1:N0} minutes; PresentMon: {2}" -f $runs.Count, ($runs.Count * ($Seconds + 12) / 60.0), $(if ($pm) { $pm } else { 'not used' }))
 
 $n = 0
 foreach ($run in $runs) {
     ++$n
-    $id = '{0:D3}_{1}_{2}_{3}x_{4}{5}' -f $n, $run.Gen, $run.Scenario, $run.Mult, $run.Config, $(if ($Repeat -gt 1) { "_r$($run.Rep)" } else { '' })
+    $id = '{0:D3}_{1}_{2}_{3}x_{4}_s{5}{6}' -f $n, $run.Gen, $run.Scenario, $run.Mult, $run.Config, $run.Sync, $(if ($Repeat -gt 1) { "_r$($run.Rep)" } else { '' })
     $dir = Join-Path $Out "runs\$id"
     $sc = Scenario $run.Scenario $Seconds
     $env_ = @{ REPRO_TIMER1 = '1'; XEFG_CUDA_LOG = '1'; XEFG_CUDA_PACELOG = '1'; XEFG_CUDA_PATH = $Path; XEFG_CUDA_GATE = "$Gate"; XEFG_CUDA_PROF = '0'
                F5LOW_GENERATOR = $run.Gen; REPRO_FRONT = '1'; REPRO_PACELOG = '1'; REPRO_BAR = '1'; REPRO_OFF = '60'
-               REPRO_ON = "$($sc.ON)"; REPRO_INTERP = "$($run.Mult - 1)" }
+               REPRO_ON = "$($sc.ON)"; REPRO_INTERP = "$($run.Mult - 1)"; REPRO_SYNC = "$($run.Sync)" }
     foreach ($k in $sc.Keys) { if ($k -ne 'ON') { $env_[$k] = $sc[$k] } }
-    if ($cfgEnv.ContainsKey($run.Config)) { foreach ($k in $cfgEnv[$run.Config].Keys) { $env_[$k] = $cfgEnv[$run.Config][$k] } }
+    if ($run.Gen -eq 'own' -and $cfgEnv.ContainsKey($run.Config)) { foreach ($k in $cfgEnv[$run.Config].Keys) { $env_[$k] = $cfgEnv[$run.Config][$k] } }
     if ($IntelLib) { $env_['XEFG_CUDA_INTEL_LIBRARY'] = $IntelLib }     # the own generator builds its pack from it too; intel runs it
     if ($run.Gen -eq 'intel') {
         $env_['F5LOW_SINK_STATS'] = '1'; $env_['SINK_PROBE'] = '1'
-        switch -Regex ($run.Config) {
-            '^auto$'     { }
-            '^(burst|schedule)$' { $env_['F5LOW_SINK_PACE'] = $run.Config }
-            '^wide$'     { $env_['F5LOW_SINK_PACE'] = 'schedule'; $env_['F5LOW_TEST_SINK_LEADCAP'] = 'wide' }
-            '^lead(\d+(\.\d+)?)$' { $env_['F5LOW_SINK_PACE'] = 'schedule'; $env_['F5LOW_TEST_SINK_LEAD_MS'] = $Matches[1] }
-            default      { throw "unknown intel config $($run.Config)" }
-        }
+        SinkConfig $run.Config $env_
     }
     if ($run.Gen -eq 'dlssg') {
         $env_['F5LOW_SINK_STATS'] = '1'; $env_['SINK_PROBE'] = '1'
+        SinkConfig $run.Config $env_
         if ($DlssgPath) { $env_['XEFG_CUDA_DLSSGPATH'] = $DlssgPath }
     }
     Write-Host ("[{0}/{1}] {2}" -f $n, $runs.Count, $id)
@@ -149,7 +166,7 @@ foreach ($run in $runs) {
     $code = if ($p.HasExited) { $p.ExitCode } else { -1 }
     if ($pmProc) { if (-not $pmProc.WaitForExit(15000)) { $pmProc.Kill() } }
     if (Test-Path $log) { Copy-Item $log "$dir\f5low.log" -Force } elseif ($fbLog -and (Test-Path $fbLog)) { Copy-Item $fbLog "$dir\f5low.log" -Force }
-    $line = & $Python -I $stats run $dir --gen $run.Gen --mult $run.Mult --skip 60 --meta "scenario=$($run.Scenario)" --meta "config=$($run.Config)" `
+    $line = & $Python -I $stats run $dir --gen $run.Gen --mult $run.Mult --skip 60 --meta "scenario=$($run.Scenario)" --meta "config=$($run.Config)" --meta "sync=$($run.Sync)" `
         --meta "exit=$code" --meta "id=$id"
     if ($LASTEXITCODE -ne 0 -or -not $line) { Write-Warning "$id : analysis failed"; continue }
     Add-Content -Path (Join-Path $Out 'results.jsonl') -Value $line -Encoding ascii

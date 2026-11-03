@@ -53,6 +53,10 @@ APP = re.compile(r"^app: frame=(\d+) t=([\d.]+) ret=([\d.]+)", re.M)
 SINK_GAPS = re.compile(r"sink: gaps between the real chain's Present calls: (\d+) gaps\s+mean ([\d.]+)\s+ms\s+sd ([\d.]+)\s+p01 ([\d.]+)\s+p50 ([\d.]+)\s+p99 ([\d.]+)\s+max ([\d.]+)")
 SINK_PROBE = re.compile(r"sink probe: .*")
 SINK_SCHED = re.compile(r"sink: schedule: (\d+) app Presents stamped, (\d+) batches \((\d+) without a stamp\), lead ([\d.]+)\.\.([\d.]+) ms, (\d+) late generated frames of (\d+)")
+# The schedule's bases (GPU stamps), lag and interval lines (newer f5low.dll only; older logs simply have none of them)
+SINK_BASES = re.compile(r"sink: schedule bases: (\d+) on a GPU stamp, (\d+) on the CPU time of the Present \((\d+) of those asked for a GPU stamp that did not come in time\); lag ([\d.]+) mean, ([\d.]+) max ms over (\d+) batches")
+SINK_AGE = re.compile(r"sink: GPU stamp trails the CPU time of its Present by ([\d.]+) ms mean \(([\d.]+) max\) over (\d+) batches")
+SINK_IV = re.compile(r"sink: app frame interval over (\d+) batches: mean ([\d.]+) ms, sd ([\d.]+) ms by the CPU time of the Present, sd ([\d.]+) ms by the GPU stamp")
 PROBE_STEP = re.compile(r"(-?\d+): (\d+)")
 
 
@@ -104,6 +108,15 @@ def dlssg_metrics(text, app_text, mult, skip):
     if sched:
         out["late_pct"] = 100.0 * int(sched[6]) / max(1, int(sched[7]))     # generated frames whose staging copy ran past their time
         out["lead_ms"] = f"{sched[4]}..{sched[5]}"
+    bases = SINK_BASES.search(text)
+    if bases:
+        out.update({"base_gpu": int(bases[1]), "base_cpu": int(bases[2]), "base_miss": int(bases[3]), "lag_mean": float(bases[4]), "lag_max": float(bases[5])})
+    age = SINK_AGE.search(text)
+    if age:
+        out.update({"gpu_age_mean": float(age[1]), "gpu_age_max": float(age[2])})
+    iv = SINK_IV.search(text)
+    if iv:
+        out.update({"iv_sd_cpu": float(iv[3]), "iv_sd_gpu": float(iv[4])})
     apps = [(int(m[1]), float(m[2])) for m in APP.finditer(app_text)]
     if not times:
         out["notes"] = "no 'sink: pace' lines (F5LOW_SINK_STATS=1, XEFG_CUDA_PACELOG=1; did Generator=dlssg run?)"
@@ -185,7 +198,8 @@ def cmd_run(argv):
     print(json.dumps(out))
 
 
-COLS = ["gen", "scenario", "mult", "config", "exit", "gap_n", "gap_mean", "gap_sd", "gap_p99", "gap_max", "hitch2x", "lat_last_mean",
+COLS = ["gen", "scenario", "mult", "sync", "config", "exit", "base_gpu", "base_cpu", "base_miss", "lag_mean", "lag_max", "gpu_age_mean", "gpu_age_max",
+        "iv_sd_cpu", "iv_sd_gpu", "gap_n", "gap_mean", "gap_sd", "gap_p99", "gap_max", "hitch2x", "lat_last_mean",
         "lat_last_p99", "lat_first_mean", "lat_first_p99", "late_pct", "lead_ms", "pm_n", "pm_mean", "pm_sd", "pm_p99", "pm_max",
         "pm_shown_pct", "probe_exact", "probe_total", "probe", "notes"]
 
@@ -208,22 +222,27 @@ def cmd_report(argv):
     keys = sorted({(r["gen"], r["scenario"]) for r in rows}, key=lambda k: (k[0], k[1]))
     for gen, sc in keys:
         md += [f"## {gen} - {sc}", "",
-               "| mult | config | gap sd | p99 | max | >2x | d sd | lat last | d last | lat 1st | d 1st | late% | pm sd | pm p99 | shown% | notes |",
-               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+               "| mult | sync | config | gap sd | p99 | max | >2x | d sd | lat last | d last | lat 1st | d 1st | late% | pm sd | pm p99 | shown% | gpu/cpu/miss | lag mean/max | gpu age | iv sd cpu/gpu | notes |",
+               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         sub = [r for r in rows if r["gen"] == gen and r["scenario"] == sc]
-        for r in sorted(sub, key=lambda r: (r["mult"], r["config"] != "off", r["config"])):
-            base = next((b for b in sub if b["mult"] == r["mult"] and b["config"] == "off"), None)
+        for r in sorted(sub, key=lambda r: (r["mult"], int(r.get("sync") or 0), r["config"] != "off", r["config"])):
+            base = next((b for b in sub if b["mult"] == r["mult"] and b["config"] == "off" and b.get("sync", "0") == r.get("sync", "0")), None)
+
+            def pair(a, b, n=2):
+                return f"{f(r.get(a), n)}/{f(r.get(b), n)}" if a in r else ""
+
+            bases = f"{r['base_gpu']}/{r['base_cpu']}/{r['base_miss']}" if "base_gpu" in r else ""
 
             def dl(key):
                 if base is None or r is base or key not in r or key not in base:
                     return ""
                 return f"{r[key] - base[key]:+.2f}"
 
-            md.append("| {}x | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
-                r["mult"], r["config"], f(r.get("gap_sd")), f(r.get("gap_p99")), f(r.get("gap_max")), f(r.get("hitch2x"), 0),
+            md.append("| {}x | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                r["mult"], r.get("sync", ""), r["config"], f(r.get("gap_sd")), f(r.get("gap_p99")), f(r.get("gap_max")), f(r.get("hitch2x"), 0),
                 dl("gap_sd"), f(r.get("lat_last_mean")), dl("lat_last_mean"), f(r.get("lat_first_mean")), dl("lat_first_mean"),
                 f(r.get("late_pct"), 1), f(r.get("pm_sd")), f(r.get("pm_p99")),
-                f(r.get("pm_shown_pct"), 1), r.get("notes", "") if int(r.get("exit") or 0) == 0 else "exit " + str(r["exit"]) + " " + r.get("notes", "")))
+                f(r.get("pm_shown_pct"), 1), bases, pair("lag_mean", "lag_max"), f(r.get("gpu_age_mean")), pair("iv_sd_cpu", "iv_sd_gpu", 3), r.get("notes", "") if int(r.get("exit") or 0) == 0 else "exit " + str(r["exit"]) + " " + r.get("notes", "")))
         md.append("")
     (d / "results.md").write_text("\n".join(md), encoding="utf-8")
     print(f"{len(rows)} runs -> {d / 'results.csv'}, {d / 'results.md'}")
