@@ -5,9 +5,10 @@ f5low.dll is a frame generation **host**. OptiScaler drives it through Intel's X
 shares: the swap chain the game sees, frame input staging, pacing, presentation, latency reporting (XeLL calls),
 the UI/letterbox rules. A **generator** only makes the in-between frames.
 
-Two generators run: **own** (XeFG Tensor) and **dlssg** (NVIDIA DLSS-G through a private copy of the player's Streamline,
-RTX 20 and newer, 2x to 6x on every tier: native on RTX 50, unlocked in memory on RTX 20/30/40, see "dlssg" below). `intel` and `fsr`
-are registered and selectable, report "not available yet" in the log, and run `own`; their design is below (see "What is ready").
+Three generators run: **own** (XeFG Tensor), **dlssg** (NVIDIA DLSS-G through a private copy of the player's Streamline,
+RTX 20 and newer, 2x to 6x on every tier: native on RTX 50, unlocked in memory on RTX 20/30/40, see "dlssg" below) and **intel**
+(Intel's libxess_fg, the one the own generator reads, unlocked in memory to 6x, see "intel" below). `fsr` is registered and selectable, reports
+"not available yet" in the log, and runs `own`; its design is below (see "What is ready").
 
 ## Choosing a generator
 
@@ -17,7 +18,7 @@ other settings). Values, case insensitive: `own` (default), `intel`, `dlssg`, `f
 `f5low: generator "<value>" is unknown (own, intel, dlssg, fsr) - running own` and runs `own`.
 
 A generator that is not available logs one line and the host runs `own`: `f5low: generator <name> not available yet, running own`
-for `intel` and `fsr` (`src/generators/stubs.h`, `GenCaps::available = false`). **`dlssg` never falls back**: when the player picks it and it
+for `fsr` (`src/generators/stubs.h`, `GenCaps::available = false`). **`dlssg` and `intel` never fall back**: when the player picks `dlssg` and it
 cannot start (no NVIDIA GPU, below RTX 20, no usable Streamline, a DLSS-G build the unlock does not recognise, slInit failing),
 `f5low: generator dlssg not available (<reason>) - frame generation is off (no fallback to own)` is logged, `f5lowGetStatus` says 3 with
 `dlssg unavailable: <reason>`, `xefgSwapChainD3D12CreateContext` returns `XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE` and no own context is
@@ -108,22 +109,85 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 ## What is ready
 
-- Ready: `own` behind `IGenerator` / `IPackGenerator`; the selection (above); `dlssg` (present sink, see below); `intel` and `fsr`
+- Ready: `own` behind `IGenerator` / `IPackGenerator`; the selection (above); `dlssg` and `intel` (present sink, see below); `fsr`
   registered as "not available yet" (`GenCaps` only) and falling back to `own`.
 - Not ready: frames-only backends (`fsr`). The host only knows pack-layout buffers; a backend that takes and returns textures
   needs a texture in/out path in `CopyFrame` / `Show` / `PresentGen` next to them, and a `Generate(GenInputs, t[], out[])`
   entry on `IGenerator`.
-- Ready for dlssg, not for intel: the present-sink route. A dlssg context is a separate kind of context at the XeFG entry points of
+- Ready for dlssg and intel: the present-sink route. A dlssg context is a separate kind of context at the XeFG entry points of
   `src/xefg_cuda.cpp` (next to the forwarding-to-Intel route: `FindDlssg(h)` in every entry point), not a `class Own` /
-  `IPackGenerator`; `own` runs through exactly the code it ran through before. `intel` will reuse `src/sink/` and the same kind of
-  entry-point branch, with its own sink mode (spaced bursts); its design is the per-backend note below (story A2).
+  `IPackGenerator`; `own` runs through exactly the code it ran through before. `intel` reuses `src/sink/` and the same kind of
+  entry-point branch, with its own sink mode (spaced bursts); see "intel" below.
 - Not ready: the frames-only shape (`fsr`), see above. Stories A3-A4 will shape it.
 
 ## Per backend, when it is built (stories A2-A4)
 
-- **intel**: libxess_fg from `XEFG_CUDA_INTEL_LIBRARY` (OptiScaler sets it to XeFGPath or its own copy), then our
-  folder, then the folder above. Sink shape. Max = what Intel reports; our unlock never patches this copy (decided
-  in OptiScaler's F5Low plan). XeLL: the library's own calls pass through.
+- **intel** (built, `src/generators/intel.h`, `src/unlock/FamilyXeFG.h` + `UnlockXeFg.h`): Intel's libxess_fg makes the frames, our sink
+  paces them. Present-sink shape, spaced mode. Any D3D12 GPU Intel's library runs on.
+  - *Routing.* `Generator=intel` in `D3D12CreateContext` builds an `xintel::Ctx` (not `Own`). The handle is the library's own handle; every XeFG
+    entry point of `xefg_cuda.cpp` calls the library f5low loaded for it for such a handle (`FORWARDH`; a proc it lacks is an error, never a fall-back), the other handles still go to the shared
+    `Real()` library. **No fallback**: when the library cannot start (no libxess_fg found, the load failed, a failed rollback of the unlock, CreateContext refused),
+    `f5low: generator intel not available (<reason>) - frame generation is off (no fallback to own)`, `f5lowGetStatus` 3
+    `intel unavailable: <reason>`, `XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE`.
+  - *Library.* No copies on disk. It is the SAME libxess_fg.dll the own generator reads (`RealLibraryPath` in `xefg_cuda.cpp`:
+    `XEFG_CUDA_INTEL_LIBRARY`, next to f5low.dll, the folder above = OptiScaler's), loaded by full path and logged. A source that is f5low
+    itself (our own path, or a module exporting `f5lowGetStatus`) is never loaded.
+  - *Unlock.* `unlock/FamilyXeFG.h` (OptiScaler-NR's family, U1-U5 on libxess_fg, XL1 on libxell, structural locators) applied by
+    `unlock/UnlockXeFg.h` right after f5low loaded the library and BEFORE the first XeFG call: Intel sizes every per-generated-frame buffer
+    from U3 (its default interpolation ceiling) when a context is created, so a late patch leaves 3-slot buffers (evidence in the ai-os
+    2026-11-03 study). Whether libxess_fg.dll was ALREADY loaded in the process before f5low is decided by handle (the process' module
+    list before the load against the handle the load returns: 8.3 names, junctions and `\\?\` prefixes do not matter); then a context may exist
+    and nothing is patched: Intel's own maximum, with the reason in the log. One exception: the module f5low's own forwarding (`Real()`)
+    loaded itself, when no context was ever made through it, counts as f5low's own and is patched. **The patched module is shared:** it is THE
+    module of that path, so a later loader in the process (the player switching OptiScaler's FG output to XeFG at run time) gets a library that
+    reports 6x; the log line "module shared" says so when the unlock applies. All or none; an unknown build is refused with the failing site and the library then runs
+    unpatched at its own maximum (on an RTX 5070 Ti with 1.3.4.95 and libxell 1.3.2.10 that is 2x: GetProperties says 1; with the
+    unlock it says 5 = 6x). A failed rollback (a partially patched module) refuses the library outright: status 3. The count is 3 to 5.
+    `F5LOW_INTEL_UNLOCK=0|off|false|no` turns it off (tests); `F5LOW_TEST_XEFG_SKIP=U4` leaves one site unpatched (tests). This patches
+    inside Intel's DLLs in memory; nothing is written to disk.
+  - *libxell.* libxess_fg does not import libxell: it calls `GetModuleHandleExA(0, "libxell.dll")` at run time, so it uses the libxell the
+    process already has (OptiScaler's or the game's) = the one that made the XeLL context OptiScaler hands over. XL1 is patched in that
+    module in memory (one log line says so; it only lifts libxell's refusal of generated-frame counts above 3; f5low takes a reference on it so
+    it is not unloaded and loaded again unpatched). XL1 already holding exactly the byte this family writes (another component, e.g.
+    OptiScaler's own MFG unlock on the shared libxell, lifted it) counts as applied ("already lifted by another component"); the same is
+    never accepted for libxess_fg U1-U5. If no libxell.dll is loaded
+    when the context is created, the one next to libxess_fg is loaded by full path. If the XL1 site is not found (or the libxell holds another count
+    before), XL1 and the libxess_fg unlock are skipped together. Intel reports the generated frames to XeLL itself every frame, so
+    `xefgCudaXellCountsRenderedOnly` stays 0.
+  - *Sink.* `InitFromSwapChainDesc` hands Intel a `SinkFactory` (spaced mode); `SetEnabled` / `SetNumInterpolatedFrames` set the sink's burst
+    (generated + 1; the factory remembers it, so a re-created chain starts with it). `InitFromSwapChain` (a chain the game made) cannot be sunk: the library presents on it itself (logged).
+  - *Pacing policy.* `F5LOW_SINK_PACE=auto` (default; `SinkPace=` in f5low.ini), `schedule` or `burst`. Auto picks per burst size (logged:
+    "N frames per application frame: pacing by ..."): the schedule at 2x, the burst spacing from 3x. Why (harness A/B, 1.3.4.95, RTX 5070 Ti,
+    20 s): at 2x the schedule removes the burst-start jitter (2x/30 gap sd 0.69 -> 0.24, pm_sd 2.0 -> 0.5, late <= 1 %). From 3x the first
+    generated frame of every burst is late (~3 ms, about one late frame per batch, 12-20 % of generated frames at 4x/6x at 60 fps) and gap sd /
+    pm_sd are worse than the burst spacing. A wider lead cap (n steps; the lead rule reached 13-17 ms) did NOT remove it, and
+    Intel's frames all arrive within ~1.5 ms of the game's Present, so the cause is probably the first frame's GPU completion behind the whole
+    burst's work, not a short lead. Fixed leads (not clamped to a step any more; harness 2026-11-03, 20 s, d7387f9) did not remove it either: lead 6 ms / lead 9 ms
+    at 4x/60 give late 1.1 % / 27 % with gap sd 1.14 / 0.79 (burst 0.19) and at 6x/60 late 15 % / 27 % with gap sd 1.5 (burst 0.13); jitter2 is
+    the same picture (6x late 11 % / 23 %, gap sd 1.5 against 0.70). Only lead 6 at 4x/60 reaches late ~1 %, with a gap sd still six times
+    the burst spacing's. A bigger lead costs latency and, past about one frame time, raises the late share (the frames wait behind the burst). Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
+    arrival offsets and late frames per burst frame j.
+  - *Schedule mode.* **schedule**: the sink releases a burst on the own
+    generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
+    proxy chain behind a thin wrapper (`xintel::StampChain`; the call is forwarded untouched, every other method passes through; it holds its
+    context weakly). This was the least invasive place that sees the game's own Present, and the stamp is the game's own timing, free of
+    Intel's variable generation time. The stamps give the smoothed app interval (`pacesched::ReadyInterval`, the own pacer's rule) and each
+    batch's base (`pacesched::NextBase`); the first frame of a burst (the sink's arrival-gap split) takes the newest stamp not later than its arrival (`pacesched::PickStamp`; older
+    ones are dropped, so an extra stamp cannot shift the schedule). Frame j of a batch (generated 1..n, then the game's frame) is
+    released at `base + pacelead::Offset(lead, step, j + 1)`, step = interval / (n + 1), the lead frozen per batch (`pacelead::Lead`). The
+    Present waits for the frame's staging copy first (as the own generator's `PresentReal`): a generated frame whose copy ran past its time
+    is "late" and feeds `Lead::Late`/`EndFrame` exactly as Own does. A frame past its time is presented on arrival and followed no
+    sooner than half a step after the last (`pacesched::Bound`; no bunching). First frames (fewer than 6 stamps), no wrapper (the game's own
+    chain from `InitFromSwapChain`), FG off (burst 1) and a changed burst size or resized chain fall back to / restart from the burst
+    spacing; a short burst (a menu) is released on its planned time for frame 0 and as it comes after. dlssg is unchanged (burst spacing).
+    The pieces shared with the own generator are in `src/pace_sched.h` (and `pace_lead.h`). Base: the Present call, not the app frame's GPU-ready
+    stamp as in Own; a late app GPU frame therefore shows up as late generated frames and raises the lead. Only our own GPU wait counts as
+    late for the lead (a frame that arrived after its time is presented on arrival and does not raise it). After a late frame the lead
+    stays raised for up to 128 application frames (`pacelead::kWindow`) and eases down by 1/16 per frame, so a menu (short bursts) that
+    follows keeps the higher lead's latency for a few seconds. A Present with `DXGI_PRESENT_TEST` is neither stamped nor sampled.
+  - *Tests.* `tests/build_mfgunlock_tests.ps1` builds `xefg_unlock_test.exe <libxess_fg.dll> <libxell.dll>` (sites found once, Locate changes
+    nothing, Apply changes exactly the planned bytes); the harness: `repro_test` with `F5LOW_GENERATOR=intel REPRO_INTERP=n XEFG_CUDA_INTEL_LIBRARY=<OptiScaler-style folder>\libxess_fg.dll F5LOW_SINK_STATS=1 SINK_PROBE=1 REPRO_BAR=1 REPRO_FRONT=1 XEFG_CUDA_LOG=1` and Intel's libxell.dll as the second argument
+    (Intel's library wants an XeLL context before the swap chain is made); `SINK_PROBE_DUMP=1` also logs the bar's x per frame shown.
 - **dlssg** (built, `src/generators/dlssg.h`, `dlssg_files.h`): NVIDIA DLSS-G through Streamline's public API. Sink shape.
   - *Routing.* `Generator=dlssg` in `D3D12CreateContext` builds a `DlssgGenerator` (an `IGenerator`: `Caps()` = name, available,
     reason, `maxGenerated` (5 on every tier), `presentsItself = true`, `anyGpu = false`). Not available below RTX 20 (sm < 75) or without an

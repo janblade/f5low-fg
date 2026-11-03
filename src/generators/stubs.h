@@ -1,4 +1,4 @@
-// generators/stubs.h - the generators that are registered but not built yet: intel, fsr (docs/GENERATORS.md; dlssg is real, generators/dlssg.h).
+// generators/stubs.h - the generators that are registered but not built yet: fsr (docs/GENERATORS.md; dlssg and intel are real, generators/dlssg.h and intel.h).
 // Each reports available = false; the host then logs one line and runs own.
 #pragma once
 
@@ -26,11 +26,9 @@ private:
     GenCaps caps;
 };
 
-// intel | fsr (lower case) as a stub; null for anything else (own is built by the host; dlssg is routed by xefg_cuda.cpp).
+// fsr (lower case) as a stub; null for anything else (own is built by the host; dlssg and intel are routed by xefg_cuda.cpp).
 inline std::unique_ptr<IGenerator> MakeStubGenerator(const std::string& id)
 {
-    if (id == "intel")
-        return std::make_unique<UnavailableGenerator>("Intel XeFG");
     if (id == "fsr")
         return std::make_unique<UnavailableGenerator>("FSR FG");
     return nullptr;

@@ -30,12 +30,15 @@
 #include "pack_build.h"
 #include "xefg_own.h"
 #include "generators/dlssg.h"
+#include "generators/intel.h"
 #include "xefg_version.h"
 #include <xefg_swapchain_debug.h>
 
 namespace
 {
 HMODULE g_real = nullptr;
+std::atomic<bool> g_realFirstLoad { false };    // f5low's load of the shared library (Real()) was the first one in the process (no other loader had it)
+std::atomic<bool> g_realContext { false };     // a context was made through g_real (the shared library; generators/intel.h asks before it patches)
 FILE* g_log = nullptr;
 std::mutex g_logLock;           // opening and the line count; never held for file I/O after the first open
 std::mutex g_fileLock;          // the writer thread's (and detach's) file writes
@@ -770,6 +773,27 @@ double MaxDelaySetting()
     return std::isfinite(v) ? std::clamp(v, 0.25, 3.0) : 1.5;
 }
 
+// F5LOW_SINK_PACE (else SinkPace= in f5low.ini): how the intel generator's sink releases a burst. "auto" (default): the schedule for the
+// burst sizes where it is not worse than the burst spacing (sink/sink.h kAutoMaxBurst), else the burst spacing, the choice logged;
+// "schedule": always on the own generator's D3D12 schedule from the game's stamped Presents, with PaceLead; "burst": always by the burst
+// interval it measured. Tests only: F5LOW_TEST_SINK_LEADCAP=wide (the lead may reach n steps, not one), F5LOW_TEST_SINK_LEAD_MS=<ms> (a
+// fixed lead, not clamped to a step).
+double PaceLeadSetting(bool* autoLead);
+xsink::PaceCfg SinkPaceCfg()
+{
+    xsink::PaceCfg c;
+    const std::string m = Setting("F5LOW_SINK_PACE", "SinkPace", "auto");
+    c.mode = m == "burst" ? xsink::PaceMode::Burst : m == "schedule" ? xsink::PaceMode::Schedule : xsink::PaceMode::Auto;
+    c.leadFixedMs = PaceLeadSetting(&c.leadAuto);
+    // Test switches: environment only, never the ini (a stray ini line must not change a player's pacing)
+    char tv[32] = {};
+    c.wideCap = GetEnvironmentVariableA("F5LOW_TEST_SINK_LEADCAP", tv, sizeof(tv)) > 0 && !strcmp(tv, "wide");
+    tv[0] = 0;
+    const double t = GetEnvironmentVariableA("F5LOW_TEST_SINK_LEAD_MS", tv, sizeof(tv)) > 0 && GetEnvironmentVariableA("F5LOW_TEST_SINK_LEAD_MS", tv, sizeof(tv)) < sizeof(tv) ? atof(tv) : 0.0;
+    c.testLeadMs = std::isfinite(t) && t > 0 ? t : 0;
+    return c;
+}
+
 // PaceLog=1 (XEFG_CUDA_PACELOG, else f5low.ini): a record per present in the log when the presenter stops (needs Log=1; tests/pacer_ab.ps1).
 bool PaceFlag(const char* env, const char* key)
 {
@@ -886,8 +910,11 @@ FARPROC Real(const char* name)
         const char* from = "";
         const std::wstring path = RealLibraryPath(&from);
         // The full path: a libxess_fg.dll the game loaded from its own folder is not taken by name instead
+        // The process' modules before the load: was it ours that brought the library in? (Generator=intel patches it only then.)
+        const std::vector<HMODULE> before = xintel::ProcessModules();
         g_real = LoadLibraryExW(longpath::ExtendIfLong(path).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        Log("real library %S (%s): %p", path.c_str(), from, static_cast<void*>(g_real));
+        g_realFirstLoad = g_real && !before.empty() && std::find(before.begin(), before.end(), g_real) == before.end();
+        Log("real library %S (%s): %p%s", path.c_str(), from, static_cast<void*>(g_real), g_realFirstLoad ? "" : " (already loaded by someone else, or unknown)");
     });
     FARPROC p = g_real ? GetProcAddress(g_real, name) : nullptr;
     if (!p)
@@ -899,6 +926,27 @@ FARPROC Real(const char* name)
     static auto fn = reinterpret_cast<decltype(&name)>(Real(#name));                                \
     if (!fn)                                                                                        \
         return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;                                           \
+    const xefg_swapchain_result_t r = fn(__VA_ARGS__)
+
+// The same for a call on a context handle (the handle parameter is always called h): a Generator=intel context goes to the library f5low
+// loaded for it (generators/intel.h), looked up once per call site; a proc it lacks is an error, never a fall-back to the shared real
+// library. Every other handle goes to the shared real library as above (cached per export, as before).
+#define FORWARDH(name, ...)                                                                        \
+    decltype(&name) fn = nullptr;                                                                   \
+    if (xintel::Find(h))                                                                            \
+    {                                                                                               \
+        static auto fnIntel = reinterpret_cast<decltype(&name)>(xintel::Proc(#name));               \
+        if (!fnIntel)                                                                               \
+            return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;                                       \
+        fn = fnIntel;                                                                               \
+    }                                                                                               \
+    else                                                                                            \
+    {                                                                                               \
+        static auto fnReal = reinterpret_cast<decltype(&name)>(Real(#name));                        \
+        if (!fnReal)                                                                                \
+            return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;                                       \
+        fn = fnReal;                                                                                \
+    }                                                                                               \
     const xefg_swapchain_result_t r = fn(__VA_ARGS__)
 
 const char* ResName(int t)
@@ -956,9 +1004,10 @@ xefg_swapchain_result_t xefgSwapChainGetVersion(xefg_swapchain_version_t* v)
     // The first API call starts the pack's build in the background (it never waits for it). Ours answers unless the build has
     // failed already; Intel's library then answers.
     const PackRoute route = ResolvePack();
-    if (route.built())
+    const std::string gen = GeneratorRaw();
+    if (route.built() && gen != "intel")
         StartPackBuild();
-    if (!route.forward && (GeneratorRaw() == "dlssg" || !(route.built() && g_packStateA.load(std::memory_order_acquire) == kPackFailed)))
+    if (!route.forward && (gen == "dlssg" || gen == "intel" || !(route.built() && g_packStateA.load(std::memory_order_acquire) == kPackFailed)))
     {
         if (!v)
             return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
@@ -988,7 +1037,7 @@ xefg_swapchain_result_t xefgSwapChainGetProperties(xefg_swapchain_handle_t h, xe
         p->maxSupportedInterpolations = xefgown::kMaxInterp;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainGetProperties, h, p);
+    FORWARDH(xefgSwapChainGetProperties, h, p);
     if (p)
         Log("GetProperties h=%p -> %d descriptors=%u bufHeap=%llu texHeap=%llu cb=%llu maxInterp=%u", static_cast<void*>(h), r,
             p->requiredDescriptorCount, p->tempBufferHeapSize, p->tempTextureHeapSize, p->constantBufferSize,
@@ -999,6 +1048,13 @@ xefg_swapchain_result_t xefgSwapChainGetProperties(xefg_swapchain_handle_t h, xe
 xefg_swapchain_result_t xefgSwapChainTagFrameConstants(xefg_swapchain_handle_t h, uint32_t id, const xefg_swapchain_frame_constant_data_t* c)
 {
     SlowApi slow("xefgSwapChainTagFrameConstants");
+    if (auto ic = xintel::Find(h))
+    {
+        // F5LOW_SINK_STATS=1 (tests): the sink's statistics cover frame generation after its start-up (as for dlssg)
+        std::lock_guard<std::mutex> lk(ic->mu);
+        if (ic->enabled && xsink::g_stats && ++ic->statFrames == 12)
+            xsink::ResetGaps();
+    }
     if (auto dg = FindDlssg(h))
         return c ? dg->Constants(id, *c) : XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
     if (auto o = FindOwn(h))
@@ -1009,7 +1065,7 @@ xefg_swapchain_result_t xefgSwapChainTagFrameConstants(xefg_swapchain_handle_t h
         o->constants = *c;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainTagFrameConstants, h, id, c);
+    FORWARDH(xefgSwapChainTagFrameConstants, h, id, c);
     if (c)
     {
         Log("TagFrameConstants id=%u -> %d jitter=%.6f,%.6f mvScale=%.6f,%.6f reset=%u renderTime=%.3f", id, r, c->jitterOffsetX,
@@ -1034,6 +1090,18 @@ xefg_swapchain_result_t xefgSwapChainSetEnabled(xefg_swapchain_handle_t h, uint3
         c->Apply();
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
+    if (auto ic = xintel::Find(h))
+    {
+        FORWARDH(xefgSwapChainSetEnabled, h, e);
+        if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS)
+        {
+            std::lock_guard<std::mutex> lk(ic->mu);
+            ic->enabled = e != 0;
+            ic->ApplyBurst();       // only once the library took it
+        }
+        Log("SetEnabled %u -> %d (intel)", e, r);
+        return r;
+    }
     if (auto o = FindOwn(h))
     {
         xefgown::Own::XellCall c;
@@ -1046,7 +1114,7 @@ xefg_swapchain_result_t xefgSwapChainSetEnabled(xefg_swapchain_handle_t h, uint3
         Log("SetEnabled %u (own)", e);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainSetEnabled, h, e);
+    FORWARDH(xefgSwapChainSetEnabled, h, e);
     Log("SetEnabled %u -> %d", e, r);
     return r;
 }
@@ -1061,7 +1129,7 @@ xefg_swapchain_result_t xefgSwapChainSetPresentId(xefg_swapchain_handle_t h, uin
     }
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
-    FORWARD(xefgSwapChainSetPresentId, h, id);
+    FORWARDH(xefgSwapChainSetPresentId, h, id);
     Log("SetPresentId %u -> %d", id, r);
     return r;
 }
@@ -1085,7 +1153,7 @@ xefg_swapchain_result_t xefgSwapChainGetLastPresentStatus(xefg_swapchain_handle_
         s->isFrameGenEnabled = o->lastGenerated ? 1 : 0;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainGetLastPresentStatus, h, s);
+    FORWARDH(xefgSwapChainGetLastPresentStatus, h, s);
     if (s)
         Log("GetLastPresentStatus -> %d presented=%u enabled=%u", r, s->framesPresented, s->isFrameGenEnabled);
     return r;
@@ -1098,7 +1166,7 @@ xefg_swapchain_result_t xefgSwapChainSetLoggingCallback(xefg_swapchain_handle_t 
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
-    FORWARD(xefgSwapChainSetLoggingCallback, h, lvl, cb, ud);
+    FORWARDH(xefgSwapChainSetLoggingCallback, h, lvl, cb, ud);
     Log("SetLoggingCallback level=%d -> %d", static_cast<int>(lvl), r);
     return r;
 }
@@ -1124,6 +1192,28 @@ xefg_swapchain_result_t xefgSwapChainDestroy(xefg_swapchain_handle_t h)
             return XEFG_SWAPCHAIN_RESULT_SUCCESS;
         }
     }
+    if (auto ic = xintel::Find(h))
+    {
+        {
+            // before the library lets go of its chain: no more stamps, and our wrapper chain (a reference on Intel's) goes first
+            std::lock_guard<std::mutex> lk(ic->mu);
+            ic->stampTarget = nullptr;
+            if (ic->stampChain)
+            {
+                ic->stampChain->Release();
+                ic->stampChain = nullptr;
+            }
+        }
+        FORWARDH(xefgSwapChainDestroy, h);
+        {
+            std::lock_guard<std::mutex> lk(xintel::g_ctxMu);
+            xintel::g_ctx.erase(h);
+        }
+        Log("Destroy h=%p -> %d (intel)", static_cast<void*>(h), r);
+        ic.reset();         // the library let go of its swap chain (and so the sink); now our factory reference goes
+        xintel::LogSinkStats();
+        return r;
+    }
     std::shared_ptr<xefgown::Own> o;
     {
         std::lock_guard<std::mutex> lk(g_ownLock);
@@ -1146,7 +1236,7 @@ xefg_swapchain_result_t xefgSwapChainDestroy(xefg_swapchain_handle_t h)
         o->Retire(); // outside g_ownLock: it waits for our GPU work
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainDestroy, h);
+    FORWARDH(xefgSwapChainDestroy, h);
     Log("Destroy h=%p -> %d", static_cast<void*>(h), r);
     return r;
 }
@@ -1249,7 +1339,7 @@ xefg_swapchain_result_t xefgSwapChainSetLatencyReduction(xefg_swapchain_handle_t
         o->LinkXell(xell).Send();
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainSetLatencyReduction, h, xell);
+    FORWARDH(xefgSwapChainSetLatencyReduction, h, xell);
     Log("SetLatencyReduction xell=%p -> %d", xell, r);
     return r;
 }
@@ -1264,7 +1354,7 @@ xefg_swapchain_result_t xefgSwapChainSetSceneChangeThreshold(xefg_swapchain_hand
         o->sceneThreshold = t;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainSetSceneChangeThreshold, h, t);
+    FORWARDH(xefgSwapChainSetSceneChangeThreshold, h, t);
     Log("SetSceneChangeThreshold %.4f -> %d", t, r);
     return r;
 }
@@ -1275,7 +1365,7 @@ xefg_swapchain_result_t xefgSwapChainGetPipelineBuildStatus(xefg_swapchain_handl
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
-    FORWARD(xefgSwapChainGetPipelineBuildStatus, h);
+    FORWARDH(xefgSwapChainGetPipelineBuildStatus, h);
     Log("GetPipelineBuildStatus -> %d", r);
     return r;
 }
@@ -1295,6 +1385,18 @@ xefg_swapchain_result_t xefgSwapChainSetNumInterpolatedFrames(xefg_swapchain_han
         c->Apply();
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
+    if (auto ic = xintel::Find(h))
+    {
+        FORWARDH(xefgSwapChainSetNumInterpolatedFrames, h, n);
+        if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS)
+        {
+            std::lock_guard<std::mutex> lk(ic->mu);
+            ic->numInterp = n;
+            ic->ApplyBurst();
+        }
+        Log("SetNumInterpolatedFrames %u -> %d (intel, max %u)", n, r, ic->maxGen);
+        return r;
+    }
     if (auto o = FindOwn(h))
     {
         if (n < 1 || n > xefgown::kMaxInterp)
@@ -1312,7 +1414,7 @@ xefg_swapchain_result_t xefgSwapChainSetNumInterpolatedFrames(xefg_swapchain_han
         c.Send();
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainSetNumInterpolatedFrames, h, n);
+    FORWARDH(xefgSwapChainSetNumInterpolatedFrames, h, n);
     Log("SetNumInterpolatedFrames %u -> %d", n, r);
     return r;
 }
@@ -1328,7 +1430,7 @@ xefg_swapchain_result_t xefgSwapChainSetUiCompositionState(xefg_swapchain_handle
         Log("SetUiCompositionState %d (own)", static_cast<int>(s));
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainSetUiCompositionState, h, s);
+    FORWARDH(xefgSwapChainSetUiCompositionState, h, s);
     Log("SetUiCompositionState %d -> %d", static_cast<int>(s), r);
     return r;
 }
@@ -1347,7 +1449,7 @@ xefg_swapchain_result_t xefgSwapChainEnableDebugFeature(xefg_swapchain_handle_t 
             o->dbgOnly = e != 0;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;       // PRESENT_FAILED_INTERPOLATION: nothing fails here
     }
-    FORWARD(xefgSwapChainEnableDebugFeature, h, f, e, arg);
+    FORWARDH(xefgSwapChainEnableDebugFeature, h, f, e, arg);
     Log("EnableDebugFeature %d enable=%u -> %d", static_cast<int>(f), e, r);
     return r;
 }
@@ -1409,6 +1511,58 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         const std::string reason = std::string("dlssg unavailable: ") + dg.Caps().reason;
         SetStatus(3, reason);
         Log("f5low: generator dlssg not available (%s) - frame generation is off (no fallback to own)", dg.Caps().reason);
+        return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
+    }
+    // Generator=intel (generators/intel.h): Intel's libxess_fg (the one the own generator reads), unlocked in memory, presenting into our sink in
+    // spaced mode. NO fallback to the own generator (same rule as dlssg): when the library cannot start, frame generation is off with
+    // the reason in f5lowGetStatus (3) and an error from CreateContext.
+    if (!route.forward && d && ph && GeneratorRaw() == "intel")
+    {
+        xintel::g_log = XLog;
+        xsink::g_stats = xsink::EnvSet("F5LOW_SINK_STATS");     // tests: the sink's statistics into the log
+        xsink::g_log = XLog;
+        xefgown::IntelGenerator ig;
+        std::string why;
+        std::shared_ptr<xintel::Ctx> c;
+        const char* srcFrom = "";
+        const std::wstring srcPath = RealLibraryPath(&srcFrom);     // exactly where the own generator reads libxess_fg from
+        if (xintel::Lib* lib = xintel::Get(srcPath, srcFrom, g_self, g_real, g_realFirstLoad.load(), g_realContext.load(), why))
+        {
+            Log("intel: %s", lib->how.c_str());
+            Log("intel: %s", lib->unlockNote.c_str());
+            auto create = reinterpret_cast<decltype(&xefgSwapChainD3D12CreateContext)>(GetProcAddress(lib->fg, "xefgSwapChainD3D12CreateContext"));
+            auto props = reinterpret_cast<decltype(&xefgSwapChainGetProperties)>(GetProcAddress(lib->fg, "xefgSwapChainGetProperties"));
+            xefg_swapchain_handle_t nh = nullptr;
+            xefg_swapchain_result_t cr = XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;
+            if (!create || !props)
+                why = "the libxess_fg lacks the XeFG API";
+            else if ((cr = create(d, &nh)) != XEFG_SWAPCHAIN_RESULT_SUCCESS || !nh)
+                why = "the library's CreateContext failed (" + std::to_string(static_cast<int>(cr)) + ")";
+            else
+            {
+                c = std::make_shared<xintel::Ctx>();
+                c->lib = lib;
+                c->h = nh;
+                xefg_swapchain_properties_t pr {};
+                if (props(nh, &pr) == XEFG_SWAPCHAIN_RESULT_SUCCESS && pr.maxSupportedInterpolations)
+                    c->maxGen = pr.maxSupportedInterpolations;
+                ig.SetMax(c->maxGen);
+                std::lock_guard<std::mutex> lk(xintel::g_ctxMu);
+                xintel::g_ctx[nh] = c;
+            }
+        }
+        if (c)
+        {
+            *ph = c->h;
+            SetStatus(1, "intel generator (XeFG from libxess_fg, up to " + std::to_string(c->maxGen) + " generated; " + c->lib->unlockNote + "), D3D12");
+            Log("f5low: generator intel (%s)", ig.Caps().name);
+            Log("D3D12CreateContext device=%p -> Generator=intel: h=%p, the library makes up to %u generated frames, the sink paces its burst (spaced)",
+                static_cast<void*>(d), static_cast<void*>(*ph), c->maxGen);
+            return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+        }
+        ig.Fail(why);
+        SetStatus(3, "intel unavailable: " + why);
+        Log("f5low: generator intel not available (%s) - frame generation is off (no fallback to own)", why.c_str());
         return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
     }
     std::string pack = route.forward ? std::string() : route.dir;
@@ -1563,6 +1717,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     else if (d && ph)
         SetStatus(2, fwdText);
     FORWARD(xefgSwapChainD3D12CreateContext, d, ph);
+    if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS && ph && *ph)
+        g_realContext = true;
     if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS && d && ph && Real("xefgSwapChainD3D12CreateContext"))
         SetStatus(3, "Intel XeFG CreateContext failed (" + std::to_string(static_cast<int>(r)) + ") after hand-over: " + fwdText);
     Log("D3D12CreateContext device=%p -> %d h=%p", static_cast<void*>(d), r, ph ? static_cast<void*>(*ph) : nullptr);
@@ -1581,7 +1737,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12BuildPipelines(xefg_swapchain_handle_t
         Log("D3D12BuildPipelines flags=0x%x -> %s", flags, ok ? "built" : "FAILED");
         return ok ? XEFG_SWAPCHAIN_RESULT_SUCCESS : XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
     }
-    FORWARD(xefgSwapChainD3D12BuildPipelines, h, lib, blocking, flags);
+    FORWARDH(xefgSwapChainD3D12BuildPipelines, h, lib, blocking, flags);
     Log("D3D12BuildPipelines lib=%p blocking=%u flags=0x%x -> %d", static_cast<void*>(lib), blocking, flags, r);
     return r;
 }
@@ -1605,7 +1761,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12GetProperties(xefg_swapchain_handle_t 
         p->maxSupportedInterpolations = xefgown::kMaxInterp;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainD3D12GetProperties, h, ip, w, ht, f, p);
+    FORWARDH(xefgSwapChainD3D12GetProperties, h, ip, w, ht, f, p);
     Log("D3D12GetProperties %ux%u fmt=%d -> %d descriptors=%u bufHeap=%llu texHeap=%llu maxInterp=%u", w, ht, static_cast<int>(f), r,
         p ? p->requiredDescriptorCount : 0, p ? p->tempBufferHeapSize : 0, p ? p->tempTextureHeapSize : 0,
         p ? p->maxSupportedInterpolations : 0);
@@ -1647,8 +1803,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChain(xefg_swapchain_handl
         Log("D3D12InitFromSwapChain queue=%p flags=0x%x (own)", static_cast<void*>(q), ip->initFlags);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainD3D12InitFromSwapChain, h, q, ip);
-    Log("D3D12InitFromSwapChain queue=%p -> %d", static_cast<void*>(q), r);
+    FORWARDH(xefgSwapChainD3D12InitFromSwapChain, h, q, ip);
+    Log("D3D12InitFromSwapChain queue=%p -> %d%s", static_cast<void*>(q), r, xintel::Find(h) ? " (intel: the game's own chain, no sink - the library paces itself)" : "");
     LogInitParams("params", ip);
     return r;
 }
@@ -1659,6 +1815,52 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
 {
     if (auto c = FindDlssg(h))
         return c->InitFromDesc(wnd, d, fs, q, fac, ip);
+    if (auto ic = xintel::Find(h))
+    {
+        // The library creates its swap chain through OUR factory (the sink, spaced mode): its presents land in the sink
+        IDXGIFactory4* f4 = nullptr;
+        if (!d || !q || !fac || !ip || FAILED(fac->QueryInterface(IID_PPV_ARGS(&f4))))
+            return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+        auto* sf = new xsink::SinkFactory(f4, false);
+        f4->Release();
+        {
+            const xsink::PaceCfg pc = SinkPaceCfg();
+            ic->schedule = pc.mode != xsink::PaceMode::Burst;       // the game's Presents are stamped unless the burst spacing is forced
+            sf->SetPace(pc);
+        }
+        IDXGIFactory2* sf2 = nullptr;
+        if (FAILED(sf->QueryInterface(IID_PPV_ARGS(&sf2))))
+        {
+            sf->Release();
+            return XEFG_SWAPCHAIN_RESULT_ERROR_UNKNOWN;
+        }
+        FORWARDH(xefgSwapChainD3D12InitFromSwapChainDesc, h, wnd, d, fs, q, sf2, ip);
+        sf2->Release();
+        Log("D3D12InitFromSwapChainDesc %ux%u fmt=%d buffers=%u effect=%d flags=0x%x queue=%p -> %d (intel, through the sink%s)", d->Width, d->Height,
+            static_cast<int>(d->Format), d->BufferCount, static_cast<int>(d->SwapEffect), d->Flags, static_cast<void*>(q), r, sf->HasSink() ? "" : ": NOT on the sink");
+        LogInitParams("params", ip);
+        if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS)
+        {
+            sf->Release();
+            return r;
+        }
+        std::lock_guard<std::mutex> lk(ic->mu);
+        // a re-init: the chain the game holds wraps the OLD Intel chain; it is dropped here and made anew at GetSwapChainPtr
+        if (ic->stampChain)
+        {
+            ic->stampChain->Release();
+            ic->stampChain = nullptr;
+        }
+        xsink::SinkFactory* old = ic->sinkFac;
+        ic->sinkFac = sf;
+        ic->stampTarget = sf;           // the new target first, then the old factory goes
+        if (old)
+            old->Release();
+        ic->ApplyBurst();
+        Log("intel: sink pacing %s", !ic->schedule ? "burst (forced: the sink's measured burst interval)"
+                                      : "auto (the game's Presents are stamped; own D3D12 schedule + PaceLead where it is not worse than the burst spacing) or forced schedule");
+        return r;
+    }
     if (auto o = FindOwn(h))
     {
         if (!q || !d || !fac || !ip)
@@ -1704,7 +1906,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
             static_cast<int>(d->Format), d->BufferCount, static_cast<int>(d->SwapEffect), d->Flags, static_cast<void*>(q), ip->initFlags);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainD3D12InitFromSwapChainDesc, h, wnd, d, fs, q, fac, ip);
+    FORWARDH(xefgSwapChainD3D12InitFromSwapChainDesc, h, wnd, d, fs, q, fac, ip);
     if (d)
         Log("D3D12InitFromSwapChainDesc %ux%u fmt=%d buffers=%u effect=%d flags=0x%x windowed=%d queue=%p -> %d", d->Width, d->Height,
             static_cast<int>(d->Format), d->BufferCount, static_cast<int>(d->SwapEffect), d->Flags, fs ? fs->Windowed : -1,
@@ -1730,7 +1932,25 @@ xefg_swapchain_result_t xefgSwapChainD3D12GetSwapChainPtr(xefg_swapchain_handle_
             return XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;
         return SUCCEEDED(p->QueryInterface(riid, pp)) ? XEFG_SWAPCHAIN_RESULT_SUCCESS : XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
     }
-    FORWARD(xefgSwapChainD3D12GetSwapChainPtr, h, riid, pp);
+    if (auto ic = xintel::Find(h); ic && ic->schedule && pp)
+    {
+        // Schedule mode: the game gets a thin wrapper over Intel's chain that stamps its Presents (xintel::StampChain)
+        std::lock_guard<std::mutex> lk(ic->mu);
+        if (!ic->stampChain)
+        {
+            IDXGISwapChain4* sc4 = nullptr;
+            FORWARDH(xefgSwapChainD3D12GetSwapChainPtr, h, IID_PPV_ARGS(&sc4));
+            if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS || !sc4)
+            {
+                if (sc4)
+                    sc4->Release();
+                return r != XEFG_SWAPCHAIN_RESULT_SUCCESS ? r : XEFG_SWAPCHAIN_RESULT_ERROR_UNINITIALIZED;
+            }
+            ic->stampChain = new xintel::StampChain(sc4, ic);       // owns the reference
+        }
+        return SUCCEEDED(ic->stampChain->QueryInterface(riid, pp)) ? XEFG_SWAPCHAIN_RESULT_SUCCESS : XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    FORWARDH(xefgSwapChainD3D12GetSwapChainPtr, h, riid, pp);
     Log("D3D12GetSwapChainPtr -> %d sc=%p", r, pp ? *pp : nullptr);
     return r;
 }
@@ -1757,7 +1977,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12TagFrameResource(xefg_swapchain_handle
         }
         return o->Tag(cl, *rd);
     }
-    FORWARD(xefgSwapChainD3D12TagFrameResource, h, cl, id, rd);
+    FORWARDH(xefgSwapChainD3D12TagFrameResource, h, cl, id, rd);
     if (rd)
     {
         D3D12_RESOURCE_DESC desc {};
@@ -1777,7 +1997,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12SetDescriptorHeap(xefg_swapchain_handl
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
-    FORWARD(xefgSwapChainD3D12SetDescriptorHeap, h, heap, off);
+    FORWARDH(xefgSwapChainD3D12SetDescriptorHeap, h, heap, off);
     Log("D3D12SetDescriptorHeap heap=%p offset=%u -> %d", static_cast<void*>(heap), off, r);
     return r;
 }
@@ -1789,7 +2009,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12UpdateExternalHeapOnResize(xefg_swapch
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     if (FindOwn(h))
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
-    FORWARD(xefgSwapChainD3D12UpdateExternalHeapOnResize, h, bh, bo, th, to);
+    FORWARDH(xefgSwapChainD3D12UpdateExternalHeapOnResize, h, bh, bo, th, to);
     Log("D3D12UpdateExternalHeapOnResize -> %d", r);
     return r;
 }
@@ -1811,7 +2031,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12GetInitializationParameters(xefg_swapc
         *p = o->initParams;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    FORWARD(xefgSwapChainD3D12GetInitializationParameters, h, p);
+    FORWARDH(xefgSwapChainD3D12GetInitializationParameters, h, p);
     Log("D3D12GetInitializationParameters -> %d", r);
     LogInitParams("params", p);
     return r;

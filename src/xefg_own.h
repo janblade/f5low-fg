@@ -43,6 +43,7 @@
 #include "generators/own.h"
 #include "generators/stubs.h"
 #include "pace_lead.h"
+#include "pace_sched.h"
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
 
@@ -1718,7 +1719,7 @@ private:
     // milliseconds, which taken as they are put the jitter into the gap between an app frame and the next generated one.
     long long PaceTarget(uint32_t k, uint32_t n) const
     {
-        const double step = readyInterval / static_cast<double>(n + 1) * freq() / 1000.0;
+        const double step = ri.ms / static_cast<double>(n + 1) * freq() / 1000.0;
         return Bound(schedBase + static_cast<long long>(k * step), static_cast<long long>(step));
     }
     // target: worked out by the caller beforehand (Show, before Early moves the timeline on), else here. Returns how
@@ -1728,7 +1729,7 @@ private:
         if (n > 0 && !target)
             target = PaceTarget(k, n);
         const bool paced = n > 0 && !DisplayPaced(j);
-        const long long lead = k > 1 && Metered(j) ? FlipLead(static_cast<long long>(readyInterval / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
+        const long long lead = k > 1 && Metered(j) ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
         const long long t0 = Now(), before = lastAnyPresent;
         if (paced)
             WaitUntil(target - lead);
@@ -1776,7 +1777,7 @@ private:
             ++statGaps;
         }
         // Diagnostics: a gap of more than three steps between presents, with what it was made of (Hitch).
-        const double stepMs = readyInterval / static_cast<double>(n + 1);
+        const double stepMs = ri.ms / static_cast<double>(n + 1);
         if (sync == 0 && n > 0 && before && static_cast<double>(t - before) * 1000.0 / freq() > 3 * stepMs)
         {
             if (t - hitchSecond > static_cast<long long>(freq()))
@@ -1805,12 +1806,12 @@ private:
                      ms(f->ready, t));
         // the last app frames' ready-to-ready times, oldest first (for replaying the game's pace: xefg_host --stallat)
         char hist[8 * 8 + 1] = "";
-        for (size_t i = 0, o = 0; i < readyHist.size() && o < sizeof(hist); ++i)
-            o += snprintf(hist + o, sizeof(hist) - o, i ? " %.1f" : "%.1f", readyHist[(readyHistAt + i) % readyHist.size()]);
+        for (size_t i = 0, o = 0; i < ri.hist.size() && o < sizeof(hist); ++i)
+            o += snprintf(hist + o, sizeof(hist) - o, i ? " %.1f" : "%.1f", ri.hist[(ri.at + i) % ri.hist.size()]);
         XLog("hitch: %.1f ms since the last present (step %.2f), k %u/%u: reached its present %.2f after it, target %+.2f after it, "
              "slept %.2f, GPU wait %.2f (%.2f late), swap chain wait %.2f, Present %.2f; %s; interval %.2f (last frames %s)",
              ms(before, t), stepMs, k, n + 1, ms(before, t0), ms(before, target), ms(t0, tg), gpuWaitMs, std::max(0.0, ms(target, tw0)),
-             ms(tw0, tw1), ms(tw1, t), what, readyInterval, hist);
+             ms(tw0, tw1), ms(tw1, t), what, ri.ms, hist);
     }
 
     // One application frame on the presenter thread. Its inputs may have been taken already (Early), while the
@@ -1934,9 +1935,8 @@ private:
         lastReady = ready;
         jobBase = ready;
         // The schedule's clock (PaceTarget); set anew when it is more than an interval off (a pause, the first frame).
-        const long long iv = static_cast<long long>(readyInterval * freq() / 1000.0);
-        const long long want = ready + static_cast<long long>(paceLag * freq() / 1000.0), due = schedBase + iv;
-        schedBase = !schedBase || std::abs(want - due) > iv ? want : due + (want - due) / 5;
+        const long long iv = static_cast<long long>(ri.ms * freq() / 1000.0);
+        schedBase = pacesched::NextBase(schedBase, ready, static_cast<long long>(paceLag * freq() / 1000.0), iv);
         // Where the presenter stands: how old the frame's ready stamp is, and how many app frames came after it.
         statStampAge += static_cast<double>(Now() - ready) * 1000.0 / freq();
         statBehind += static_cast<double>(submitted.load() - j.frame - 1);
@@ -1999,7 +1999,7 @@ private:
         f.ready = jobBase;
         f.pickT = pickT;
         f.catchUp = catchUp;
-        f.step = static_cast<long long>(readyInterval / static_cast<double>(f.nGen + 1) * freq() / 1000.0);
+        f.step = static_cast<long long>(ri.ms / static_cast<double>(f.nGen + 1) * freq() / 1000.0);
         // GenSpread on the CUDA path (PresentGenGated has the why): pass k > 1 waits on the stream until the present spread
         // places before it is released; this frame's presents come after those of the frame being shown (gateFrameEnd: a
         // frame taken early is submitted in the middle of the last one's presents).
@@ -2041,7 +2041,7 @@ private:
         if (!on)
             return;
         std::lock_guard<std::mutex> l(clkMu);
-        const double batch = clkBatch > 0 ? std::max(clkBatch - 0.1 * std::sqrt(clkVar), 0.9 * clkBatch) : readyInterval;
+        const double batch = clkBatch > 0 ? std::max(clkBatch - 0.1 * std::sqrt(clkVar), 0.9 * clkBatch) : ri.ms;
         f.cstep = static_cast<long long>(batch * (1.0 - clkCorr) / static_cast<double>(f.nGen + 1) * freq() / 1000.0);
     }
 
@@ -2054,7 +2054,7 @@ private:
     // after a stutter has its schedule set from that late frame, and it waited lag + a step more with its picture ready.
     long long Bound(long long target, long long step) const
     {
-        return lastAnyPresent ? std::clamp(target, lastAnyPresent + step / 2, lastAnyPresent + 2 * step) : target;
+        return pacesched::Bound(target, step, lastAnyPresent);
     }
 
     // ---- display pacing and flip metering --------------------------------------------------------------
@@ -2225,27 +2225,7 @@ private:
     // couple of quick catch-up frames, and taking those as its pace made every batch after it short (NBA run V). Three in a
     // row under 1/1.3 of it (a real return to a faster pace, e.g. after a two-frame stall raised it) lower it at once, to the
     // longest of the three; catch-up bursts are one or two frames.
-    void ObserveReady(double ms)
-    {
-        if (!(ms > 0.5 && ms < 200))
-        {
-            prevReadyMs = 0;
-            readyRun = 0;               // the history stays for the hitch log; the down rule needs three new samples
-            return;
-        }
-        ++readyRun;
-        readyHist[readyHistAt] = ms;
-        readyHistAt = (readyHistAt + 1) % readyHist.size();
-        const size_t n = readyHist.size();
-        const double a = readyHist[(readyHistAt + n - 1) % n], b = readyHist[(readyHistAt + n - 2) % n], c = readyHist[(readyHistAt + n - 3) % n];
-        if (prevReadyMs > 1.3 * readyInterval && ms > 1.3 * readyInterval)
-            readyInterval = std::min(ms, prevReadyMs);
-        else if (readyRun >= 3 && std::max({ a, b, c }) * 1.3 < readyInterval)
-            readyInterval = std::max({ a, b, c });
-        else
-            readyInterval = readyInterval * 0.9 + ms * 0.1;
-        prevReadyMs = ms;
-    }
+    void ObserveReady(double ms) { ri.Observe(ms); }
 
     // The app frame's time on the GPU timeline (Pick): smoothed (1/8), a delta over 1.5x left out at most twice in a
     // row (one game stutter must not stretch the spacing for the frames after it), none outside 1-250 ms (set anew).
@@ -2280,7 +2260,7 @@ private:
     long long ClockTarget(const Frame& f, uint32_t k) const
     {
         const double q = freq() / 1000.0;
-        const long long now = Now(), batch = static_cast<long long>((clkBatch > 0 ? clkBatch : readyInterval) * q);
+        const long long now = Now(), batch = static_cast<long long>((clkBatch > 0 ? clkBatch : ri.ms) * q);
         const long long slot = f.ready + static_cast<long long>(k - 1) * f.cstep;
         const long long soonest = slot + static_cast<long long>(std::max(0.0, clkTarget - ClockMargin(f.cstep)) * q);
         const long long latest = slot + static_cast<long long>(maxDelay * static_cast<double>(batch));
@@ -2295,7 +2275,7 @@ private:
     void ClockAfter(const Frame& f, long long firstRelease)
     {
         const double q = freq() / 1000.0;
-        const double batch = clkBatch > 0 ? clkBatch : readyInterval, limit = maxDelay * batch;
+        const double batch = clkBatch > 0 ? clkBatch : ri.ms, limit = maxDelay * batch;
         double need = -1;
         for (uint32_t k = 1; k <= (f.spread ? 1 : f.nGen) && !f.j.cut; ++k)
         {
@@ -2395,7 +2375,7 @@ private:
                     leadState.Late(late);
                 }
                 if (!D3d() && late > 0.5)   // not a hair's breadth, which undid the fall below every frame
-                    paceLag = std::min(std::max(paceLag, f.lag + late), readyInterval * maxLag);
+                    paceLag = std::min(std::max(paceLag, f.lag + late), ri.ms * maxLag);
             }
             if (++genCount == 1 || genCount % 600 == 0)
                 XLog("present: %u frames generated", genCount);
@@ -3366,8 +3346,8 @@ private:
         XLog("stats: app interval %.2f ms (%.1f fps), on the GPU %.2f ms, sync %u, %u generated per frame; app's Present %.3f ms (of it "
              "waiting for the presenter %.3f); presents every %.2f ms (sd %.2f, max %.2f; target %.2f), waited for our GPU work %.2f ms "
              "per present, %u frames started behind, %u taken early, schedule lag %.1f ms, %u CUDA handoff failures (avg of 120)",
-             iv, 1000.0 / iv, readyInterval, j.sync, nGen, statAppCall / 120, statAppWait / 120, statGaps ? statGap / statGaps : 0.0, sd,
-             statGapMax, readyInterval / (nGen + 1), statGaps ? statGpuWait / statGaps : 0.0, statLate, statEarly, paceLag, pg->TakeHandoffFails());
+             iv, 1000.0 / iv, ri.ms, j.sync, nGen, statAppCall / 120, statAppWait / 120, statGaps ? statGap / statGaps : 0.0, sd,
+             statGapMax, ri.ms / (nGen + 1), statGaps ? statGpuWait / statGaps : 0.0, statLate, statEarly, paceLag, pg->TakeHandoffFails());
         XLog("stats: ready stamp %.1f ms old when the presenter took the frame, presenter %.2f app frames behind, first generated "
              "frame %.1f ms after its target; from the app's Present call: taken %.1f ms, ready stamp %.1f ms (avg of 120)",
              statJobs ? statStampAge / statJobs : 0.0, statJobs ? statBehind / statJobs : 0.0, statFirstN ? statFirstLate / statFirstN : 0.0,
@@ -4191,11 +4171,7 @@ private:
     double allocWaitMs = 0;
     // Presenter, GPU timeline: when the app's frame was done on the GPU (QPC), and the smoothed interval between those.
     long long lastReady = 0, pickT = 0;  // pickT: when the presenter took the current app frame (trace)
-    double readyInterval = 16.7;
-    double prevReadyMs = 0;                 // the last app frame's ready-to-ready time (ObserveReady)
-    std::array<double, 8> readyHist {};     // the last 8 of them, for the hitch log
-    size_t readyHistAt = 0;
-    uint64_t readyRun = 0;                  // samples in range since the last one out of range
+    pacesched::ReadyInterval ri;            // the smoothed interval between those (ri.ms), its history for the hitch log (pace_sched.h)
     double paceLag = 0;                 // presenter: ms the schedule runs behind the GPU timeline (PaceTarget)
     // The clock pacer (ClockTarget), presenter thread. clkBatch / clkVar: the app frame's time on the GPU timeline and its
     // variance, ms; clkTarget: the delay behind the app frame's ready stamp the clock aims for, ms (clkNeed: the last 64
@@ -4207,7 +4183,7 @@ private:
     unsigned clkNeedN = 0, clkNeedAt = 0;
     double statClkDelay = 0, statClkNeed = 0;
     unsigned statClkN = 0, statClkSlips = 0, statClkHitches = 0;
-    // Gate=1: the clock above is shared with the release thread (clkMu: clkBatch, clkVar, readyInterval, clkCorr, clkTarget,
+    // Gate=1: the clock above is shared with the release thread (clkMu: clkBatch, clkVar, ri.ms, clkCorr, clkTarget,
     // clkLast and the clock's stats).
     std::mutex clkMu;
     // PaceLead (Frame::lead; pace_lead.h): the rule's state (presenter thread), and the lead's range, the app frames that used it

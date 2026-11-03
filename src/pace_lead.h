@@ -15,10 +15,11 @@ constexpr double kMaxRise = 2.0;                // ms of late that count: a late
 constexpr double kMargin = 1.0;                 // (the game's own jitter is in `late` too: jitter2 2x swung the lead 3 -> 8.2 ms of an 8.3 ms step)
 constexpr size_t kWindow = 128;                 // app frames a late frame holds the lead up for
 
-// Frame k's offset from the schedule's base (ticks): lead 0 (off): k steps; else the lead (at most a step) + (k - 1) steps.
-inline long long Offset(long long lead, long long step, uint32_t k)
+// Frame k's offset from the schedule's base (ticks): lead 0 (off): k steps; else the lead (at most a step, or `cap` when given: the
+// sink of a library whose first frame needs longer than a step, sink/sink.h) + (k - 1) steps.
+inline long long Offset(long long lead, long long step, uint32_t k, long long cap = 0)
 {
-    return (lead > 0 ? std::min(step, lead) : step) + static_cast<long long>(k - 1) * step;
+    return (lead > 0 ? std::min(cap > 0 ? cap : step, lead) : step) + static_cast<long long>(k - 1) * step;
 }
 
 struct Lead

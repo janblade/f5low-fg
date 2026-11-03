@@ -1,6 +1,6 @@
 """Pacer A/B analysis (tests/pacer_ab.ps1 runs the harness, this reads what it left).
 
-  python -I tests/pacer_stats.py run <rundir> --gen own|dlssg --mult N [--skip 60] [--meta key=value ...]
+  python -I tests/pacer_stats.py run <rundir> --gen own|dlssg|intel --mult N [--skip 60] [--meta key=value ...]
       one JSON line on stdout: gap and latency numbers of one run.  <rundir> holds
         f5low.log        the DLL's log (own generator: "pace:" lines from PaceLog=1; dlssg: "sink: pace t=" lines and the
                          sink's gaps / probe lines, with F5LOW_SINK_STATS=1 and XEFG_CUDA_PACELOG=1)
@@ -13,7 +13,7 @@ Own generator, from the "pace:" records (t = the present's time, QPC ms; ready =
   gaps      = time between consecutive presents, app frames after --skip, three last left out
   lat_last  = per app frame: time its LAST present (the app's own frame) went out - its ready stamp
   lat_first = per app frame: time its FIRST presented generated frame went out - its ready stamp
-dlssg: the sink lists only present times. Gaps are exact; latency is approximate - presents are grouped in bursts of `mult` and
+dlssg and intel (both present into the sink): the sink lists only present times. Gaps are exact; latency is approximate - presents are grouped in bursts of `mult` and
   matched to the app frames' Present calls (REPRO_PACELOG), the shift chosen so no latency is negative and the mean is smallest,
   and counted from the app's Present CALL, not the ready stamp (a few ms more than the own generator's numbers).
 """
@@ -52,6 +52,8 @@ SINK_PACE = re.compile(r"sink: pace t=([\d.]+)")
 APP = re.compile(r"^app: frame=(\d+) t=([\d.]+) ret=([\d.]+)", re.M)
 SINK_GAPS = re.compile(r"sink: gaps between the real chain's Present calls: (\d+) gaps\s+mean ([\d.]+)\s+ms\s+sd ([\d.]+)\s+p01 ([\d.]+)\s+p50 ([\d.]+)\s+p99 ([\d.]+)\s+max ([\d.]+)")
 SINK_PROBE = re.compile(r"sink probe: .*")
+SINK_SCHED = re.compile(r"sink: schedule: (\d+) app Presents stamped, (\d+) batches \((\d+) without a stamp\), lead ([\d.]+)\.\.([\d.]+) ms, (\d+) late generated frames of (\d+)")
+PROBE_STEP = re.compile(r"(-?\d+): (\d+)")
 
 
 def own_metrics(text, skip):
@@ -93,6 +95,15 @@ def dlssg_metrics(text, app_text, mult, skip):
         out["sink_gaps"] = {"n": int(g[1]), "mean": float(g[2]), "sd": float(g[3]), "p99": float(g[6]), "max": float(g[7])}
     probe = SINK_PROBE.search(text)
     out["probe"] = probe.group(0)[len("sink probe: "):] if probe else ""
+    if probe and "(px: count):" in probe.group(0):
+        # REPRO_BAR moves the bar 12 px per app frame: with `mult` frames shown per app frame each step is 12 / mult px
+        steps = {int(k): int(v) for k, v in PROBE_STEP.findall(probe.group(0).split("(px: count):")[1].split("(steps")[0])}
+        out["probe_exact"] = steps.get(12 // mult, 0)
+        out["probe_total"] = sum(steps.values())
+    sched = SINK_SCHED.search(text)
+    if sched:
+        out["late_pct"] = 100.0 * int(sched[6]) / max(1, int(sched[7]))     # generated frames whose staging copy ran past their time
+        out["lead_ms"] = f"{sched[4]}..{sched[5]}"
     apps = [(int(m[1]), float(m[2])) for m in APP.finditer(app_text)]
     if not times:
         out["notes"] = "no 'sink: pace' lines (F5LOW_SINK_STATS=1, XEFG_CUDA_PACELOG=1; did Generator=dlssg run?)"
@@ -175,8 +186,8 @@ def cmd_run(argv):
 
 
 COLS = ["gen", "scenario", "mult", "config", "exit", "gap_n", "gap_mean", "gap_sd", "gap_p99", "gap_max", "hitch2x", "lat_last_mean",
-        "lat_last_p99", "lat_first_mean", "lat_first_p99", "late_pct", "pm_n", "pm_mean", "pm_sd", "pm_p99", "pm_max",
-        "pm_shown_pct", "probe", "notes"]
+        "lat_last_p99", "lat_first_mean", "lat_first_p99", "late_pct", "lead_ms", "pm_n", "pm_mean", "pm_sd", "pm_p99", "pm_max",
+        "pm_shown_pct", "probe_exact", "probe_total", "probe", "notes"]
 
 
 def f(v, n=2):

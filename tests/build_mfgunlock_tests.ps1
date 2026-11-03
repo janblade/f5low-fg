@@ -19,12 +19,13 @@ cl /nologo /std:c++20 /EHsc /W4 /wd4701 /O2 /MT /DNDEBUG /Fe:mfgunlock_check.exe
 cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /Fe:mfgunlock_fatbin_refs.exe "$root\tests\mfgunlock_fatbin_refs.cpp" >> _build_mfg.log 2>&1
 cl /nologo /std:c++20 /EHsc /W4 /wd4701 /O2 /MT /DNDEBUG /Fe:mfgunlock_turing_probe.exe "$root\tests\mfgunlock_turing_probe.cpp" hde64.obj >> _build_mfg.log 2>&1
 cl /nologo /std:c++20 /EHsc /W4 /wd4701 /O2 /MT /DNDEBUG /Fe:unlock_hook_probe.exe "$root\tests\unlock_hook_probe.cpp" hde64.obj >> _build_mfg.log 2>&1
+cl /nologo /std:c++20 /EHsc /W4 /wd4701 /O2 /MT /DNDEBUG /Fe:xefg_unlock_test.exe "$root\tests\xefg_unlock_test.cpp" hde64.obj >> _build_mfg.log 2>&1
 "@
 Set-Content -Path (Join-Path $out '_build_mfg.bat') -Value $cmd -Encoding ascii
-foreach ($e in 'mfgunlock_core_smoke', 'mfgunlock_check', 'mfgunlock_fatbin_refs', 'mfgunlock_turing_probe', 'unlock_hook_probe') { Remove-Item (Join-Path $out "$e.exe") -ErrorAction SilentlyContinue }
+foreach ($e in 'mfgunlock_core_smoke', 'mfgunlock_check', 'mfgunlock_fatbin_refs', 'mfgunlock_turing_probe', 'unlock_hook_probe', 'xefg_unlock_test') { Remove-Item (Join-Path $out "$e.exe") -ErrorAction SilentlyContinue }
 cmd /c (Join-Path $out '_build_mfg.bat')
 Get-Content (Join-Path $out '_build_mfg.log') | Select-String -Pattern 'error|warning' | ForEach-Object { $_.Line }
 Remove-Item (Join-Path $out '_build_mfg.bat'), (Join-Path $out '_build_mfg.log'), (Join-Path $out 'hde64.obj'), (Join-Path $out 'mfgunlock_*.obj') -ErrorAction SilentlyContinue
-foreach ($e in 'mfgunlock_core_smoke', 'mfgunlock_check', 'mfgunlock_fatbin_refs', 'mfgunlock_turing_probe', 'unlock_hook_probe') {
+foreach ($e in 'mfgunlock_core_smoke', 'mfgunlock_check', 'mfgunlock_fatbin_refs', 'mfgunlock_turing_probe', 'unlock_hook_probe', 'xefg_unlock_test') {
     if (Test-Path (Join-Path $out "$e.exe")) { Write-Host "built build\$e.exe" } else { throw "$e build failed" }
 }
