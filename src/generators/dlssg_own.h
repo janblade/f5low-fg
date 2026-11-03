@@ -40,7 +40,21 @@ inline bool IsNgxDlssgName(const std::wstring& path)
     return base.rfind(L"nvngx_dlssg", 0) == 0 && base.size() > 4 && base.compare(base.size() - 4, 4, L".dll") == 0;
 }
 
-// ownPath: our private nvngx_dlssg.dll; loaded: full paths of the loaded modules (anything not named nvngx_dlssg*.dll is ignored).
+// A driver-downloaded DLSS-G under ...\NGX\models\dlssg\ (any .dll/.bin; the same test as unlock/Provider.h IsDlssgPath). The Streamline
+// plugin OTA folder (models\sl_dlss_g_*) is not this.
+inline bool IsNgxModelsDlssgPath(const std::wstring& path)
+{
+    const std::wstring k = NgxPathKey(path);
+    if (k.find(L"\\models\\dlssg\\") == std::wstring::npos || k.size() < 4)
+        return false;
+    const std::wstring ext = k.substr(k.size() - 4);
+    return ext == L".dll" || ext == L".bin";
+}
+
+// Anything that could be a DLSS-G module other than ours
+inline bool IsNgxCandidate(const std::wstring& path) { return IsNgxDlssgName(path) || IsNgxModelsDlssgPath(path); }
+
+// ownPath: our private nvngx_dlssg.dll; loaded: full paths of the loaded modules (anything neither named nvngx_dlssg*.dll nor a file under models\dlssg\ is ignored).
 inline NgxVerdict JudgeNgx(const std::wstring& ownPath, const std::vector<std::wstring>& loaded)
 {
     NgxVerdict v;
@@ -48,7 +62,7 @@ inline NgxVerdict JudgeNgx(const std::wstring& ownPath, const std::vector<std::w
     std::vector<std::wstring> seen;
     for (const std::wstring& p : loaded)
     {
-        if (!IsNgxDlssgName(p))
+        if (!IsNgxCandidate(p))
             continue;
         const std::wstring k = NgxPathKey(p);
         bool dup = false;

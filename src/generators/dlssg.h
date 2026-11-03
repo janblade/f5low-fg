@@ -97,7 +97,6 @@ inline void SlLog(sl::LogType type, const char* msg)
 // Which nvngx_dlssg is in use (dlssg_own.h has the rule). Generator=dlssg runs DLSS-G on OUR copy: it is loaded by full path before slInit
 // on every tier, and after DLSS-G is up no other nvngx_dlssg* may be in the process (a game's own 310.6 under Streamline 2.11.1 got the
 // driver to run DLSS-G on it: GPU fault at level load in A Plague Tale: Resonance). F5LOW_DLSSG_ALLOW_FOREIGN=1 only logs.
-#pragma comment(lib, "version.lib")
 inline std::wstring ModulePathOf(HMODULE m)
 {
     std::wstring p(1024, L'\0');
@@ -121,19 +120,29 @@ inline std::vector<std::wstring> LoadedNgxModules()
     for (size_t i = 0; i < need / sizeof(HMODULE) && i < mods.size(); ++i)
     {
         const std::wstring p = ModulePathOf(mods[i]);
-        if (IsNgxDlssgName(p))
+        if (IsNgxCandidate(p))
             out.push_back(p);
     }
     return out;
 }
+// version.dll is loaded from System32 on first use, not imported (OptiScaler is sometimes the game's own version.dll proxy)
 inline std::string FileVersionOf(const std::wstring& path)
 {
+    using PSize = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+    using PInfo = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+    using PQuery = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+    static const HMODULE ver = LoadLibraryExW(L"version.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static const PSize getSize = ver ? reinterpret_cast<PSize>(GetProcAddress(ver, "GetFileVersionInfoSizeW")) : nullptr;
+    static const PInfo getInfo = ver ? reinterpret_cast<PInfo>(GetProcAddress(ver, "GetFileVersionInfoW")) : nullptr;
+    static const PQuery query = ver ? reinterpret_cast<PQuery>(GetProcAddress(ver, "VerQueryValueW")) : nullptr;
+    if (!getSize || !getInfo || !query)
+        return "version unknown";
     DWORD dummy = 0;
-    const DWORD sz = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    const DWORD sz = getSize(path.c_str(), &dummy);
     std::vector<char> buf(sz);
     VS_FIXEDFILEINFO* fi = nullptr;
     UINT len = 0;
-    if (!sz || !GetFileVersionInfoW(path.c_str(), 0, sz, buf.data()) || !VerQueryValueW(buf.data(), L"\\", reinterpret_cast<LPVOID*>(&fi), &len) || !fi)
+    if (!sz || !getInfo(path.c_str(), 0, sz, buf.data()) || !query(buf.data(), L"\\", reinterpret_cast<LPVOID*>(&fi), &len) || !fi)
         return "version unknown";
     char v[64];
     snprintf(v, sizeof v, "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS), HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
@@ -142,16 +151,28 @@ inline std::string FileVersionOf(const std::wstring& path)
 inline std::string DescribeNgx(const std::wstring& path) { return Narrow(path) + ", " + FileVersionOf(path); }
 
 inline bool g_allowForeignNgx = false;
+inline void (*g_onRefused)(const std::string& why) = nullptr;      // late refusal -> f5lowGetStatus (set by xefg_cuda.cpp)
 // Our nvngx_dlssg.dll, by full path, before slInit (every tier; the unlock's own load of the same path then returns this handle). The
 // reference is kept for the life of the process. A different nvngx_dlssg already in the process is logged with both paths and versions.
 inline bool PreloadOwnNgx(const std::wstring& dir, std::wstring& ownPath, std::string& why)
 {
     ownPath = longpath::Plain(dir + L"\\nvngx_dlssg.dll");
     const NgxVerdict before = JudgeNgx(ownPath, LoadedNgxModules());
-    if (g_log)
-        for (const std::wstring& f : before.foreign)
-            g_log("dlssg: a different nvngx_dlssg.dll is already in the process before ours is loaded: %s (ours: %s)", DescribeNgx(f).c_str(),
-                  DescribeNgx(ownPath).c_str());
+    for (const std::wstring& f : before.foreign)
+    {
+        const std::string msg = "a different nvngx_dlssg.dll (" + DescribeNgx(f) + ") is loaded in the game: DLSS-G would run on it (before ours: " +
+                                DescribeNgx(ownPath) + ")";
+        if (g_allowForeignNgx)
+        {
+            if (g_log)
+                g_log("dlssg: %s - F5LOW_DLSSG_ALLOW_FOREIGN=1 (the player keeps the game's DLSS-G), continuing", msg.c_str());
+        }
+        else
+        {
+            why = msg;      // refused before slInit: Streamline is never started
+            return false;
+        }
+    }
     static HMODULE keep = nullptr;
     if (!keep)
         keep = LoadLibraryW(ownPath.c_str());
@@ -180,7 +201,7 @@ inline bool CheckOwnNgxInUse(const std::wstring& ownPath, std::string& why)
         if (g_allowForeignNgx)
         {
             if (g_log)
-                g_log("dlssg: %s - F5LOW_DLSSG_ALLOW_FOREIGN=1, continuing", msg.c_str());
+                g_log("dlssg: %s - F5LOW_DLSSG_ALLOW_FOREIGN=1 (the player keeps the game's DLSS-G), continuing", msg.c_str());
         }
         else if (why.empty())
             why = msg;
@@ -438,6 +459,8 @@ public:
     // DLSS-G would otherwise interpolate it from the last inputs. DLSS-G keeps its resources while off (eRetainResourcesWhenOff).
     bool inputsThisFrame = false;
     bool appliedOn = false;
+    bool ngxChecked1 = false, ngxChecked2 = false, ngxRefused = false;
+    unsigned onPresents = 0;
     unsigned untaggedLogs = 0;
     unsigned statFrames = 0;
     const sl::ViewportHandle vp { 0 };
@@ -452,8 +475,28 @@ public:
 
     // DLSS-G's options (on: enabled and this frame has inputs) and the sink's burst (from enabled / count). Called with mu held.
     void Apply() { Apply(enabled && inputsThisFrame); }
+    // Only our nvngx_dlssg may be in use. NGX may load its module late, so this runs when DLSS-G is first switched on and again a few
+    // presents after (BeforePresent). A foreign one: DLSS-G off for good, with the reason (log and f5lowGetStatus).
+    void NgxCheck()
+    {
+        std::string why;
+        if (ngxRefused || CheckOwnNgxInUse(sl->ownNgx, why))
+            return;
+        ngxRefused = true;
+        if (g_log)
+            g_log("dlssg: frame generation is off: %s", why.c_str());
+        if (g_onRefused)
+            g_onRefused(why);
+    }
     void Apply(bool on)
     {
+        if (on && !ngxChecked1)
+        {
+            ngxChecked1 = true;
+            NgxCheck();
+        }
+        if (ngxRefused)
+            on = false;
         const uint32_t n = std::max(1u, std::min(numInterp, maxGen));
         appliedOn = on;
         sl::DLSSGOptions o {};
@@ -725,6 +768,13 @@ inline uint32_t BeforePresent(Ctx& c)
               "through NVIDIA Reflex comes out divided by the multiplier twice (3x with a cap of 90: 30 shown). Use OptiScaler-NR "
               "0.1.36 or newer, or no cap; Generator=own / intel are not affected");
     std::lock_guard<std::mutex> lk(c.mu);
+    if (c.appliedOn && !c.ngxChecked2 && ++c.onPresents >= 3)
+    {
+        c.ngxChecked2 = true;
+        c.NgxCheck();
+        if (c.ngxRefused)
+            c.Apply(false);
+    }
     if (c.enabled && !c.inputsThisFrame && c.appliedOn)
         c.Apply(false);
     c.inputsThisFrame = false;

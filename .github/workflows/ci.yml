@@ -75,7 +75,7 @@ jobs:
       - name: DLSS-G own module test
         shell: pwsh
         run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installerswhere.exe" -latest -products * -property installationPath
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_dlssg_own_test.ps1 -VsPath $vs
 
       - name: Audit the DLL (only what we compile in)

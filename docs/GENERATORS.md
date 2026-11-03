@@ -149,7 +149,12 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     loads its copy by full path before `slInit` (a different nvngx_dlssg already in the process is logged with both paths and versions).
     After DLSS-G is up it checks that no other `nvngx_dlssg*` module is loaded and that a bare-name lookup resolves to ours; otherwise
     `dlssg` is refused like any other dlssg error (status 3, no fallback): `a different nvngx_dlssg.dll (<path>, <version>) is loaded in the
-    game: DLSS-G would run on it`. `F5LOW_DLSSG_ALLOW_FOREIGN=1` (environment only) turns the refusal into a log line. Rule:
+    game: DLSS-G would run on it`. A driver-downloaded copy under `NGX\models\dlssg\` counts as foreign too. The check also runs when DLSS-G is first switched on and
+    a few presents later (NGX may load its module late); a foreign copy found then switches DLSS-G off, with the reason in the log and
+    `f5lowGetStatus`. A foreign copy already in the process before ours loads is refused before `slInit`. `F5LOW_DLSSG_ALLOW_FOREIGN=1`
+    (environment only; OptiScaler sets it when the player keeps the game's DLSS-G) turns the refusal into a log line. OptiScaler only
+    allows the private copy under `<plugins>\f5low_streamline`, so a Streamline folder used as-is through `F5LOW_STREAMLINE_DIR` or
+    `DlssgPath` outside it gets blocked when OptiScaler's F5Low DLSS-G block is on. Rule:
     `src/generators/dlssg_own.h`, test `tests\dlssg_own_test.cpp`.
   - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G paces its own frames (it presents from a
     thread of its own, with the driver's flip metering) and the sink queues each present and shows it on the real chain, spacing a full

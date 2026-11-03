@@ -45,6 +45,16 @@ int main()
     CHECK(!v.Ok() && v.foreign.size() == 1);
     CHECK(IsNgxDlssgName(L"nvngx_dlssg.dll") && !IsNgxDlssgName(L"nvngx_dlssg.dll.off") && !IsNgxDlssgName(L"nvngx_dlss.dll"));
 
+    // a driver-downloaded DLSS-G under models\dlssg (dll or bin) is foreign; the Streamline OTA folder and other files are not
+    const std::wstring mdl = L"C:\\ProgramData\\NVIDIA\\NGX\\models\\dlssg\\versions\\310.9.0\\files\\160_E658703.bin";
+    v = JudgeNgx(own, { own, mdl });
+    CHECK(!v.Ok() && v.foreign.size() == 1 && v.foreign[0] == mdl);
+    v = JudgeNgx(own, { L"C:\\ProgramData\\NVIDIA\\NGX\\models\\DLSSG\\x\\nvngx_foo.dll" });
+    CHECK(!v.Ok());
+    v = JudgeNgx(own, { own, L"C:\\ProgramData\\NVIDIA\\NGX\\models\\sl_dlss_g_310_9\\sl.dlss_g.dll", L"C:\\ProgramData\\NVIDIA\\NGX\\models\\dlssg\\readme.txt" });
+    CHECK(v.OwnInUse());
+    CHECK(IsNgxModelsDlssgPath(mdl) && !IsNgxModelsDlssgPath(L"C:\\a\\models\\dlssgx\\a.dll"));
+
     if (g_fail)
         return 1;
     printf("dlssg_own_test: all passed\n");

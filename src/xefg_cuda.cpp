@@ -1167,6 +1167,9 @@ __declspec(dllexport) uint32_t xefgCudaXellCountsRenderedOnly()
     return g_dlssg.empty() ? 0u : 1u;
 }
 
+// A foreign nvngx_dlssg found after the context exists (dlssg.h Ctx::NgxCheck): frame generation is off, f5lowGetStatus says 3 with the reason
+static const bool g_ngxRefusedHook = (xdlssg::g_onRefused = [](const std::string& why) { SetStatus(3, "dlssg unavailable: " + why); }, true);
+
 // Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask once, when they load the library).
 // 1 while a Generator=dlssg context runs: the NVIDIA driver multiplies a Reflex interval on the device by DLSS-G's multiplier
 // itself (NBA 2K27: 33333 us read back as 99999 us at 3x), so the caller gives real Reflex the shown-frame cap undivided.
