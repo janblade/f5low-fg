@@ -158,7 +158,9 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     `src/generators/dlssg_own.h`, test `tests\dlssg_own_test.cpp`.
   - *Early load.* OptiScaler calls `uint32_t f5lowPrepareDlssg()` (cdecl export) right after loading f5low.dll when the generator is DLSS-G:
     it makes the private copy and loads our `nvngx_dlssg.dll` before the game's Streamline asks NGX (NGX marks DLSS-G unavailable
-    process-wide otherwise). File I/O and LoadLibrary only, safe under the loader lock; returns 1 when loaded, 0 (logged) otherwise.
+    process-wide otherwise). File I/O and LoadLibrary only, safe under the loader lock; returns 1 when loaded, 0 (logged) otherwise. The
+    module is NOT unlock-patched there (the RTX 20-40 tier needs the CUDA device behind the game's D3D12 device, known only at context
+    time), so on RTX 20-40 the game's own DLSS-G must stay off while F5Low DLSS-G is on.
   - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G paces its own frames (it presents from a
     thread of its own, with the driver's flip metering) and the sink queues each present and shows it on the real chain, spacing a full
     burst by the smoothed burst interval (`SetBurst(n + 1)` from the multiplier). Logged once per context: `dlssg: DLSS-G paces its own

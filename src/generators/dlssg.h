@@ -173,9 +173,13 @@ inline bool PreloadOwnNgx(const std::wstring& dir, std::wstring& ownPath, std::s
             return false;
         }
     }
-    static HMODULE keep = nullptr;
+    static std::atomic<HMODULE> keepAtomic { nullptr };     // one load whoever gets here first (prepare export and context creation)
+    HMODULE keep = keepAtomic.load();
     if (!keep)
-        keep = LoadLibraryW(ownPath.c_str());
+    {
+        keep = LoadLibraryW(ownPath.c_str());      // same path: the same handle for a racing second caller
+        keepAtomic.store(keep);
+    }
     if (!keep)
     {
         why = "cannot load " + Narrow(ownPath) + " (error " + std::to_string(GetLastError()) + ")";

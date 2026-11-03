@@ -1173,6 +1173,9 @@ __declspec(dllexport) uint32_t xefgCudaXellCountsRenderedOnly()
 // keeps the handle. No slInit, no D3D. May run under the loader lock: only file I/O and LoadLibrary here, no threads, no COM, no waits on
 // other threads. Idempotent, thread-safe. Returns 1 when our copy is loaded (or already was), 0 on failure (logged), also when a foreign
 // nvngx_dlssg is already in the process (unless F5LOW_DLSSG_ALLOW_FOREIGN=1). The context-time load reuses the same handle.
+// NOT patched here: the MFG unlock (RTX 20-40) needs the GPU tier, which comes from a CUDA device behind the game's D3D12 device (cuInit,
+// adapter match), not available this early or under the loader lock. It is applied at context time. So on RTX 20-40 the game's own
+// DLSS-G must stay off while F5Low DLSS-G is on: the game's Streamline could use this module before it is patched.
 extern "C" __declspec(dllexport) uint32_t __cdecl f5lowPrepareDlssg()
 {
     static std::mutex mu;
