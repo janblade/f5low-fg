@@ -64,5 +64,12 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_pace_lead_test.ps1 -VsPath $vs
 
+      # The schedule pieces shared by the own generator and the intel sink (src/pace_sched.h): no GPU
+      - name: Pace schedule test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_pace_sched_test.ps1 -VsPath $vs
+
       - name: Audit the DLL (only what we compile in)
         run: python tools/audit.py --dll build/f5low.dll

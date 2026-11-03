@@ -321,14 +321,12 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             batchValid = false;
             if (stampsSeen >= 6)
             {
-                while (stamps.size() > 2)
-                    stamps.pop_front();         // the burst is behind the game by more than a frame: follow the newest
+                // The newest application Present not later than this burst's first frame; older ones are dropped (an extra stamp must not
+                // shift the schedule by a frame for good). None: the arrival is the base.
                 LONGLONG s = arrived;
-                if (!stamps.empty())
-                {
-                    s = stamps.front();
-                    stamps.pop_front();
-                }
+                long long picked = 0;
+                if (pacesched::PickStamp(stamps, arrived, picked))
+                    s = picked;
                 else
                     ++g_schedNoStamp;
                 const LONGLONG iv = static_cast<LONGLONG>(ri.ms * Freq() / 1000.0);
@@ -341,6 +339,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 bCap = static_cast<LONGLONG>(bCapMs * Freq() / 1000.0);
                 bLeadMs = cfg.testLeadMs > 0 ? (std::min)(cfg.testLeadMs, 2.0 * ri.ms) : lead.Freeze(bCapMs);
                 bLead = static_cast<LONGLONG>(bLeadMs * Freq() / 1000.0);
+                bCap = pacesched::LeadCap(bCap, bLead, cfg.testLeadMs > 0);     // a fixed test lead is not cut to a step
                 bBase = schedBase;
                 batchValid = true;
                 ++g_schedBatches;
@@ -664,6 +663,8 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             const LONGLONG c0 = scproxy::Qpc();
             const bool copied = CopyToBackBuffer(it.slot, n);
             scproxy::AddTime("sink.copy", c0);
+            // Only our own GPU wait counts as late for the lead rule (as in the own generator): a frame that ARRIVED after its time (the library
+            // or the game was late) is presented on arrival and does not raise the lead.
             // Schedule mode: the Present waits for the frame's own GPU work (so it never queues behind it in the swap chain, as the own
             // generator's PresentReal); a generated frame whose work was still running at its time is "late" for the lead rule
             double lateMs = 0;

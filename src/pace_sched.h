@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace pacesched
 {
@@ -62,4 +63,23 @@ inline long long Bound(long long target, long long step, long long last)
 {
     return last ? std::clamp(target, last + step / 2, last + 2 * step) : target;
 }
+
+// The sink's choice of the application Present a burst belongs to (sink/sink.h, Plan). `stamps`: the unmatched Present times, oldest
+// first (any container with front/pop_front/operator[]/size). The newest one not later than `arrived` (the burst's first frame) is taken
+// and the older ones dropped: one extra stamp (a Present the library never turned into a burst) must not shift the schedule by a frame
+// for good. Returns false when there is none (every stamp is later than the arrival): the arrival itself is the base then.
+template <class Deque> inline bool PickStamp(Deque& stamps, long long arrived, long long& stamp)
+{
+    while (stamps.size() > 1 && stamps[1] <= arrived)
+        stamps.pop_front();
+    if (stamps.empty() || stamps.front() > arrived)
+        return false;
+    stamp = stamps.front();
+    stamps.pop_front();
+    return true;
+}
+
+// The cap of the lead (ticks) a batch is planned with: `cap` (a step, or n steps with the wide-cap test) for the lead rule; a fixed test
+// lead (F5LOW_TEST_SINK_LEAD_MS) is never cut by it - the experiment must run the lead it asks for.
+inline long long LeadCap(long long cap, long long lead, bool fixedTestLead) { return fixedTestLead ? std::max(cap, lead) : cap; }
 } // namespace pacesched
