@@ -186,6 +186,20 @@ int main()
         // the base with a lag: the stamp plus the lag
         CHECK(pacesched::NextBase(0, 1000, 80, 1600) == 1080);
     }
+    // BaseOnMiss: a GPU stamp is the usual NextBase; a miss after GPU stamps keeps the predicted base (no jump to the CPU time)
+    {
+        const long long iv = 1600;
+        long long base = pacesched::BaseOnMiss(0, true, true, 5000, 0, iv);             // first GPU stamp: set anew
+        CHECK(base == 5000);
+        base = pacesched::BaseOnMiss(base, true, true, 5000 + iv + 20, 0, iv);          // in step: drawn a fifth of the way
+        CHECK(base == 5000 + iv + 4);
+        const long long cpuS = 5000 + 2 * iv - 700;                                     // the CPU time sits 700 ticks before the GPU stamp
+        const long long miss = pacesched::BaseOnMiss(base, false, true, cpuS, 0, iv);
+        CHECK(miss == base + iv);                                                       // predicted, not pulled to the CPU time
+        CHECK(pacesched::BaseOnMiss(0, false, false, cpuS, 0, iv) == cpuS);             // never a GPU stamp: the CPU time
+        CHECK(pacesched::BaseOnMiss(base, false, false, cpuS, 0, iv) == pacesched::NextBase(base, cpuS, 0, iv));   // too many misses: CPU again
+        CHECK(pacesched::BaseOnMiss(0, false, true, cpuS, 0, iv) == cpuS);              // after a reset (base 0): the CPU time
+    }
     if (g_fail)
     {
         printf("pace_sched_test: %d FAILED\n", g_fail);

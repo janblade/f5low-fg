@@ -96,12 +96,22 @@ template <class Deque, class Entry, class Key> inline bool PickStampBy(Deque& st
 }
 
 // One application Present as the sink's schedule keeps it: the CPU time of the call, and the value of the fence signalled on the
-// application's queue right behind it (0: none was signalled - GPU stamps off, no fence, or an older Present).
+// APPLICATION's queue right behind it (SinkFactory::SetStampQueue; not the queue the library made its chain with) (0: none was signalled -
+// GPU stamps off, no application queue, or an older Present).
 struct AppStamp
 {
     long long cpu = 0;
     uint64_t fence = 0;
 };
+
+// The base of a batch (ticks) when the Present's GPU time may not be there. gpu: it is, `s` is it: the usual NextBase. A miss while GPU stamps
+// have been in use (haveGpu: a GPU stamp was used since the last reset and fewer than 4 misses in a row) keeps the predicted base, the last one
+// plus the interval, with no pull towards the CPU time (which sits a GPU latency off the GPU stamps: falling back to it made the base jump there
+// and back). No GPU stamp yet / after a reset / too many misses: the CPU time `s`, as without GPU stamps.
+inline long long BaseOnMiss(long long base, bool gpu, bool haveGpu, long long s, long long lag, long long interval)
+{
+    return !gpu && haveGpu && base ? base + interval : NextBase(base, s, lag, interval);
+}
 
 // The times the GPU reached the fence values signalled behind the game's Presents (sink/sink.h: a watcher thread takes the time at
 // which the fence's completion event fired, as the own generator's watcher does for appFence, xefg_own.h StartPresenter). Values are

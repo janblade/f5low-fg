@@ -537,6 +537,7 @@ public:
         std::lock_guard<std::mutex> lk(mu);
         auto* sf = new xsink::SinkFactory(f4, true);     // DLSS-G takes its buffers once: stable buffers
         f4->Release();
+        sf->SetStampQueue(q);                           // the application's queue: the sink's GPU stamps are signalled on it
         IDXGIFactory* up = sf;
         sf->AddRef();                                   // Streamline's proxy holds this one
         IDXGIFactory2* up2 = nullptr;

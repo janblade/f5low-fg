@@ -1836,6 +1836,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
             return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
         auto* sf = new xsink::SinkFactory(f4, false);
         f4->Release();
+        sf->SetStampQueue(q);       // the application's queue (Intel presents on a queue of its own): the sink's GPU stamps are signalled on it
         {
             xsink::PaceCfg pc = SinkPaceCfg();
             if (pc.mode == xsink::PaceMode::Off)

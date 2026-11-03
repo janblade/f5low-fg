@@ -35,14 +35,20 @@
 // What a stamp is (GPU stamps, SinkGpuStamps=1 default): the own generator bases its schedule on the moment each application frame was
 // DONE ON THE GPU (xefg_own.h: appFence signalled on the application's queue behind the frame, a watcher thread takes the time its
 // completion event fired). The CPU time of the game's Present carries the game thread's jitter (several ms in RDR2), the GPU time does
-// not. The sink does the same: AppPresent signals a fence of its own on the chain's queue (the queue the game presents on, so the signal
-// lands behind the game's frame work submitted so far) and a watcher thread takes the time the GPU reached it. The Present call itself
-// only does the (non-blocking) Signal. The pairing of a burst with an application Present stays by the CPU time of the Present (PickStampBy:
+// not. The sink does the same: AppPresent signals a fence of its own on the APPLICATION'S queue (SinkFactory::SetStampQueue: the queue
+// the host gave InitFromDesc, which is what the own generator's appFence is signalled on) so the signal lands behind the game's frame work
+// submitted so far, and a watcher thread takes the time the GPU reached it. It is NOT the queue the library made its chain with: Intel
+// presents on a present queue of its own (a Signal there would only say "Intel finished the frame before"); for DLSS-G the two are
+// logged when the chain is made (SINK.CreateSwapChainForHwnd). No application queue, or one on another device than the sink's: no GPU
+// stamps, the CPU time of the Present is used (counted). The Present call itself only does the (non-blocking) Signal. The pairing of a burst with an application Present stays by the CPU time of the Present (PickStampBy:
 // a burst takes the newest Present not later than its first frame); the GPU time of that Present is the value the schedule is based on.
 // The library may hand the sink its first generated frame before the GPU has finished the application's frame, so the GPU time is not
 // there yet when the burst arrives: it is read when the pacer thread is about to release the batch's first frame (ResolveBatch), waiting
 // for it at most two app frame intervals (the generated frame cannot be shown before the application's frame is done anyway). No GPU
-// time then (no fence, device removed, the wait ran out): the CPU time of that Present, counted. Precision: the time is the wake-up of
+// time then (no fence, device removed, the wait ran out): counted as a miss, and the base is the PREDICTED one (the last base + the
+// interval, no pull towards the CPU time: the CPU time sits a GPU latency off the GPU stamps, and falling back to it made the base jump
+// there and back, two hitches per miss); only before the first GPU stamp, after a reset, or after three misses in a row is the CPU time
+// of that Present the base (pacesched::BaseOnMiss). Precision: the time is the wake-up of
 // a thread after the fence completed, so it trails the GPU's completion by the scheduler's latency (tens of microseconds to ~1 ms), and
 // when the GPU is more than one frame behind the watcher takes several frames at the same wake-up (the stamps of the late ones are too
 // late, never early); both are far below the CPU jitter this replaces.
@@ -53,9 +59,11 @@
 // GPU wait counts. Lead and lag: the batch base is the GPU stamp + lag; frame j goes out at base + Offset(lead, step, j + 1). The lag moves
 // the whole batch later, the lead moves it earlier by (step - lead). The own generator uses one OR the other (the lead on its D3D12 path,
 // where each pass is recorded just before its present; the lag on its CUDA path, where the passes are done ahead and a lag only gives
-// them time); the sink has both, because its frames are the library's work done ahead like the CUDA path's, but its first frame still
-// has the lead's cap. Both start from the same late measurement, so a late frame raises both (at 3x+ that is the point: the first frame
-// of a batch needs time); MaxLag=0 or PaceLead=off take either out for an A/B.
+// them time). The sink has both, but the lead goes first and the lag is the overflow: a late frame raises the lag only when the lead has
+// no room, i.e. PaceLead is off or the batch's frozen lead was already at its cap (a step). Raising both for the same late frame
+// overshot by 1-3 ms and added latency to the real frame. MaxLag=0 or PaceLead=off take either out for an A/B. The lag falls 2 % per
+// batch as it arrives (Tensor: per app frame) and is reset with the schedule. The defaults (SinkGpuStamps on, this lag rule) are not
+// game-tested yet: a game A/B is pending.
 //
 // Only what Intel's 1.3.4.95 uses is implemented with care (see the plan, Story 3 step 1); the rest is forwarded.
 #pragma once
@@ -390,10 +398,16 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     bool leadOpen = false;              // a batch's lead is waiting for its EndFrame
     double openFrozen = 0, openStep = 0;
 
-    // GPU stamps (see the top). A fence of the sink's own on the chain's queue, signalled behind every stamped application Present; the
+    // GPU stamps (see the top). A fence of the sink's own, signalled on the APPLICATION's queue (stampQueue) behind every stamped application Present; the
     // watcher thread publishes the time each value completed into gpuRing (under mu) and wakes the pacer if it waits for one.
     ID3D12Fence* stampFence = nullptr;
     HANDLE watchEvent = nullptr;
+    ID3D12CommandQueue* stampQueue = nullptr;   // the application's queue (AddRef'd; SinkFactory::SetStampQueue): stampFence is signalled on it
+    std::mutex wm;                      // the watcher sleeps on wcv until a value is signalled (no polling for values nobody signals)
+    std::condition_variable wcv;
+    uint64_t signalled = 0;             // wm: the last fence value Signal was called with
+    bool gpuMode = false;               // mu: a GPU stamp was used since the last reset (a miss then keeps the predicted base)
+    unsigned missRun = 0;               // mu: misses in a row
     std::mutex sigMu;                   // the fence values are signalled in order (one game thread presents at a time in practice); taken before mu, never inside it
     uint64_t stampValue = 0;            // under sigMu: the last fence value handed out
     pacesched::GpuStampRing gpuRing;    // under mu
@@ -426,27 +440,38 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     // mu held (l owns it), on the pacer thread, as the batch's first frame is about to be released: the batch's base. The Present's GPU
     // stamp if the fence has it, else (waiting for it for two app frame intervals at most, 4..50 ms) the CPU time of the Present. The
     // base is then smoothed as the own generator's (NextBase), with the lag it has now.
-    void ResolveBatch(std::unique_lock<std::mutex>& l, Batch& b)
+    // Returns the batch (looked up again after the wait: the lock is let go in it), or null if it is gone.
+    Batch* ResolveBatch(std::unique_lock<std::mutex>& l, uint64_t seq)
     {
-        if (b.resolved)
-            return;
-        LONGLONG s = b.stamp.cpu, g = 0;
-        bool gpu = false;
-        if (b.stamp.fence)
+        Batch* bp = FindBatch(seq);
+        if (!bp)
+            return nullptr;
+        if (bp->resolved)
+            return bp;
+        const uint64_t fence = bp->stamp.fence;
+        LONGLONG g = 0;
+        if (fence && !gpuRing.Get(fence, g) && !stop)
         {
-            if (!gpuRing.Get(b.stamp.fence, g) && !stop)
-            {
-                const double waitMs = (std::min)((std::max)(2.0 * ri.ms, 4.0), 50.0);
-                cvGpu.wait_for(l, std::chrono::microseconds(static_cast<long long>(waitMs * 1000.0)), [&] { return stop || gpuRing.Get(b.stamp.fence, g); });
-            }
-            gpu = gpuRing.Get(b.stamp.fence, g);
-            if (gpu)
-                s = g;
+            const double waitMs = (std::min)((std::max)(2.0 * ri.ms, 4.0), 50.0);
+            cvGpu.wait_for(l, std::chrono::microseconds(static_cast<long long>(waitMs * 1000.0)), [&] { return stop || gpuRing.Get(fence, g); });
         }
+        bp = FindBatch(seq);
+        if (!bp)
+            return nullptr;
+        Batch& b = *bp;
+        const bool gpu = fence && gpuRing.Get(fence, g);
+        LONGLONG s = gpu ? g : b.stamp.cpu;
         const LONGLONG lagTicks = static_cast<LONGLONG>(lag.ms * Freq() / 1000.0);
+        if (gpu)
+        {
+            gpuMode = true;
+            missRun = 0;
+        }
+        else if (gpuMode)
+            ++missRun;
         if (b.epoch == epoch)
         {
-            schedBase = pacesched::NextBase(schedBase, s, lagTicks, b.iv);
+            schedBase = pacesched::BaseOnMiss(schedBase, gpu, gpuMode && missRun < 4, s, lagTicks, b.iv);
             b.base = schedBase;
         }
         else
@@ -458,7 +483,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         else
         {
             ++g_schedCpu;
-            if (b.stamp.fence)
+            if (fence)
                 ++g_schedGpuMiss;
         }
         if (Collect())
@@ -486,6 +511,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         }
         lastCpuIv = gpu ? b.stamp.cpu : 0;
         lastGpuIv = gpu ? g : 0;
+        return bp;
     }
 
     // Called with mu held, right after Observe: the first frame of a burst takes the oldest application stamp and opens a batch
@@ -495,6 +521,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         if (curCount == 1)
         {
             batchValid = false;
+            lag.EndFrame();             // falls with every application frame that arrives (the own generator: per app frame)
             if (stampsSeen >= 6)
             {
                 // The newest application Present not later than this burst's first frame (by the CPU time of the Present, see PickStampBy);
@@ -633,6 +660,9 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         leadOpen = false;
         ++epoch;                        // batches already planned stay for their queued frames but do not touch the new state
         lastCpuIv = lastGpuIv = 0;
+        gpuMode = false;
+        missRun = 0;
+        lag.ms = 0;
     }
 
     IDXGISwapChain4* real() const { return r; }
@@ -741,7 +771,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         return true;
     }
 
-    bool Init(IUnknown* queueUnknown)
+    bool Init(IUnknown* queueUnknown, ID3D12CommandQueue* stampQ)
     {
         if (stable && appBuffers > kSlots)
             return false;
@@ -757,8 +787,21 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         list->Close();
         if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
             return false;
-        if (SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stampFence))))
-            watchEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);      // (no fence: the schedule is based on the CPU times, as without SinkGpuStamps)
+        // GPU stamps need the application's queue on the sink's device; otherwise the schedule is based on the CPU times (counted)
+        if (stampQ)
+        {
+            ID3D12Device* sd = nullptr;
+            if (SUCCEEDED(stampQ->GetDevice(IID_PPV_ARGS(&sd))) && sd)
+            {
+                if (sd == dev && SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stampFence))))
+                {
+                    stampQueue = stampQ;
+                    stampQueue->AddRef();
+                    watchEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                }
+                sd->Release();
+            }
+        }
         fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         libEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         alwaysSignaled = CreateEventW(nullptr, TRUE, TRUE, nullptr);
@@ -884,6 +927,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             long long target;
             uint64_t n;
             double itemLagMs = 0;       // the lag its batch was scheduled with (the lag rule raises from it)
+            bool haveBatch = false;     // its batch was found (no lag is learned from a frame whose schedule is unknown)
             {
                 std::unique_lock<std::mutex> l(mu);
                 cvItem.wait(l, [&] { return stop || !q.empty(); });
@@ -893,14 +937,14 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 n = presented;
                 const LONGLONG now = Now();
                 const double spacing = burst > 1 && lastFull ? sTicks : 0;
-                Batch* bp = it.sched && !it.direct ? FindBatch(it.batch) : nullptr;
-                if (bp)
-                    ResolveBatch(l, *bp);       // may wait for the GPU stamp (the lock is let go meanwhile; only this thread pops the queue)
+                // (`now` above is read before ResolveBatch's wait and only used by the branches that do not wait)
+                Batch* bp = it.sched && !it.direct ? ResolveBatch(l, it.batch) : nullptr;   // may wait for the GPU stamp (the lock is let go meanwhile; only this thread pops the queue)
                 if (it.direct)
                     target = now;               // SinkPace=off or display-paced: on arrival (its copy still comes first, below)
                 else if (bp)
                 {
                     itemLagMs = bp->lagMs;
+                    haveBatch = true;
                     // a late frame: on arrival, never closer than half a step to the last
                     target = pacesched::Bound(bp->base + pacelead::Offset(bp->lead, bp->step, it.j + 1, bp->cap), it.step, lastRelease);
                 }
@@ -971,7 +1015,9 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 if (it.j + 1 < it.b)
                 {
                     ++g_schedFrames;
-                    lag.Late(itemLagMs, lateMs, ri.ms, cfg.maxLag);
+                    // the lead goes first, the lag is the overflow: only when PaceLead is off or the batch's lead was already at its cap
+                    if (haveBatch && (!lead.On() || it.leadMs >= it.stepMs))
+                        lag.Late(itemLagMs, lateMs, ri.ms, cfg.maxLag);
                     if (leadOpen && lateMs > pacelead::kLateMs)
                     {
                         ++g_schedLate;
@@ -985,7 +1031,6 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 }
                 else
                 {
-                    lag.EndFrame();
                     if (leadOpen)
                     {
                         lead.EndFrame(openFrozen, openStep);
@@ -1021,6 +1066,13 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         uint64_t f = 1;
         while (!wQuit)
         {
+            {
+                // nothing to register for until Signal was called with f (SinkGpuStamps=0, burst/off, FG off: this thread sleeps for good)
+                std::unique_lock<std::mutex> wl(wm);
+                wcv.wait(wl, [&] { return wQuit.load() || signalled >= f; });
+            }
+            if (wQuit)
+                break;
             const UINT64 done = stampFence->GetCompletedValue();
             if (done == UINT64_MAX)
             {
@@ -1045,16 +1097,19 @@ class SinkSwapChain final : public scproxy::LogSwapChain
 
 public:
     // queueUnknown: what the library gave CreateSwapChainForHwnd (the chain's command queue). ok() false: not a D3D12 queue, use the real chain as it is.
-    SinkSwapChain(IDXGISwapChain4* realChain, UINT appCount, IUnknown* queueUnknown, bool stableBuffers)
+    // stampQ: the application's queue, for the GPU stamps (null: CPU stamps). queueUnknown is the LIBRARY's queue for its chain (the copies run on it).
+    SinkSwapChain(IDXGISwapChain4* realChain, UINT appCount, IUnknown* queueUnknown, bool stableBuffers, ID3D12CommandQueue* stampQ = nullptr)
         : scproxy::LogSwapChain(realChain), appBuffers(appCount), stable(stableBuffers)
     {
-        ok = Init(queueUnknown);
+        ok = Init(queueUnknown, stampQ);
         if (ok)
             worker = std::thread([this] { Run(); });
         if (ok && stampFence && watchEvent)
             watcher = std::thread([this] { Watch(); });
     }
     bool Ok() const { return ok; }
+    ID3D12CommandQueue* LibraryQueue() const { return queue; }      // (logging) the queue the library made the chain with
+    ID3D12CommandQueue* StampQueue() const { return stampQueue; }   // (logging) null: no GPU stamps
 
     // Frames per application frame (generated + its own); 1 = frame generation off.
     void SetBurst(uint32_t count)
@@ -1083,8 +1138,8 @@ public:
         ResetSchedule();
     }
     // The game side's Present call at `t` (QPC): the base of the next batch (see the top)
-    // With GPU stamps (SinkGpuStamps, default) the call also signals the stamp fence on the chain's queue, right behind the game's frame
-    // work submitted so far; the watcher stamps the time the GPU gets there. Signal is a queue call that does not wait for the GPU, so
+    // With GPU stamps (SinkGpuStamps, default) the call also signals the stamp fence on the APPLICATION's queue (stampQueue, not the library's
+    // chain queue), right behind the game's frame work submitted so far; the watcher stamps the time the GPU gets there. Signal is a queue call that does not wait for the GPU, so
     // the game's thread is not held. The interval the schedule steps by (ri) stays on the CPU times: it is a mean, the jitter averages out.
     void AppPresent(LONGLONG t)
     {
@@ -1111,7 +1166,14 @@ public:
                 stamps.clear();
         }
         if (v)
-            queue->Signal(stampFence, v);
+        {
+            stampQueue->Signal(stampFence, v);
+            {
+                std::lock_guard<std::mutex> wl(wm);
+                signalled = v;
+            }
+            wcv.notify_one();
+        }
     }
 
     size_t MaxDepth() const { return maxDepth; }
@@ -1138,11 +1200,22 @@ public:
             cvGpu.notify_all();
             if (worker.joinable())
                 worker.join();
-            wQuit = true;
+            {
+                std::lock_guard<std::mutex> wl(wm);
+                wQuit = true;
+            }
+            wcv.notify_all();
             if (watchEvent)
                 SetEvent(watchEvent);
             if (watcher.joinable())
                 watcher.join();
+            if (stampFence)
+            {
+                // a registration the watcher left (SetEventOnCompletion) must not signal a closed handle: let the GPU reach the last value (bounded)
+                const LONGLONG dl = Now() + Freq() / 10;
+                while (stampFence->GetCompletedValue() < stampValue && Now() < dl)
+                    Sleep(1);
+            }
             g_depthStat = maxDepth;
             g_fullStat = fullWaits;
             ReleaseSlots();
@@ -1157,6 +1230,8 @@ public:
                 stampFence->Release();
             if (watchEvent)
                 CloseHandle(watchEvent);
+            if (stampQueue)
+                stampQueue->Release();
             if (qheap)
                 qheap->Release();
             if (qread)
@@ -1280,6 +1355,7 @@ class SinkFactory final : public scproxy::LogFactory
     const bool stable;
     PaceCfg pace;           // under g_linkMu: the pacing mode (SetPace), applied to every chain made
     uint32_t burst = 1;     // under g_linkMu: the frames per application frame set last, so a chain made later starts with it
+    ID3D12CommandQueue* stampQueue = nullptr;   // under g_linkMu: the application's queue for the GPU stamps (AddRef'd), applied to chains made later
 
 public:
     // stableBuffers: for a library that takes its buffers once (DLSS-G through Streamline), see SinkSwapChain
@@ -1289,6 +1365,20 @@ public:
         std::lock_guard<std::mutex> g(g_linkMu);
         if (last)
             last->owner = nullptr;
+        if (stampQueue)
+            stampQueue->Release();
+    }
+
+    // The application's command queue (the host's, as given to InitFromDesc - not the library's own present queue): the sink signals its
+    // GPU stamp fence on it. Set before the chain is made; applies to chains made later (like SetPace). Null or another device: CPU stamps.
+    void SetStampQueue(ID3D12CommandQueue* q)
+    {
+        std::lock_guard<std::mutex> g(g_linkMu);
+        if (q)
+            q->AddRef();
+        if (stampQueue)
+            stampQueue->Release();
+        stampQueue = q;
     }
 
     // The sink the library was given; null once the library let go of it. Test use only (no lock): use SetBurst.
@@ -1342,7 +1432,19 @@ public:
             return h;
         }
         real1->Release();
-        auto* sink = new SinkSwapChain(real4, desc->BufferCount, d, stable);
+        ID3D12CommandQueue* sq = nullptr;
+        {
+            std::lock_guard<std::mutex> g(g_linkMu);
+            sq = stampQueue;
+            if (sq)
+                sq->AddRef();
+        }
+        auto* sink = new SinkSwapChain(real4, desc->BufferCount, d, stable, sq);
+        if (g_log && sink->Ok())
+            g_log("sink: chain made on library queue %p; GPU stamps on the application queue %p (%s)", static_cast<void*>(sink->LibraryQueue()), static_cast<void*>(sq),
+                  !sq ? "none given: CPU stamps" : !sink->StampQueue() ? "not on the sink's device: CPU stamps" : sink->StampQueue() == sink->LibraryQueue() ? "the same queue" : "a different queue");
+        if (sq)
+            sq->Release();
         if (!sink->Ok())
         {
             scproxy::Log("SINK.unusable", "not a D3D12 queue or no staging textures - the real chain as it is");
