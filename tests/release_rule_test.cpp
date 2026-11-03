@@ -19,7 +19,7 @@ using namespace xsink;
 
 int main()
 {
-    const uint32_t tear = 0x200, other = 0x1;   // DXGI_PRESENT_ALLOW_TEARING; some other flag
+    const uint32_t tear = 0x200, other = 0x8;   // DXGI_PRESENT_ALLOW_TEARING; DXGI_PRESENT_DO_NOT_WAIT (TEST is forwarded by the sink before the rule)
     // the predicate: V-Sync or any flag but tearing
     CHECK(!DisplayPaced(0, 0));
     CHECK(!DisplayPaced(0, tear));

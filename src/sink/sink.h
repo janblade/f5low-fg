@@ -405,40 +405,54 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     }
     bool logged = false;
 
-    // Display-paced frames (release_rule.h): the state the last queued frame was in, for the one log line per change. mu held.
+    // Display-paced frames (release_rule.h): the committed state, for the one log line per change. mu held.
     bool displayPaced = false;
+    unsigned dpRun = 0;                 // consecutive queued frames that disagree with the committed state
     LONGLONG lastDpLog = 0;
     unsigned dpLogSkipped = 0;
 
     // mu held: the frame about to be queued has sync/flags. Returns true when it goes out on arrival (Off, or paced by the display).
     // Such a frame is taken out of ALL the pacing state: Observe (burst interval, spacing) and Plan (schedule, stamps, lead) never see
-    // it, and Run gives it no lateness for the lead rule. When the state changes, the burst/schedule state is reset, because it was
-    // measured on a different stream (frames missing from the bursts) and must be learned again.
+    // it, and Run gives it no lateness for the lead rule. The per-frame decision is always taken from the frame's own sync/flags.
+    // The STATE change (reset of the burst/schedule state, which was measured on a different stream, and the log line) has hysteresis:
+    // a stream that mixes the two per frame (generated frames sync 0, the real frame sync 1) would otherwise reset on every flip, so
+    // the new state must hold for burst + 1 queued frames in a row (at least 2) before it counts.
     bool NoteRelease(UINT sync, UINT flags)
     {
         const ReleaseKind rel = ReleaseRule(sync, flags, cfg.mode);
         const bool dp = rel == ReleaseKind::OnArrivalDisplay;
-        if (dp != displayPaced)
+        const LONGLONG now = Now();
+        if (dp == displayPaced)
+            dpRun = 0;
+        else if (++dpRun >= (std::max)(2u, burst + 1))
         {
+            dpRun = 0;
             displayPaced = dp;
             ResetBurstState();
             ResetSchedule();
-            if (g_log)
-            {
-                const LONGLONG now = Now();
-                // one line per change, and not more than one per second (a game that alternates flags every frame must not flood the log)
-                if (!lastDpLog || now - lastDpLog >= Freq())
-                {
-                    lastDpLog = now;
-                    g_log(dp ? "sink: display-paced (V-Sync): frames go out as they come%s" : "sink: paced again (tearing, no V-Sync)%s",
-                          dpLogSkipped ? " (state changes since the last line were not logged)" : "");
-                    dpLogSkipped = 0;
-                }
-                else
-                    ++dpLogSkipped;
-            }
+            LogDisplayPaced(now, sync, flags);
         }
+        if (dpLogSkipped && now - lastDpLog >= Freq())
+            LogDisplayPaced(now, sync, flags);      // a change was not logged (too soon after the last line): say what holds now
         return rel != ReleaseKind::Paced;
+    }
+    // One line per change, and not more than one per second (a game that alternates quickly must not flood the log); a line that was
+    // held back is written, with the state that holds by then, on the first frame a second after the last line.
+    void LogDisplayPaced(LONGLONG now, UINT sync, UINT flags)
+    {
+        if (!g_log)
+            return;
+        if (lastDpLog && now - lastDpLog < Freq())
+        {
+            ++dpLogSkipped;
+            return;
+        }
+        lastDpLog = now;
+        dpLogSkipped = 0;
+        if (displayPaced)
+            g_log("sink: display-paced (sync interval %u, flags 0x%x): frames go out as they come", sync, flags);
+        else
+            g_log("sink: paced again (sync interval %u, flags 0x%x)", sync, flags);
     }
 
     void ResetBurstState()      // mu held: forget the measured burst interval and spacing (a new burst size, or the stream changed)
@@ -849,6 +863,9 @@ public:
     {
         std::lock_guard<std::mutex> l(mu);
         cfg = c;
+        displayPaced = false;           // the next frame decides again (Off must not log "paced again" for a state it never had)
+        dpRun = 0;
+        dpLogSkipped = 0;
         lead.automatic = c.leadAuto;
         lead.fixedMs = c.leadFixedMs;
         UpdateSched();
@@ -978,11 +995,15 @@ public:
     HRESULT STDMETHODCALLTYPE Present(UINT si, UINT fl) override
     {
         scproxy::Log("SINK.Present", "sync %u flags 0x%x", si, fl);
+        if (fl & DXGI_PRESENT_TEST)         // shows nothing: straight to the real chain, never queued (as the own generator does)
+            return real()->Present(si, fl);
         return Enqueue(si, fl);
     }
-    HRESULT STDMETHODCALLTYPE Present1(UINT si, UINT fl, const DXGI_PRESENT_PARAMETERS*) override
+    HRESULT STDMETHODCALLTYPE Present1(UINT si, UINT fl, const DXGI_PRESENT_PARAMETERS* pp) override
     {
         scproxy::Log("SINK.Present1", "sync %u flags 0x%x", si, fl);
+        if (fl & DXGI_PRESENT_TEST)
+            return real()->Present1(si, fl, pp);
         return Enqueue(si, fl);
     }
     // Intel's library paces its presents on the real chain's frame-latency waitable object (it waits on it before the next frame): with
@@ -1014,13 +1035,7 @@ public:
         const HRESULT hr = r->ResizeBuffers(c, w, h, f, fl);
         in = presented = 0;             // the real chain starts again at buffer 0
         ResetSchedule();
-        curCount = 0;
-        lastFull = false;
-        lastBurstStart = 0;
-        interval = 0;
-        sTicks = 0;
-        cleanSamples = 0;
-        emptyAt = 0;
+        ResetBurstState();
         if (SUCCEEDED(hr) && !MakeSlots())
             return E_FAIL;
         return hr;

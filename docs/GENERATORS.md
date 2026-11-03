@@ -174,7 +174,9 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     burst and schedule state is reset and learned again; one log line per change (`sink: display-paced (V-Sync): frames go out as they come`,
     at most one per second). `SinkPace=off` does the same for every frame, V-Sync or not: pass-through, no burst spacing, no schedule, no
     stamps. It is the A/B switch for DLSS-G: on RTX 40/50 DLSS-G sets the driver's flip metering itself, so with `off` the display
-    hardware spaces the flips and our timer is not a second pacer on the same chain. Default stays `auto` until a game A/B decides.
+    hardware spaces the flips and our timer is not a second pacer on the same chain. `off` is meant for `dlssg`: for `intel` it is mapped to `burst` (logged), because Intel presents its bursts back to back and nothing else spaces them.
+    A `DXGI_PRESENT_TEST` present is forwarded to the real chain and never queued. A mixed stream (generated frames sync 0, the real frame
+    sync 1) does not flip the state per frame: the new state must hold for burst + 1 frames in a row. Default stays `auto` until a game A/B decides.
   - *Schedule mode.* **schedule**: the sink releases a burst on the own
     generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
     proxy chain behind a thin wrapper (`xintel::StampChain`; the call is forwarded untouched, every other method passes through; it holds its

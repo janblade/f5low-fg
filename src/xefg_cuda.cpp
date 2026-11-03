@@ -1828,7 +1828,13 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
         auto* sf = new xsink::SinkFactory(f4, false);
         f4->Release();
         {
-            const xsink::PaceCfg pc = SinkPaceCfg();
+            xsink::PaceCfg pc = SinkPaceCfg();
+            if (pc.mode == xsink::PaceMode::Off)
+            {
+                // Off is for dlssg (DLSS-G's own flip metering paces there); Intel presents its bursts back to back and has nothing that spaces them
+                pc.mode = xsink::PaceMode::Burst;
+                Log("intel: SinkPace=off is for dlssg: intel uses burst spacing");
+            }
             ic->schedule = pc.mode != xsink::PaceMode::Burst && pc.mode != xsink::PaceMode::Off;       // the game's Presents are stamped unless the burst spacing is forced or the pacing is off
             sf->SetPace(pc);
         }
