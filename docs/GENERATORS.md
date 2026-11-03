@@ -162,8 +162,10 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     generated frame of every burst is late (~3 ms, about one late frame per batch, 12-20 % of generated frames at 4x/6x at 60 fps) and gap sd /
     pm_sd are worse than the burst spacing. A wider lead cap (n steps; the lead rule reached 13-17 ms) did NOT remove it, and
     Intel's frames all arrive within ~1.5 ms of the game's Present, so the cause is probably the first frame's GPU completion behind the whole
-    burst's work, not a short lead. The fixed-lead evidence (6 and 9 ms) is INVALID: those test leads were clamped to one step; fixed in the
-    sink (a fixed test lead is not cut) and **pending a re-run** (lead6/lead9 at 4x and 6x, 60 fps). Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
+    burst's work, not a short lead. Fixed leads (not clamped to a step any more; harness 2026-11-03, 20 s, d7387f9) did not remove it either: lead 6 ms / lead 9 ms
+    at 4x/60 give late 1.1 % / 27 % with gap sd 1.14 / 0.79 (burst 0.19) and at 6x/60 late 15 % / 27 % with gap sd 1.5 (burst 0.13); jitter2 is
+    the same picture (6x late 11 % / 23 %, gap sd 1.5 against 0.70). Only lead 6 at 4x/60 reaches late ~1 %, with a gap sd still six times
+    the burst spacing's. A bigger lead costs latency and, past about one frame time, raises the late share (the frames wait behind the burst). Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
     arrival offsets and late frames per burst frame j.
   - *Schedule mode.* **schedule**: the sink releases a burst on the own
     generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
