@@ -448,18 +448,18 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             return nullptr;
         if (bp->resolved)
             return bp;
-        const uint64_t fence = bp->stamp.fence;
+        const uint64_t fv = bp->stamp.fence;
         LONGLONG g = 0;
-        if (fence && !gpuRing.Get(fence, g) && !stop)
+        if (fv && !gpuRing.Get(fv, g) && !stop)
         {
             const double waitMs = (std::min)((std::max)(2.0 * ri.ms, 4.0), 50.0);
-            cvGpu.wait_for(l, std::chrono::microseconds(static_cast<long long>(waitMs * 1000.0)), [&] { return stop || gpuRing.Get(fence, g); });
+            cvGpu.wait_for(l, std::chrono::microseconds(static_cast<long long>(waitMs * 1000.0)), [&] { return stop || gpuRing.Get(fv, g); });
         }
         bp = FindBatch(seq);
         if (!bp)
             return nullptr;
         Batch& b = *bp;
-        const bool gpu = fence && gpuRing.Get(fence, g);
+        const bool gpu = fv && gpuRing.Get(fv, g);
         LONGLONG s = gpu ? g : b.stamp.cpu;
         const LONGLONG lagTicks = static_cast<LONGLONG>(lag.ms * Freq() / 1000.0);
         if (gpu)
@@ -483,7 +483,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         else
         {
             ++g_schedCpu;
-            if (fence)
+            if (fv)
                 ++g_schedGpuMiss;
         }
         if (Collect())
@@ -1212,7 +1212,7 @@ public:
             if (stampFence)
             {
                 // a registration the watcher left (SetEventOnCompletion) must not signal a closed handle: let the GPU reach the last value (bounded)
-                const LONGLONG dl = Now() + Freq() / 10;
+                const LONGLONG dl = Now() + static_cast<LONGLONG>(Freq() / 10);
                 while (stampFence->GetCompletedValue() < stampValue && Now() < dl)
                     Sleep(1);
             }
