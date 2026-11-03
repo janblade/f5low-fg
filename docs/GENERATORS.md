@@ -160,9 +160,10 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     "N frames per application frame: pacing by ..."): the schedule at 2x, the burst spacing from 3x. Why (harness A/B, 1.3.4.95, RTX 5070 Ti,
     20 s): at 2x the schedule removes the burst-start jitter (2x/30 gap sd 0.69 -> 0.24, pm_sd 2.0 -> 0.5, late <= 1 %). From 3x the first
     generated frame of every burst is late (~3 ms, about one late frame per batch, 12-20 % of generated frames at 4x/6x at 60 fps) and gap sd /
-    pm_sd are worse than the burst spacing. A wider lead cap (n steps, lead 13-17 ms; fixed leads 6 and 9 ms) did NOT remove it, and
-    Intel's frames all arrive within ~1.5 ms of the game's Present, so the cause is the first frame's GPU completion behind the whole burst's
-    work, not a short lead. Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
+    pm_sd are worse than the burst spacing. A wider lead cap (n steps; the lead rule reached 13-17 ms) did NOT remove it, and
+    Intel's frames all arrive within ~1.5 ms of the game's Present, so the cause is probably the first frame's GPU completion behind the whole
+    burst's work, not a short lead. The fixed-lead evidence (6 and 9 ms) is INVALID: those test leads were clamped to one step; fixed in the
+    sink (a fixed test lead is not cut) and **pending a re-run** (lead6/lead9 at 4x and 6x, 60 fps). Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
     arrival offsets and late frames per burst frame j.
   - *Schedule mode.* **schedule**: the sink releases a burst on the own
     generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
@@ -178,7 +179,10 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     chain from `InitFromSwapChain`), FG off (burst 1) and a changed burst size or resized chain fall back to / restart from the burst
     spacing; a short burst (a menu) is released on its planned time for frame 0 and as it comes after. dlssg is unchanged (burst spacing).
     The pieces shared with the own generator are in `src/pace_sched.h` (and `pace_lead.h`). Base: the Present call, not the app frame's GPU-ready
-    stamp as in Own; a late app GPU frame therefore shows up as late generated frames and raises the lead.
+    stamp as in Own; a late app GPU frame therefore shows up as late generated frames and raises the lead. Only our own GPU wait counts as
+    late for the lead (a frame that arrived after its time is presented on arrival and does not raise it). After a late frame the lead
+    stays raised for up to 128 application frames (`pacelead::kWindow`) and eases down by 1/16 per frame, so a menu (short bursts) that
+    follows keeps the higher lead's latency for a few seconds. A Present with `DXGI_PRESENT_TEST` is neither stamped nor sampled.
   - *Tests.* `tests/build_mfgunlock_tests.ps1` builds `xefg_unlock_test.exe <libxess_fg.dll> <libxell.dll>` (sites found once, Locate changes
     nothing, Apply changes exactly the planned bytes); the harness: `repro_test` with `F5LOW_GENERATOR=intel REPRO_INTERP=n XEFG_CUDA_INTEL_LIBRARY=<OptiScaler-style folder>\libxess_fg.dll F5LOW_SINK_STATS=1 SINK_PROBE=1 REPRO_BAR=1 REPRO_FRONT=1 XEFG_CUDA_LOG=1` and Intel's libxell.dll as the second argument
     (Intel's library wants an XeLL context before the swap chain is made); `SINK_PROBE_DUMP=1` also logs the bar's x per frame shown.

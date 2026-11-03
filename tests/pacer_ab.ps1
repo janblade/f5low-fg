@@ -21,6 +21,8 @@
 # -Seconds    seconds of frame generation per run (each run also has ~2-4 s off before it and the DLL's start-up).
 # -Path / -Gate  the own generator's run path and Gate=: the clock pacer runs on -Path cuda (Show) and with -Gate 1 (release thread);
 #             -Path d3d12 -Gate 0 (default) uses the schedule pacer, the only one PaceLead acts in.
+# -IntelLib   the libxess_fg.dll to run (libxell.dll next to it); default $env:F5LOW_INTEL_LIB. Empty: the DLL finds both in the folder
+#             above it (OptiScaler\plugins\f5low.dll), or next to it. One of them must have a libxess_fg.dll (own and intel need it).
 # -DlssgPath  folder with Streamline + nvngx_dlssg (XEFG_CUDA_DLSSGPATH) for -Gens dlssg.
 # PresentMon (-PresentMon <exe>, default H:\Tools\PresentMon\PresentMon-2.6.0-x64.exe, else presentmon on PATH) is used when found, if
 # the session may start an ETW trace (administrator or the Performance Log Users group); -NoPresentMon skips it. It runs with
@@ -39,7 +41,7 @@ param([Parameter(Mandatory)][string]$Dll,
       [string]$Path = 'd3d12',
       [int]$Gate = 0,
       [string]$DlssgPath = '',
-      [string]$IntelLib = 'D:\DEV\OptiScaler-NR\_builds\xefg-repro-log20\intel\libxess_fg.dll',
+      [string]$IntelLib = $env:F5LOW_INTEL_LIB,
       [string[]]$IntelConfigs = @('auto', 'schedule', 'burst'),
       [string]$Python = 'python',
       [string]$PresentMon = 'H:\Tools\PresentMon\PresentMon-2.6.0-x64.exe',
@@ -50,6 +52,11 @@ $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $exe = Join-Path $root 'build\repro_test.exe'
 if (-not (Test-Path $exe)) { throw 'build\repro_test.exe missing: run tests\build_repro_test.ps1' }
 $Dll = (Resolve-Path $Dll).Path
+if ($Gens -contains 'own' -or $Gens -contains 'intel') {
+    $dllDir = Split-Path -Parent $Dll
+    $found = @($IntelLib, (Join-Path $dllDir 'libxess_fg.dll'), (Join-Path (Split-Path -Parent $dllDir) 'libxess_fg.dll')) | Where-Object { $_ -and (Test-Path $_) }
+    if (-not $found) { throw "no libxess_fg.dll: pass -IntelLib <path>\libxess_fg.dll (or set `$env:F5LOW_INTEL_LIB), or put it next to $Dll / in the folder above it" }
+}
 if (-not $Out) { $Out = Join-Path $root ('build\pacer_ab\' + (Get-Date -Format 'yyyyMMdd_HHmmss')) }
 New-Item -ItemType Directory -Force $Out | Out-Null
 $Out = (Resolve-Path $Out).Path
