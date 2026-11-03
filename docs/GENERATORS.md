@@ -172,8 +172,8 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     proxy chain behind a thin wrapper (`xintel::StampChain`; the call is forwarded untouched, every other method passes through; it holds its
     context weakly). This was the least invasive place that sees the game's own Present, and the stamp is the game's own timing, free of
     Intel's variable generation time. The stamps give the smoothed app interval (`pacesched::ReadyInterval`, the own pacer's rule) and each
-    batch's base (`pacesched::NextBase`); the first frame of a burst (the sink's arrival-gap split) takes the oldest unmatched stamp, more than
-    two pending are dropped (the library is behind the game: follow the newest). Frame j of a batch (generated 1..n, then the game's frame) is
+    batch's base (`pacesched::NextBase`); the first frame of a burst (the sink's arrival-gap split) takes the newest stamp not later than its arrival (`pacesched::PickStamp`; older
+    ones are dropped, so an extra stamp cannot shift the schedule). Frame j of a batch (generated 1..n, then the game's frame) is
     released at `base + pacelead::Offset(lead, step, j + 1)`, step = interval / (n + 1), the lead frozen per batch (`pacelead::Lead`). The
     Present waits for the frame's staging copy first (as the own generator's `PresentReal`): a generated frame whose copy ran past its time
     is "late" and feeds `Lead::Late`/`EndFrame` exactly as Own does. A frame past its time is presented on arrival and followed no
