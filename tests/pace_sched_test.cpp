@@ -186,19 +186,44 @@ int main()
         // the base with a lag: the stamp plus the lag
         CHECK(pacesched::NextBase(0, 1000, 80, 1600) == 1080);
     }
-    // BaseOnMiss: a GPU stamp is the usual NextBase; a miss after GPU stamps keeps the predicted base (no jump to the CPU time)
+    // GpuBase: GPU stamps track the offset to the CPU time; a miss stays continuous, a pause resets, no GPU stamp yet = CPU time
     {
-        const long long iv = 1600;
-        long long base = pacesched::BaseOnMiss(0, true, true, 5000, 0, iv);             // first GPU stamp: set anew
-        CHECK(base == 5000);
-        base = pacesched::BaseOnMiss(base, true, true, 5000 + iv + 20, 0, iv);          // in step: drawn a fifth of the way
-        CHECK(base == 5000 + iv + 4);
-        const long long cpuS = 5000 + 2 * iv - 700;                                     // the CPU time sits 700 ticks before the GPU stamp
-        const long long miss = pacesched::BaseOnMiss(base, false, true, cpuS, 0, iv);
-        CHECK(miss == base + iv);                                                       // predicted, not pulled to the CPU time
-        CHECK(pacesched::BaseOnMiss(0, false, false, cpuS, 0, iv) == cpuS);             // never a GPU stamp: the CPU time
-        CHECK(pacesched::BaseOnMiss(base, false, false, cpuS, 0, iv) == pacesched::NextBase(base, cpuS, 0, iv));   // too many misses: CPU again
-        CHECK(pacesched::BaseOnMiss(0, false, true, cpuS, 0, iv) == cpuS);              // after a reset (base 0): the CPU time
+        const long long iv = 1600, off = 700;                   // the GPU stamp trails the CPU time of its Present by 700 ticks
+        pacesched::GpuBase gb;
+        // first: no GPU stamp yet - the CPU time as it is
+        long long base = gb.Next(0, false, 0, 1000, 0, iv);
+        CHECK(base == 1000 && !gb.have);
+        gb.Reset();
+        // first GPU stamp: set anew, offset learned
+        base = gb.Next(0, true, 1000 + off, 1000, 0, iv);
+        CHECK(base == 1000 + off && gb.have && Near(gb.offset, off));
+        // steady state with exact stamps: stays on the grid
+        for (int i = 1; i <= 5; ++i)
+            base = gb.Next(base, true, 1000 + off + i * iv, 1000 + i * iv, 0, iv);
+        CHECK(base == 1000 + off + 5 * iv);
+        // a miss in steady state: the CPU time moved by the offset = the same grid point, no jump (a raw CPU time would be 700 early)
+        const long long miss = gb.Next(base, false, 0, 1000 + 6 * iv, 0, iv);
+        CHECK(miss == 1000 + off + 6 * iv);
+        CHECK(gb.missRun == 1);
+        // a GPU stamp ends the run of misses
+        base = gb.Next(miss, true, 1000 + off + 7 * iv, 1000 + 7 * iv, 0, iv);
+        CHECK(gb.missRun == 0 && base == 1000 + off + 7 * iv);
+        // a miss after a long pause (more than an interval off): reset to the corrected CPU time, not the stale predicted base
+        const long long later = 1000 + 40 * iv;
+        CHECK(gb.Next(base, false, 0, later, 0, iv) == later + off);
+        // three misses in a row keep the offset, the fourth takes the CPU time as it is
+        gb.Reset();
+        base = gb.Next(0, true, 5000 + off, 5000, 0, iv);
+        for (int i = 1; i <= 3; ++i)
+            base = gb.Next(base, false, 0, 5000 + i * iv, 0, iv);
+        CHECK(base == 5000 + off + 3 * iv);
+        base = gb.Next(base, false, 0, 5000 + 4 * iv, 0, iv);   // 4th: CPU time as it is, drawn a fifth of the way from the grid
+        CHECK(base == (5000 + off + 4 * iv) + (5000 + 4 * iv - (5000 + off + 4 * iv)) / 5);
+        // the offset is smoothed
+        gb.Reset();
+        gb.Next(0, true, 1000 + 800, 1000, 0, iv);
+        gb.Next(1000 + 800, true, 1000 + iv + 800 + 80, 1000 + iv, 0, iv);
+        CHECK(Near(gb.offset, 800 + 80.0 / 8));
     }
     if (g_fail)
     {

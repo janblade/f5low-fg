@@ -201,7 +201,7 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     before the GPU finished the game's frame), and the base is read when the pacer thread reaches the batch's first frame (`ResolveBatch`),
     waiting at most two app frame intervals (4..50 ms) for a GPU time that is not there yet. No GPU time (device removed, the wait
     ran out): counted as a miss ("schedule bases" line of the sink statistics, with the lag and how far the GPU stamp trails the Present), and
-    the base is the predicted one (last base + interval, `pacesched::BaseOnMiss`), not the CPU time, which sits a GPU latency off the GPU
+    the base is drawn (`NextBase`) towards the Present's CPU time moved by the smoothed GPU-minus-CPU offset of the GPU-stamped batches (`pacesched::GpuBase`), not the raw CPU time, which sits a GPU latency off the GPU
     stamps and made the base jump there and back; the CPU time is the base only before the first GPU stamp, after a reset, with no
     application queue / `SinkGpuStamps=0`, or after 3 misses in a row. The watcher sleeps until a value is signalled. Precision: the time is a thread's wake-up after the fence completed (tens of microseconds to ~1 ms late), and a
     GPU more than a frame behind stamps several frames at one wake-up (those are late, never early). Lag (`pacesched::Lag`, `MaxLag=`,

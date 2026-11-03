@@ -104,14 +104,40 @@ struct AppStamp
     uint64_t fence = 0;
 };
 
-// The base of a batch (ticks) when the Present's GPU time may not be there. gpu: it is, `s` is it: the usual NextBase. A miss while GPU stamps
-// have been in use (haveGpu: a GPU stamp was used since the last reset and fewer than 4 misses in a row) keeps the predicted base, the last one
-// plus the interval, with no pull towards the CPU time (which sits a GPU latency off the GPU stamps: falling back to it made the base jump there
-// and back). No GPU stamp yet / after a reset / too many misses: the CPU time `s`, as without GPU stamps.
-inline long long BaseOnMiss(long long base, bool gpu, bool haveGpu, long long s, long long lag, long long interval)
+// The base of a batch (ticks) when the Present's GPU time may not be there (sink/sink.h, ResolveBatch). With the GPU time the usual
+// NextBase, and the offset GPU time minus CPU time of the Present is tracked (smoothed by 1/8). A miss (the GPU time did not come in time)
+// is based on the Present's CPU time MOVED BY that offset, through the same NextBase: the CPU time alone sits a GPU latency off the GPU
+// stamps (falling back to it made the base jump there and back, two hitches per miss), and the corrected one stays continuous; it is
+// drawn towards by NextBase, not set to, and after a real pause (more than an interval off) it resets, as every base does. Before the first
+// GPU time, after Reset, and after kMaxMisses misses in a row (the GPU stamps are gone): the CPU time as it is.
+struct GpuBase
 {
-    return !gpu && haveGpu && base ? base + interval : NextBase(base, s, lag, interval);
-}
+    static constexpr unsigned kMaxMisses = 3;
+    bool have = false;
+    double offset = 0;                      // ticks, GPU minus CPU
+    unsigned missRun = 0;
+
+    void Reset() { *this = GpuBase {}; }
+    long long Next(long long base, bool gpu, long long gpuT, long long cpuT, long long lag, long long interval)
+    {
+        if (gpu)
+        {
+            const double cur = static_cast<double>(gpuT - cpuT);
+            offset = have ? offset + (cur - offset) / 8 : cur;
+            have = true;
+            missRun = 0;
+            return NextBase(base, gpuT, lag, interval);
+        }
+        if (have && missRun < kMaxMisses)
+        {
+            ++missRun;
+            return NextBase(base, cpuT + static_cast<long long>(offset), lag, interval);
+        }
+        if (have)
+            ++missRun;
+        return NextBase(base, cpuT, lag, interval);
+    }
+};
 
 // The times the GPU reached the fence values signalled behind the game's Presents (sink/sink.h: a watcher thread takes the time at
 // which the fence's completion event fired, as the own generator's watcher does for appFence, xefg_own.h StartPresenter). Values are
