@@ -103,6 +103,23 @@ inline std::vector<double> g_outTimes;      // QPC ms of each real Present call'
 inline std::vector<double> g_copyGpuMs;     // GPU ms of each staging copy (timestamps around it)
 inline std::vector<std::pair<uint64_t, int>> g_probe;    // SINK_PROBE (harness): frame number, x of the first bright-yellow pixel in row 540 (-1 none)
 
+// How a sink releases a burst (docs/GENERATORS.md, "intel"): by the burst interval it measured, on the own generator's schedule, or the
+// schedule where it is not worse than the burst spacing (per burst size, kAutoMaxBurst; the choice is logged).
+enum class PaceMode { Burst, Schedule, Auto };
+struct PaceCfg
+{
+    PaceMode mode = PaceMode::Burst;
+    bool leadAuto = true;               // PaceLead: automatic, else leadFixedMs (0 = off)
+    double leadFixedMs = 0;
+    bool wideCap = false;               // test: the lead may reach a whole app frame minus one step (n steps), not one step
+    double testLeadMs = 0;              // test: a fixed lead, not clamped to a step (at most two intervals)
+};
+inline constexpr uint32_t kAutoMaxBurst = 2;    // Auto: the schedule only at 2x (A/B 2026-11-03: from 3x the first generated frame of a burst is late and gap sd/pm_sd are worse than the burst spacing)
+inline void (*g_log)(const char* fmt, ...) = nullptr;
+inline std::atomic<double> g_arrSum[8], g_arrMax[8];            // schedule mode: arrival after the app Present, per burst frame j
+inline std::atomic<uint64_t> g_arrN[8], g_lateJ[8];
+inline std::atomic<double> g_lateJSum[8];     // schedule mode: late generated frames per burst frame j, and how late (ms)
+
 // Schedule mode statistics (the harness reads them with the sink's gaps)
 inline std::atomic<uint64_t> g_schedBatches { 0 }, g_schedNoStamp { 0 }, g_schedFrames { 0 }, g_schedLate { 0 }, g_schedStamps { 0 };
 inline double g_leadMin = 1e9, g_leadMax = 0;       // under g_outMu: the frozen lead's range (ms)
@@ -118,6 +135,14 @@ inline void ResetGaps()
     g_copyGpuMs.clear();
     g_probe.clear();
     g_schedBatches = g_schedNoStamp = g_schedFrames = g_schedLate = g_schedStamps = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        g_arrSum[i] = 0;
+        g_arrMax[i] = 0;
+        g_arrN[i] = 0;
+        g_lateJ[i] = 0;
+        g_lateJSum[i] = 0;
+    }
     g_leadMin = 1e9;
     g_leadMax = 0;
 }
@@ -146,6 +171,26 @@ inline std::vector<std::string> StatsLines()
                  static_cast<unsigned long long>(g_schedStamps.load()), static_cast<unsigned long long>(g_schedBatches.load()), static_cast<unsigned long long>(g_schedNoStamp.load()), g_leadMin, g_leadMax,
                  static_cast<unsigned long long>(g_schedLate.load()), static_cast<unsigned long long>(g_schedFrames.load()));
         lines.push_back(buf);
+    }
+    if (g_schedLate)
+    {
+        std::string a = "sink: late generated frames per burst frame j (count, mean ms late):";
+        for (int i = 0; i < 8 && g_arrN[i]; ++i)
+        {
+            snprintf(buf, sizeof(buf), "  j%d %llu (%.2f)", i, static_cast<unsigned long long>(g_lateJ[i].load()), g_lateJ[i] ? g_lateJSum[i].load() / static_cast<double>(g_lateJ[i].load()) : 0.0);
+            a += buf;
+        }
+        lines.push_back(a);
+    }
+    if (g_arrN[0])
+    {
+        std::string a = "sink: arrival after the app Present, mean (max) ms per burst frame j:";
+        for (int i = 0; i < 8 && g_arrN[i]; ++i)
+        {
+            snprintf(buf, sizeof(buf), "  j%d %.2f (%.2f)", i, g_arrSum[i].load() / static_cast<double>(g_arrN[i].load()), g_arrMax[i].load());
+            a += buf;
+        }
+        lines.push_back(a);
     }
     if (g_probe.empty())
         return lines;
@@ -254,15 +299,16 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     std::thread worker;
 
     // Schedule mode (see the top)
-    bool sched = false;
+    PaceCfg cfg;
+    bool sched = false;                 // schedule pacing in effect now (cfg.mode, and for Auto the burst size)
     pacelead::Lead lead;
     pacesched::ReadyInterval ri;
     std::deque<LONGLONG> stamps;        // application Presents not yet matched to a burst
     LONGLONG lastStamp = 0, schedBase = 0;
     uint64_t stampsSeen = 0;
     bool batchValid = false;
-    LONGLONG bBase = 0, bStep = 0, bLead = 0;
-    double bLeadMs = 0, bStepMs = 0;
+    LONGLONG bBase = 0, bStep = 0, bLead = 0, bCap = 0, bStamp = 0;
+    double bLeadMs = 0, bStepMs = 0, bCapMs = 0;
     bool leadOpen = false;              // a batch's lead is waiting for its EndFrame
     double openFrozen = 0, openStep = 0;
 
@@ -287,9 +333,13 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                     ++g_schedNoStamp;
                 const LONGLONG iv = static_cast<LONGLONG>(ri.ms * Freq() / 1000.0);
                 schedBase = pacesched::NextBase(schedBase, s, 0, iv);
+                bStamp = s;
                 bStepMs = ri.ms / static_cast<double>(burst);
                 bStep = static_cast<LONGLONG>(bStepMs * Freq() / 1000.0);
-                bLeadMs = lead.Freeze(bStepMs);
+                // the lead is at most a step (the own generator's rule); wideCap (test): n steps = an app frame minus one step
+                bCapMs = cfg.wideCap ? bStepMs * static_cast<double>(burst - 1) : bStepMs;
+                bCap = static_cast<LONGLONG>(bCapMs * Freq() / 1000.0);
+                bLeadMs = cfg.testLeadMs > 0 ? (std::min)(cfg.testLeadMs, 2.0 * ri.ms) : lead.Freeze(bCapMs);
                 bLead = static_cast<LONGLONG>(bLeadMs * Freq() / 1000.0);
                 bBase = schedBase;
                 batchValid = true;
@@ -309,9 +359,30 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         it.b = burst;
         it.step = bStep;
         it.leadMs = bLeadMs;
-        it.stepMs = bStepMs;
-        it.due = bBase + pacelead::Offset(bLead, bStep, it.j + 1);
+        it.stepMs = bCapMs;             // the lead's cap: EndFrame limits the lead to it
+        it.due = bBase + pacelead::Offset(bLead, bStep, it.j + 1, bCap);
+        if (it.j < 8 && Collect())      // how long after the game's Present each frame of the burst arrives (is Intel's own spacing wider than our step?)
+        {
+            const double off = static_cast<double>(arrived - bStamp) * 1000.0 / Freq();
+            g_arrSum[it.j] = g_arrSum[it.j].load() + off;
+            g_arrMax[it.j] = (std::max)(g_arrMax[it.j].load(), off);
+            ++g_arrN[it.j];
+        }
     }
+
+    // mu held, after the mode or the burst size changed: whether schedule pacing is in effect now (Auto: where it is not worse than the burst spacing)
+    void UpdateSched()
+    {
+        const bool was = sched;
+        sched = burst > 1 && (cfg.mode == PaceMode::Schedule || (cfg.mode == PaceMode::Auto && burst <= kAutoMaxBurst));
+        if (cfg.mode != PaceMode::Burst && burst > 1 && (sched != was || !logged) && g_log)
+        {
+            logged = true;
+            g_log("sink: %u frames per application frame: pacing by %s (%s)", burst, sched ? "the schedule" : "the burst interval",
+                  cfg.mode == PaceMode::Auto ? "auto" : "forced");
+        }
+    }
+    bool logged = false;
 
     void ResetSchedule()        // mu held: a new burst size, a new chain size
     {
@@ -640,6 +711,11 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                     if (leadOpen && lateMs > pacelead::kLateMs)
                     {
                         ++g_schedLate;
+                        if (it.j < 8)
+                        {
+                            ++g_lateJ[it.j];
+                            g_lateJSum[it.j] = g_lateJSum[it.j].load() + lateMs;
+                        }
                         lead.Late(lateMs);
                     }
                 }
@@ -684,6 +760,7 @@ public:
         if (nb == burst)
             return;         // the pacing state (interval, spacing) is only reset by a real change
         burst = nb;
+        UpdateSched();
         ResetSchedule();
         curCount = 0;
         lastFull = false;
@@ -695,27 +772,28 @@ public:
         emptyAt = 0;
     }
 
-    // Schedule mode on / off and the lead rule's setting (PaceLead: automatic, else fixedMs, 0 = off)
-    void SetSchedule(bool on, bool leadAuto, double leadFixedMs)
+    // The pacing mode and the lead rule's setting (PaceLead: automatic, else fixedMs, 0 = off)
+    void SetPace(const PaceCfg& c)
     {
         std::lock_guard<std::mutex> l(mu);
-        sched = on;
-        lead.automatic = leadAuto;
-        lead.fixedMs = leadFixedMs;
+        cfg = c;
+        lead.automatic = c.leadAuto;
+        lead.fixedMs = c.leadFixedMs;
+        UpdateSched();
         ResetSchedule();
     }
     // The game side's Present call at `t` (QPC): the base of the next batch (see the top)
     void AppPresent(LONGLONG t)
     {
         std::lock_guard<std::mutex> l(mu);
-        if (!sched)
+        if (cfg.mode == PaceMode::Burst)
             return;
         if (lastStamp)
             ri.Observe(static_cast<double>(t - lastStamp) * 1000.0 / Freq());
         lastStamp = t;
         ++stampsSeen;
         ++g_schedStamps;
-        if (burst > 1)
+        if (sched)
         {
             stamps.push_back(t);
             if (stamps.size() > 8)
@@ -878,8 +956,7 @@ class SinkFactory final : public scproxy::LogFactory
 {
     SinkSwapChain* last = nullptr;
     const bool stable;
-    bool sched = false, leadAuto = true;    // under g_linkMu: schedule mode (SetSchedule), applied to every chain made
-    double leadFixed = 0;
+    PaceCfg pace;           // under g_linkMu: the pacing mode (SetPace), applied to every chain made
     uint32_t burst = 1;     // under g_linkMu: the frames per application frame set last, so a chain made later starts with it
 
 public:
@@ -900,15 +977,13 @@ public:
         return last != nullptr;
     }
 
-    // Schedule mode for the chains made from now on (and the current one): see the top of this file
-    void SetSchedule(bool on, bool leadAuto_, double leadFixedMs)
+    // The pacing mode for the chains made from now on (and the current one): see the top of this file
+    void SetPace(const PaceCfg& c)
     {
         std::lock_guard<std::mutex> g(g_linkMu);
-        sched = on;
-        leadAuto = leadAuto_;
-        leadFixed = leadFixedMs;
+        pace = c;
         if (last)
-            last->SetSchedule(on, leadAuto_, leadFixedMs);
+            last->SetPace(c);
     }
     // The game's Present call (QPC), for schedule mode
     void AppPresent(LONGLONG t)
@@ -958,7 +1033,7 @@ public:
                 last->owner = nullptr;
             last = sink;
             sink->owner = &last;
-            sink->SetSchedule(sched, leadAuto, leadFixed);
+            sink->SetPace(pace);
             sink->SetBurst(burst);      // a chain made after a SetBurst (a re-created chain) starts with the current burst
         }
         *s = sink;

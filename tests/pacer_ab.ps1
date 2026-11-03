@@ -8,8 +8,11 @@
 #
 # -Gens       own, dlssg, intel. PaceLead (-Configs) acts in the own generator's pacer only; dlssg runs once per cell with `off`.
 #             intel (Intel's libxess_fg from -IntelLib, unlocked to 6x; repro_test gets the libxell next to it) runs once per cell and
-#             -IntelConfigs entry: schedule (the sink releases on the own generator's D3D12 schedule + PaceLead from the stamped game
-#             Presents, F5LOW_SINK_PACE=schedule, the default) and burst (the sink's measured burst interval, F5LOW_SINK_PACE=burst).
+#             -IntelConfigs entry: auto (the default policy: schedule where it is not worse, else burst), schedule (the sink releases on
+#             the own generator's D3D12 schedule + PaceLead from the stamped game Presents, F5LOW_SINK_PACE=schedule), burst (the sink's
+#             measured burst interval, F5LOW_SINK_PACE=burst), wide (schedule, lead cap n steps: F5LOW_TEST_SINK_LEADCAP=wide) and
+#             leadN (schedule, a fixed lead of N ms not clamped to a step: F5LOW_TEST_SINK_LEAD_MS=N). -IntelLib '' sets no
+#             XEFG_CUDA_INTEL_LIBRARY: the DLL then finds libxess_fg and libxell in the folder above it (OptiScaler\plugins\f5low.dll).
 # -Mults      2, 4, 6 (REPRO_INTERP = mult - 1).
 # -Scenarios  steady30, steady60, ramp30-60 (30 -> 60 fps over half the run), hitch50 (60 fps, one 50 ms frame in the middle),
 #             capstep (60 fps, 30 fps from the middle), jitter2 (60 fps, +-2 ms per frame).
@@ -37,7 +40,7 @@ param([Parameter(Mandatory)][string]$Dll,
       [int]$Gate = 0,
       [string]$DlssgPath = '',
       [string]$IntelLib = 'D:\DEV\OptiScaler-NR\_builds\xefg-repro-log20\intel\libxess_fg.dll',
-      [string[]]$IntelConfigs = @('schedule', 'burst'),
+      [string[]]$IntelConfigs = @('auto', 'schedule', 'burst'),
       [string]$Python = 'python',
       [string]$PresentMon = 'H:\Tools\PresentMon\PresentMon-2.6.0-x64.exe',
       [switch]$NoPresentMon,
@@ -81,7 +84,7 @@ function Scenario([string]$name, [int]$s) {
 $clear = 'XEFG_CUDA_PACELEAD', 'REPRO_TIMER1', 'XEFG_CUDA_PACELOG',
          'REPRO_FPS', 'REPRO_RAMP', 'REPRO_HITCH', 'REPRO_CAPSTEP', 'REPRO_JITTER', 'REPRO_ON', 'REPRO_OFF', 'REPRO_INTERP', 'REPRO_FRONT',
          'REPRO_PACELOG', 'REPRO_BAR', 'XEFG_CUDA_LOG', 'XEFG_CUDA_PATH', 'XEFG_CUDA_GATE', 'XEFG_CUDA_PROF', 'F5LOW_GENERATOR',
-         'F5LOW_SINK_STATS', 'SINK_PROBE', 'XEFG_CUDA_DLSSGPATH', 'XEFG_CUDA_INTEL_LIBRARY', 'F5LOW_SINK_PACE', 'F5LOW_INTEL_UNLOCK'
+         'F5LOW_SINK_STATS', 'SINK_PROBE', 'XEFG_CUDA_DLSSGPATH', 'XEFG_CUDA_INTEL_LIBRARY', 'F5LOW_SINK_PACE', 'F5LOW_INTEL_UNLOCK', 'F5LOW_TEST_SINK_LEADCAP', 'F5LOW_TEST_SINK_LEAD_MS'
 
 $runs = @()
 foreach ($g in $Gens) { foreach ($sc in $Scenarios) { foreach ($m in $Mults) {
@@ -101,9 +104,16 @@ foreach ($run in $runs) {
                REPRO_ON = "$($sc.ON)"; REPRO_INTERP = "$($run.Mult - 1)" }
     foreach ($k in $sc.Keys) { if ($k -ne 'ON') { $env_[$k] = $sc[$k] } }
     if ($cfgEnv.ContainsKey($run.Config)) { foreach ($k in $cfgEnv[$run.Config].Keys) { $env_[$k] = $cfgEnv[$run.Config][$k] } }
-    $env_['XEFG_CUDA_INTEL_LIBRARY'] = $IntelLib     # the own generator builds its pack from it too; intel runs it
+    if ($IntelLib) { $env_['XEFG_CUDA_INTEL_LIBRARY'] = $IntelLib }     # the own generator builds its pack from it too; intel runs it
     if ($run.Gen -eq 'intel') {
-        $env_['F5LOW_SINK_STATS'] = '1'; $env_['SINK_PROBE'] = '1'; $env_['F5LOW_SINK_PACE'] = $run.Config
+        $env_['F5LOW_SINK_STATS'] = '1'; $env_['SINK_PROBE'] = '1'
+        switch -Regex ($run.Config) {
+            '^auto$'     { }
+            '^(burst|schedule)$' { $env_['F5LOW_SINK_PACE'] = $run.Config }
+            '^wide$'     { $env_['F5LOW_SINK_PACE'] = 'schedule'; $env_['F5LOW_TEST_SINK_LEADCAP'] = 'wide' }
+            '^lead(\d+(\.\d+)?)$' { $env_['F5LOW_SINK_PACE'] = 'schedule'; $env_['F5LOW_TEST_SINK_LEAD_MS'] = $Matches[1] }
+            default      { throw "unknown intel config $($run.Config)" }
+        }
     }
     if ($run.Gen -eq 'dlssg') {
         $env_['F5LOW_SINK_STATS'] = '1'; $env_['SINK_PROBE'] = '1'
@@ -126,7 +136,7 @@ foreach ($run in $runs) {
         Start-Sleep -Milliseconds 1500
     }
     $reproArgs = @("`"$Dll`"")
-    if ($run.Gen -eq 'intel') { $reproArgs += "`"$(Join-Path (Split-Path -Parent $IntelLib) 'libxell.dll')`"" }     # Intel's library wants an XeLL context
+    if ($run.Gen -eq 'intel') { $reproArgs += "`"$(Join-Path $(if ($IntelLib) { Split-Path -Parent $IntelLib } else { Split-Path -Parent (Split-Path -Parent $Dll) }) 'libxell.dll')`"" }     # Intel's library wants an XeLL context
     $p = Start-Process -FilePath $exe -ArgumentList $reproArgs -PassThru -NoNewWindow -RedirectStandardOutput "$dir\repro.out.txt" -RedirectStandardError "$dir\repro.err.txt"
     if (-not $p.WaitForExit(($Seconds + 150) * 1000)) { $p.Kill(); Write-Warning "$id timed out, killed" }
     $code = if ($p.HasExited) { $p.ExitCode } else { -1 }

@@ -156,7 +156,15 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     `xefgCudaXellCountsRenderedOnly` stays 0.
   - *Sink.* `InitFromSwapChainDesc` hands Intel a `SinkFactory` (spaced mode); `SetEnabled` / `SetNumInterpolatedFrames` set the sink's burst
     (generated + 1; the factory remembers it, so a re-created chain starts with it). `InitFromSwapChain` (a chain the game made) cannot be sunk: the library presents on it itself (logged).
-  - *Pacing.* `F5LOW_SINK_PACE=schedule` (default; `SinkPace=` in f5low.ini) or `burst`. **schedule**: the sink releases a burst on the own
+  - *Pacing policy.* `F5LOW_SINK_PACE=auto` (default; `SinkPace=` in f5low.ini), `schedule` or `burst`. Auto picks per burst size (logged:
+    "N frames per application frame: pacing by ..."): the schedule at 2x, the burst spacing from 3x. Why (harness A/B, 1.3.4.95, RTX 5070 Ti,
+    20 s): at 2x the schedule removes the burst-start jitter (2x/30 gap sd 0.69 -> 0.24, pm_sd 2.0 -> 0.5, late <= 1 %). From 3x the first
+    generated frame of every burst is late (~3 ms, about one late frame per batch, 12-20 % of generated frames at 4x/6x at 60 fps) and gap sd /
+    pm_sd are worse than the burst spacing. A wider lead cap (n steps, lead 13-17 ms; fixed leads 6 and 9 ms) did NOT remove it, and
+    Intel's frames all arrive within ~1.5 ms of the game's Present, so the cause is the first frame's GPU completion behind the whole burst's
+    work, not a short lead. Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
+    arrival offsets and late frames per burst frame j.
+  - *Schedule mode.* **schedule**: the sink releases a burst on the own
     generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
     proxy chain behind a thin wrapper (`xintel::StampChain`; the call is forwarded untouched, every other method passes through; it holds its
     context weakly). This was the least invasive place that sees the game's own Present, and the stamp is the game's own timing, free of

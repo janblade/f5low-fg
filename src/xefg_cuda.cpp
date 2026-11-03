@@ -772,9 +772,23 @@ double MaxDelaySetting()
     return std::isfinite(v) ? std::clamp(v, 0.25, 3.0) : 1.5;
 }
 
-// F5LOW_SINK_PACE (else SinkPace= in f5low.ini): how the intel generator's sink releases a burst. "schedule" (default): on the own
-// generator's D3D12 schedule from the game's stamped Presents, with PaceLead (sink/sink.h); "burst": by the burst interval it measured.
-bool SinkScheduleSetting() { return Setting("F5LOW_SINK_PACE", "SinkPace", "schedule") != "burst"; }
+// F5LOW_SINK_PACE (else SinkPace= in f5low.ini): how the intel generator's sink releases a burst. "auto" (default): the schedule for the
+// burst sizes where it is not worse than the burst spacing (sink/sink.h kAutoMaxBurst), else the burst spacing, the choice logged;
+// "schedule": always on the own generator's D3D12 schedule from the game's stamped Presents, with PaceLead; "burst": always by the burst
+// interval it measured. Tests only: F5LOW_TEST_SINK_LEADCAP=wide (the lead may reach n steps, not one), F5LOW_TEST_SINK_LEAD_MS=<ms> (a
+// fixed lead, not clamped to a step).
+double PaceLeadSetting(bool* autoLead);
+xsink::PaceCfg SinkPaceCfg()
+{
+    xsink::PaceCfg c;
+    const std::string m = Setting("F5LOW_SINK_PACE", "SinkPace", "auto");
+    c.mode = m == "burst" ? xsink::PaceMode::Burst : m == "schedule" ? xsink::PaceMode::Schedule : xsink::PaceMode::Auto;
+    c.leadFixedMs = PaceLeadSetting(&c.leadAuto);
+    c.wideCap = Setting("F5LOW_TEST_SINK_LEADCAP", "SinkLeadCap", "") == "wide";
+    const double t = atof(Setting("F5LOW_TEST_SINK_LEAD_MS", "SinkTestLeadMs", "0").c_str());
+    c.testLeadMs = std::isfinite(t) && t > 0 ? t : 0;
+    return c;
+}
 
 // PaceLog=1 (XEFG_CUDA_PACELOG, else f5low.ini): a record per present in the log when the presenter stops (needs Log=1; tests/pacer_ab.ps1).
 bool PaceFlag(const char* env, const char* key)
@@ -1449,6 +1463,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
     {
         xintel::g_log = XLog;
         xsink::g_stats = xsink::EnvSet("F5LOW_SINK_STATS");     // tests: the sink's statistics into the log
+        xsink::g_log = XLog;
         xefgown::IntelGenerator ig;
         std::string why;
         std::shared_ptr<xintel::Ctx> c;
@@ -1752,10 +1767,9 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
         auto* sf = new xsink::SinkFactory(f4, false);
         f4->Release();
         {
-            bool leadAuto = true;
-            const double leadFixed = PaceLeadSetting(&leadAuto);
-            ic->schedule = SinkScheduleSetting();
-            sf->SetSchedule(ic->schedule, leadAuto, leadFixed);
+            const xsink::PaceCfg pc = SinkPaceCfg();
+            ic->schedule = pc.mode != xsink::PaceMode::Burst;       // the game's Presents are stamped unless the burst spacing is forced
+            sf->SetPace(pc);
         }
         IDXGIFactory2* sf2 = nullptr;
         if (FAILED(sf->QueryInterface(IID_PPV_ARGS(&sf2))))
@@ -1779,7 +1793,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
         ic->sinkFac = sf;
         ic->stampTarget.store(sf);
         ic->ApplyBurst();
-        Log("intel: sink pacing %s", ic->schedule ? "schedule (the game's Presents are stamped, own D3D12 schedule + PaceLead)" : "burst (the sink's measured burst interval)");
+        Log("intel: sink pacing %s", !ic->schedule ? "burst (forced: the sink's measured burst interval)"
+                                      : "auto (the game's Presents are stamped; own D3D12 schedule + PaceLead where it is not worse than the burst spacing) or forced schedule");
         return r;
     }
     if (auto o = FindOwn(h))
