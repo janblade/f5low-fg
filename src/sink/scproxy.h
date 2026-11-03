@@ -3,7 +3,7 @@
 // Hand repro_test a LogFactory (REPRO_LOGSC=1): InitFromSwapChainDesc then creates its swap chain through it and gets a LogSwapChain
 // back, so the library's own use of the real chain is seen, not the application's. Every call is forwarded unchanged; nothing is
 // faked. A QueryInterface for an IID the proxies do not know goes to the real object and is logged as "QI unknown" - from then on
-// that object is no longer logged.
+// that object is no longer logged. One IID is refused instead (RefusedIid): Streamline's "real object" query.
 #pragma once
 #define NOMINMAX
 #include <windows.h>
@@ -22,6 +22,16 @@
 
 namespace scproxy
 {
+// Streamline's "give me the object behind your proxy" IID {ADEC44E2-61F0-45C3-AD9F-1B37379284FF}. OptiScaler (and Streamline itself)
+// ask every swap chain and factory for it to see through Streamline's wrappers. Forwarded to the real object it would hand out the real
+// DXGI chain from behind the sink, and the frames would skip our pacing (A Plague Tale Resonance, intel generator: Intel's frames
+// presented on the real chain, unpaced). The sink is not a Streamline proxy, so the answer is no.
+inline bool RefusedIid(REFIID id)
+{
+    static const GUID kStreamlineRealObject = { 0xadec44e2, 0x61f0, 0x45c3, { 0xad, 0x9f, 0x1b, 0x37, 0x37, 0x92, 0x84, 0xff } };
+    return id == kStreamlineRealObject;
+}
+
 inline std::mutex g_mu;
 inline std::map<std::string, unsigned> g_count;
 inline std::map<std::string, unsigned> g_threads;   // distinct thread ids per method are summed up below
@@ -173,6 +183,11 @@ public:
             return S_OK;
         }
         Log("SC.QueryInterface unknown", "%08lx-%04x-%04x", id.Data1, id.Data2, id.Data3);
+        if (RefusedIid(id))
+        {
+            *o = nullptr;
+            return E_NOINTERFACE;
+        }
         return r->QueryInterface(id, o);
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++rc; }
@@ -294,6 +309,11 @@ public:
             return S_OK;
         }
         Log("F.QueryInterface unknown", "%08lx-%04x-%04x", id.Data1, id.Data2, id.Data3);
+        if (RefusedIid(id))
+        {
+            *o = nullptr;
+            return E_NOINTERFACE;
+        }
         return r->QueryInterface(id, o);
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++rc; }
