@@ -394,6 +394,47 @@ int main()
                    [&](uint32_t x, uint32_t y, int c) { return f11v(f11(x, y, c)); });
     }
 
+    // A new kind at a region offset inside a larger texture (SrcX / SrcY), as the 32-bit depth region above: R16G16_SNORM and R8G8_UNORM
+    {
+        const uint32_t tw = w + 7, th = h + 4, ox = 5, oy = 3;
+        for (uint32_t stride : { 4u, 2u })
+        {
+            const uint32_t kind = stride == 4 ? 7 : 8, sp = pitchFor(tw * stride);
+            std::vector<uint8_t> s(static_cast<size_t>(sp) * th, 0xCD);
+            auto val = [&](uint32_t x, uint32_t y, uint32_t c) -> int32_t {
+                return stride == 4 ? static_cast<int16_t>(hash(x, y, c) & 0xFFFFu) : static_cast<int32_t>(hash(x, y, c) & 0xFFu);
+            };
+            for (uint32_t y = 0; y < th; ++y)
+                for (uint32_t x = 0; x < tw; ++x)
+                {
+                    uint8_t* p = &s[static_cast<size_t>(y) * sp + x * stride];
+                    if (stride == 4)
+                    {
+                        const int16_t v[2] = { static_cast<int16_t>(val(x, y, 0)), static_cast<int16_t>(val(x, y, 1)) };
+                        memcpy(p, v, 4);
+                    }
+                    else
+                    {
+                        p[0] = static_cast<uint8_t>(val(x, y, 0));
+                        p[1] = static_cast<uint8_t>(val(x, y, 1));
+                    }
+                }
+            const auto got = Convert(gpu, s, w, h, sp, kind, stride, dstPitch, ox, oy);
+            int bad = 0;
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                    for (uint32_t c = 0; c < 2; ++c)
+                    {
+                        const int32_t v = val(x + ox, y + oy, c);
+                        const double want = stride == 4 ? std::fmax(v / 32767.0, -1.0) : v / 255.0;
+                        const uint32_t g = got[static_cast<size_t>(y) * w + x];
+                        bad += !HalfNear(static_cast<uint16_t>(c ? g >> 16 : g & 0xFFFF), want);
+                    }
+            printf("%s %s motion at a region offset\n", bad ? "FAIL" : "ok  ", stride == 4 ? "R16G16_SNORM" : "R8G8_UNORM");
+            fails += bad != 0;
+        }
+    }
+
     // ---- The format table (xefg_formats.h), on the host ----
     using xefgown::Take;
     uint32_t kd = 0, st = 0;
@@ -439,6 +480,24 @@ int main()
                xefgown::TexelBytesOf(static_cast<DXGI_FORMAT>(28)) == 4 && xefgown::TexelBytesOf(static_cast<DXGI_FORMAT>(40)) == 4;
     printf("%s format table (xefg_formats.h)\n", tableOk ? "ok  " : "FAIL");
     fails += !tableOk;
+
+    // ---- The refused-state rule (StepInputs): per frame, off at once, back after two usable frames, alternation stays off ----
+    {
+        xefgown::InputsState st;
+        bool ok = true;
+        ok &= !xefgown::StepInputs(st, true, false);    // a usable frame: not refused
+        ok &= xefgown::StepInputs(st, true, true);      // a bad one: refused at once
+        ok &= xefgown::StepInputs(st, true, false);     // one usable frame is not trusted yet
+        ok &= xefgown::StepInputs(st, false, false);    // a frame without tags changes nothing
+        ok &= !xefgown::StepInputs(st, true, false);    // the second usable frame: back
+        ok &= xefgown::StepInputs(st, true, true);
+        for (int i = 0; i < 6; ++i)                     // alternating bad / usable frames: refused throughout (no flipping)
+        {
+            ok &= xefgown::StepInputs(st, true, i % 2 != 0 ? false : true);
+        }
+        printf("%s refused-state rule (StepInputs)\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails ? 1 : 0;
 }

@@ -311,7 +311,8 @@ integer format holds -8 (or 8 with scale -1). Run: `F5LOW_GENERATOR=intel XEFG_C
 REPRO_BAR=1 REPRO_OFF=60 REPRO_ON=200 REPRO_INTERP=2 REPRO_HIST=1 REPRO_LOGLEVEL=0 F5LOW_SINK_STATS=1 SINK_PROBE=1 XEFG_CUDA_LOG=1
 repro_test.exe f5low.dll libxell.dll` (no PresentMon). What it records: Intel's `TagFrameResource` result, everything its logging
 callback says at debug level, `GetLastPresentStatus` (frames presented, generation on) and the sink probe's steps between the shown
-frames: 4 px per shown frame everywhere in the plain run (R16G16_FLOAT), so any other step list means the generated frames sit in
+frames: 4 px per shown frame everywhere in the baseline run (repro_test's own inputs: motion R16G16_TYPELESS (33) holding half floats,
+depth R32G8X24_TYPELESS (19)), so any other step list means the generated frames sit in
 the wrong place. `REPRO_NOFILL=1` makes a texture in any format number and never fills it: what the tag accepts, no picture.
 
 *What Intel does.* It never refuses a format: `TagFrameResource` returned 0 for every one below (also BC1, sRGB, B8G8R8A8 as motion; integer
@@ -355,7 +356,8 @@ DXGI format 36 (R16G16_UINT) are not supported - no frames generated while they 
 region does not fit the pack), `TagFrameResource` still returns success (as Intel's does for everything), the present reports
 `framesPresented` 1 and `isFrameGenEnabled` 0, and XeLL is told `SetFgEnabled(0)` until a tag it can use arrives (then on again; the
 log says so). Pacing is not touched. Run `tests\format_check.ps1 -IntelLib <libxess_fg.dll>` (GPU) to check all of this: the generated frame of
-every taken format is bit for bit the R16G16_FLOAT one.
+every taken format is bit for bit the baseline's (motion R16G16_TYPELESS, depth R32G8X24_TYPELESS); a frame's tags decide once per frame at
+Present, a refused state ends after two usable frames, and the warning is logged once per format change (`StepInputs` in `src\xefg_formats.h`).
 
 ## Exports that are not Intel's API
 

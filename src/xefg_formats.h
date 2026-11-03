@@ -86,6 +86,32 @@ inline Take DepthTake(DXGI_FORMAT f, uint32_t& kind, uint32_t& stride)
     }
 }
 
+// Whether the motion vectors / depth the application tags can be used, decided once per frame at Present (not per tag: a frame may tag
+// twice, and alternating good and bad tags must not flip XeLL's frame generation on and off every frame). `tagged`: the frame tagged
+// motion or depth at all; `bad`: one of them was tagged and none of that kind was taken. A bad frame refuses at once; a refused state
+// ends after kGoodFramesToRecover frames with tags that were all usable (the rule of lastUsable: one good frame is not trusted), frames
+// without tags change nothing. Returns whether the inputs are refused after this frame.
+inline constexpr int kGoodFramesToRecover = 2;
+struct InputsState
+{
+    bool refused = false;
+    int good = 0;
+};
+inline bool StepInputs(InputsState& s, bool tagged, bool bad)
+{
+    if (bad)
+    {
+        s.refused = true;
+        s.good = 0;
+    }
+    else if (tagged && s.refused && ++s.good >= kGoodFramesToRecover)
+    {
+        s.refused = false;
+        s.good = 0;
+    }
+    return s.refused;
+}
+
 // The name of a format in a log line (the ones a motion vector or depth texture can plausibly be, else the number alone).
 inline const char* FormatName(DXGI_FORMAT f)
 {
