@@ -1167,6 +1167,40 @@ __declspec(dllexport) uint32_t xefgCudaXellCountsRenderedOnly()
     return g_dlssg.empty() ? 0u : 1u;
 }
 
+// Not Intel's API: for OptiScaler, right after it loads this DLL when the generator is DLSS-G. Loads OUR private nvngx_dlssg.dll before the
+// game's Streamline asks NGX for DLSS-G (NGX marks DLSS-G unavailable process-wide when the only copies it can find are blocked).
+// Resolves the Streamline folder as the generator does, makes/refreshes plugins\f5low_streamline, loads our nvngx_dlssg by full path and
+// keeps the handle. No slInit, no D3D. May run under the loader lock: only file I/O and LoadLibrary here, no threads, no COM, no waits on
+// other threads. Idempotent, thread-safe. Returns 1 when our copy is loaded (or already was), 0 on failure (logged), also when a foreign
+// nvngx_dlssg is already in the process (unless F5LOW_DLSSG_ALLOW_FOREIGN=1). The context-time load reuses the same handle.
+extern "C" __declspec(dllexport) uint32_t __cdecl f5lowPrepareDlssg()
+{
+    static std::mutex mu;
+    static bool done = false;
+    static uint32_t result = 0;
+    std::lock_guard<std::mutex> lk(mu);
+    if (done && result)
+        return result;
+    done = true;
+    xdlssg::g_log = XLog;
+    xdlssg::g_allowForeignNgx = unlock::EnvIsOne("F5LOW_DLSSG_ALLOW_FOREIGN");
+    const xdlssg::Source src = xdlssg::Prepare(g_dir, StreamlineDirEnv(), DlssgPathSetting());
+    if (!src.ok)
+    {
+        Log("dlssg: prepare: %s", src.why.c_str());
+        return result = 0;
+    }
+    Log("dlssg: prepare: %s", src.how.c_str());
+    std::wstring ownPath;
+    std::string why;
+    if (!xdlssg::PreloadOwnNgx(src.dir, ownPath, why))
+    {
+        Log("dlssg: prepare: %s", why.c_str());
+        return result = 0;
+    }
+    return result = 1;
+}
+
 // A foreign nvngx_dlssg found after the context exists (dlssg.h Ctx::NgxCheck): frame generation is off, f5lowGetStatus says 3 with the reason
 static const bool g_ngxRefusedHook = (xdlssg::g_onRefused = [](const std::string& why) { SetStatus(3, "dlssg unavailable: " + why); }, true);
 
