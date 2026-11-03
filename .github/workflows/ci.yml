@@ -92,5 +92,13 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_dlssg_own_test.ps1 -VsPath $vs
 
+      # The motion / depth format conversion (src/xefg_convert.hlsl, every kind against exact values) on WARP and the format table
+      # (src/xefg_formats.h): no NVIDIA GPU, no pack
+      - name: Format conversion test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./scripts/build_convert_test.ps1 -VsPath $vs
+
       - name: Audit the DLL (only what we compile in)
         run: python tools/audit.py --dll build/f5low.dll
