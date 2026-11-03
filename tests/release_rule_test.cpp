@@ -31,15 +31,15 @@ int main()
     // paced modes: V-Sync-less presents are paced, display-paced ones go out on arrival
     for (PaceMode m : { PaceMode::Burst, PaceMode::Schedule, PaceMode::Auto })
     {
-        CHECK(ReleaseRule(0, 0, m) == Release::Paced);
-        CHECK(ReleaseRule(0, tear, m) == Release::Paced);
-        CHECK(ReleaseRule(1, 0, m) == Release::OnArrivalDisplay);
-        CHECK(ReleaseRule(0, other, m) == Release::OnArrivalDisplay);
+        CHECK(ReleaseRule(0, 0, m) == ReleaseKind::Paced);
+        CHECK(ReleaseRule(0, tear, m) == ReleaseKind::Paced);
+        CHECK(ReleaseRule(1, 0, m) == ReleaseKind::OnArrivalDisplay);
+        CHECK(ReleaseRule(0, other, m) == ReleaseKind::OnArrivalDisplay);
     }
     // off: everything on arrival
-    CHECK(ReleaseRule(0, 0, PaceMode::Off) == Release::OnArrivalOff);
-    CHECK(ReleaseRule(0, tear, PaceMode::Off) == Release::OnArrivalOff);
-    CHECK(ReleaseRule(1, 0, PaceMode::Off) == Release::OnArrivalOff);
+    CHECK(ReleaseRule(0, 0, PaceMode::Off) == ReleaseKind::OnArrivalOff);
+    CHECK(ReleaseRule(0, tear, PaceMode::Off) == ReleaseKind::OnArrivalOff);
+    CHECK(ReleaseRule(1, 0, PaceMode::Off) == ReleaseKind::OnArrivalOff);
     if (g_fail)
         printf("%d checks failed\n", g_fail);
     else

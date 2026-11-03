@@ -25,16 +25,16 @@ inline constexpr bool DisplayPaced(uint32_t sync, uint32_t flags)
     return sync != 0 || (flags & ~kPresentAllowTearing) != 0;
 }
 
-enum class Release
+enum class ReleaseKind
 {
     Paced,              // the burst spacing or the schedule times it
     OnArrivalOff,       // SinkPace=off
     OnArrivalDisplay,   // the display paces this present (V-Sync / non-tearing flags)
 };
-inline constexpr Release ReleaseRule(uint32_t sync, uint32_t flags, PaceMode mode)
+inline constexpr ReleaseKind ReleaseRule(uint32_t sync, uint32_t flags, PaceMode mode)
 {
     if (mode == PaceMode::Off)
-        return Release::OnArrivalOff;
-    return DisplayPaced(sync, flags) ? Release::OnArrivalDisplay : Release::Paced;
+        return ReleaseKind::OnArrivalOff;
+    return DisplayPaced(sync, flags) ? ReleaseKind::OnArrivalDisplay : ReleaseKind::Paced;
 }
 } // namespace xsink

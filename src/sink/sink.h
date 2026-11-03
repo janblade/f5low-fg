@@ -416,8 +416,8 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     // measured on a different stream (frames missing from the bursts) and must be learned again.
     bool NoteRelease(UINT sync, UINT flags)
     {
-        const Release rel = ReleaseRule(sync, flags, cfg.mode);
-        const bool dp = rel == Release::OnArrivalDisplay;
+        const ReleaseKind rel = ReleaseRule(sync, flags, cfg.mode);
+        const bool dp = rel == ReleaseKind::OnArrivalDisplay;
         if (dp != displayPaced)
         {
             displayPaced = dp;
@@ -438,7 +438,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                     ++dpLogSkipped;
             }
         }
-        return rel != Release::Paced;
+        return rel != ReleaseKind::Paced;
     }
 
     void ResetBurstState()      // mu held: forget the measured burst interval and spacing (a new burst size, or the stream changed)
