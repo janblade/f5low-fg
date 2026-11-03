@@ -340,6 +340,10 @@ inline Streamline* GetLocked(const std::wstring& dir, int gpuSm, ID3D12Device* d
 
 class Ctx;
 uint32_t BeforePresent(Ctx& c);      // below: the frame's id for the markers; DLSS-G off for a frame without inputs
+// The sink's pace config (SinkPace= / F5LOW_SINK_PACE; set by xefg_cuda.cpp, which owns the setting). Null: the sink's default.
+inline xsink::PaceCfg (*g_paceCfg)() = nullptr;
+// Stamps the game's Present for the sink's schedule (a no-op when the schedule is off or the chain is not on our sink)
+void StampAppPresent(Ctx& c, UINT flags);
 
 // What the game presents on: Streamline's chain (over our sink), with DLSS-G's present markers around each Present. Holds its
 // context weakly: the game may keep the chain after Destroy (then it presents plainly).
@@ -348,13 +352,14 @@ class MarkerChain final : public scproxy::LogSwapChain
     Streamline* sl;
     std::weak_ptr<Ctx> ctx;
 
-    template <class F> HRESULT Marked(F present)
+    template <class F> HRESULT Marked(UINT flags, F present)
     {
         std::shared_ptr<Ctx> c = ctx.lock();
         if (!c)
             return present();
         sl::FrameToken* t = sl->Token(BeforePresent(*c));
         sl->marker(sl::PCLMarker::ePresentStart, *t);
+        StampAppPresent(*c, flags);      // before the real Present, as Intel's StampChain does
         const HRESULT h = present();
         sl->marker(sl::PCLMarker::ePresentEnd, *t);
         return h;
@@ -364,11 +369,11 @@ public:
     MarkerChain(IDXGISwapChain4* slChain, Streamline* s, std::weak_ptr<Ctx> c) : scproxy::LogSwapChain(slChain), sl(s), ctx(std::move(c)) {}
     HRESULT STDMETHODCALLTYPE Present(UINT si, UINT fl) override
     {
-        return Marked([&] { return r->Present(si, fl); });
+        return Marked(fl, [&] { return r->Present(si, fl); });
     }
     HRESULT STDMETHODCALLTYPE Present1(UINT si, UINT fl, const DXGI_PRESENT_PARAMETERS* p) override
     {
-        return Marked([&] { return r->Present1(si, fl, p); });
+        return Marked(fl, [&] { return r->Present1(si, fl, p); });
     }
 };
 
@@ -446,7 +451,8 @@ public:
     Streamline* sl = nullptr;
     ID3D12Device* dev = nullptr;                // the game's (not referenced; the context goes before the device)
     std::mutex mu;
-    xsink::SinkFactory* sinkFac = nullptr;      // our reference
+    xsink::SinkFactory* sinkFac = nullptr;      // our reference; only released/replaced under mu (InitFromDesc, ~Ctx), so alive where mu is held
+    bool schedule = false;                      // under mu: the sink releases on the schedule (SinkPace), so the game's Presents are stamped
     MarkerChain* chain = nullptr;               // our reference; the game gets its own through GetSwapChainPtr
     std::atomic<uint32_t> frameId { 0 };
     bool enabled = false;
@@ -558,8 +564,14 @@ public:
             return XEFG_SWAPCHAIN_RESULT_ERROR_DXGI_INVALID_CALL;
         }
         sc1->Release();
-        if (!sf->HasSink() && g_log)
+        const bool onSink = sf->HasSink();
+        if (!onSink && g_log)
             g_log("dlssg: Streamline's chain is not on our sink - DLSS-G paces its own frames");
+        // The same pacing config the intel generator's sink gets: the game's Presents are stamped unless the burst spacing is forced.
+        // Not on our sink: nothing to pace, nothing to stamp.
+        const xsink::PaceCfg pc = g_paceCfg ? g_paceCfg() : xsink::PaceCfg {};
+        schedule = onSink && pc.mode != xsink::PaceMode::Burst;
+        sf->SetPace(pc);
         if (chain)
             chain->Release();
         if (sinkFac)
@@ -579,7 +591,9 @@ public:
         {
             g_log("dlssg: swap chain %ux%u fmt=%d buffers=%u flags=0x%x, DLSS-G makes up to %u, frames go through our sink", d->Width, d->Height,
                   static_cast<int>(d->Format), d->BufferCount, dd.Flags, maxGen);
-            g_log("dlssg: DLSS-G paces its own frames (host pacer handed over)");
+            g_log("dlssg: DLSS-G makes the frames, our sink paces them: %s", !onSink ? "not on our sink, DLSS-G paces its own"
+                  : schedule ? "auto (the game's Presents are stamped; the schedule where it is not worse than the burst spacing) or forced schedule"
+                             : "burst spacing (forced by SinkPace)");
         }
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
@@ -783,6 +797,17 @@ inline uint32_t BeforePresent(Ctx& c)
         c.Apply(false);
     c.inputsThisFrame = false;
     return c.frameId.load();
+}
+
+// The game's Present, stamped for the sink's schedule. mu is taken (briefly, and not while BeforePresent / Constants / Tag hold it:
+// the caller holds no lock) because sinkFac is only released or replaced under it; AppPresent itself only takes the sink's own locks.
+inline void StampAppPresent(Ctx& c, UINT flags)
+{
+    if (flags & DXGI_PRESENT_TEST)      // a test present shows nothing: no stamp, no interval sample
+        return;
+    std::lock_guard<std::mutex> lk(c.mu);
+    if (c.schedule && c.sinkFac)
+        c.sinkFac->AppPresent(xsink::Now());
 }
 
 // A DLSS-G context for `dev`, or null with the reason in `why`.

@@ -25,7 +25,7 @@
 // Present returned (not by counting frames): a game in a menu stops tagging and the library then presents one frame per application
 // frame with frame generation still on (Cyberpunk); such short bursts go out as they arrive too and do not steer the pace.
 //
-// Schedule mode (Generator=intel, F5LOW_SINK_PACE=schedule): instead of spacing a burst by its smoothed burst interval, the frames are
+// Schedule mode (Generator=intel or dlssg, F5LOW_SINK_PACE=schedule): instead of spacing a burst by its smoothed burst interval, the frames are
 // released on the own generator's D3D12 schedule (pace_sched.h, pace_lead.h): the game side stamps every application Present
 // (AppPresent), the stamps give the smoothed interval and each batch's base; frame j of a batch (generated 1..n, then the real one) goes out
 // at base + pacelead::Offset(lead, step, j + 1), the lead frozen per batch and raised by generated frames whose staging copy was still

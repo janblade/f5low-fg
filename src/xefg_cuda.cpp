@@ -1276,6 +1276,7 @@ extern "C" __declspec(dllexport) uint32_t __cdecl f5lowPrepareDlssg()
         return result;
     done = true;
     xdlssg::g_log = XLog;
+    xdlssg::g_paceCfg = SinkPaceCfg;
     xdlssg::g_allowForeignNgx = unlock::EnvIsOne("F5LOW_DLSSG_ALLOW_FOREIGN");
     const xdlssg::Source src = xdlssg::Prepare(g_dir, StreamlineDirEnv(), DlssgPathSetting());
     if (!src.ok)
