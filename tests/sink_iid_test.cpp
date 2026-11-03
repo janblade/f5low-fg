@@ -39,6 +39,25 @@ int main()
     CHECK(sc.QueryInterface(__uuidof(IDXGISwapChain4), &o4) == S_OK);
     CHECK(o4 == static_cast<IDXGISwapChain4*>(&sc));
 
+    // The factory wrapper too (around a real DXGI factory: no GPU needed). A real factory answers E_NOINTERFACE as well, so only
+    // the wrapper's own refusal is tested here: *o must be null and the wrapper's own interface must still be its own.
+    IDXGIFactory4* real = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&real))))
+    {
+        auto* f = new scproxy::LogFactory(real);
+        void* fo = reinterpret_cast<void*>(1);
+        CHECK(f->QueryInterface(sl, &fo) == E_NOINTERFACE);
+        CHECK(fo == nullptr);
+        void* f4 = nullptr;
+        CHECK(f->QueryInterface(__uuidof(IDXGIFactory4), &f4) == S_OK);
+        CHECK(f4 == static_cast<IDXGIFactory4*>(f));
+        static_cast<IDXGIFactory4*>(f4)->Release();
+        f->Release();
+        real->Release();
+    }
+    else
+        printf("sink_iid_test: no DXGI factory here, factory check skipped\n");
+
     if (g_fail)
     {
         printf("sink_iid_test: %d FAILED\n", g_fail);
