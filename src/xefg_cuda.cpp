@@ -776,15 +776,26 @@ double MaxDelaySetting()
 // F5LOW_SINK_PACE (else SinkPace= in f5low.ini): how the intel generator's sink releases a burst. "auto" (default): the schedule for the
 // burst sizes where it is not worse than the burst spacing (sink/sink.h kAutoMaxBurst), else the burst spacing, the choice logged;
 // "schedule": always on the own generator's D3D12 schedule from the game's stamped Presents, with PaceLead; "burst": always by the burst
-// interval it measured. Tests only: F5LOW_TEST_SINK_LEADCAP=wide (the lead may reach n steps, not one), F5LOW_TEST_SINK_LEAD_MS=<ms> (a
+// interval it measured; "off": pass-through, every frame goes out on arrival (after its copy), no burst spacing, no schedule, no stamps (an A/B
+// switch: on RTX 40/50 DLSS-G meters its own flips through the driver, so `off` lets that pace them). In every mode a present with V-Sync (sync
+// interval > 0) or flags other than tearing is display-paced and goes out on arrival (sink/release_rule.h). Tests only: F5LOW_TEST_SINK_LEADCAP=wide (the lead may reach n steps, not one), F5LOW_TEST_SINK_LEAD_MS=<ms> (a
 // fixed lead, not clamped to a step).
+// In schedule mode the sink bases each batch on the moment the application's frame was done on the GPU (a fence signalled behind its
+// Present), as the own generator does, not on the CPU time of the Present: SinkGpuStamps=0 (F5LOW_SINK_GPUSTAMPS=0) takes the CPU
+// times (the A/B switch). The schedule also runs behind the GPU timeline by as much as generated frames came out late, at most MaxLag
+// app frames (MaxLag=, XEFG_CUDA_MAXLAG, default 0.5, 0 = none; the same setting as the own generator's).
 double PaceLeadSetting(bool* autoLead);
 xsink::PaceCfg SinkPaceCfg()
 {
     xsink::PaceCfg c;
     const std::string m = Setting("F5LOW_SINK_PACE", "SinkPace", "auto");
-    c.mode = m == "burst" ? xsink::PaceMode::Burst : m == "schedule" ? xsink::PaceMode::Schedule : xsink::PaceMode::Auto;
+    c.mode = m == "burst" ? xsink::PaceMode::Burst : m == "schedule" ? xsink::PaceMode::Schedule : m == "off" ? xsink::PaceMode::Off : xsink::PaceMode::Auto;
     c.leadFixedMs = PaceLeadSetting(&c.leadAuto);
+    c.maxLag = MaxLagSetting();
+    {
+        const std::string g = Setting("F5LOW_SINK_GPUSTAMPS", "SinkGpuStamps", "1");
+        c.gpuStamps = g != "0" && g != "off" && g != "false" && g != "no";
+    }
     // Test switches: environment only, never the ini (a stray ini line must not change a player's pacing)
     char tv[32] = {};
     c.wideCap = GetEnvironmentVariableA("F5LOW_TEST_SINK_LEADCAP", tv, sizeof(tv)) > 0 && !strcmp(tv, "wide");
@@ -1295,6 +1306,8 @@ extern "C" __declspec(dllexport) uint32_t __cdecl f5lowPrepareDlssg()
 }
 
 // A foreign nvngx_dlssg found after the context exists (dlssg.h Ctx::NgxCheck): frame generation is off, f5lowGetStatus says 3 with the reason
+// The sink's pace config for the dlssg generator, set at load (f5lowPrepareDlssg may never run: older OptiScaler, a harness)
+static const bool g_paceCfgHook = (xdlssg::g_paceCfg = SinkPaceCfg, true);
 static const bool g_ngxRefusedHook = (xdlssg::g_onRefused = [](const std::string& why) { SetStatus(3, "dlssg unavailable: " + why); }, true);
 
 // Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask once, when they load the library).
@@ -1502,7 +1515,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             }
             SetStatus(1, "dlssg generator (DLSS-G through a private Streamline copy, up to " + std::to_string(dg.Caps().maxGenerated) + " generated), D3D12");
             Log("f5low: generator dlssg (%s)", dg.Caps().name);
-            Log("D3D12CreateContext device=%p -> Generator=dlssg: DLSS-G h=%p, Streamline from %S, DLSS-G paces its own frames", static_cast<void*>(d),
+            Log("D3D12CreateContext device=%p -> Generator=dlssg: DLSS-G h=%p, Streamline from %S, DLSS-G makes the frames, our sink paces them (SinkPace)", static_cast<void*>(d),
                 static_cast<void*>(*ph), c->sl->dir.c_str());
             return XEFG_SWAPCHAIN_RESULT_SUCCESS;
         }
@@ -1823,9 +1836,16 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
             return XEFG_SWAPCHAIN_RESULT_ERROR_INVALID_ARGUMENT;
         auto* sf = new xsink::SinkFactory(f4, false);
         f4->Release();
+        sf->SetStampQueue(q);       // the application's queue (Intel presents on a queue of its own): the sink's GPU stamps are signalled on it
         {
-            const xsink::PaceCfg pc = SinkPaceCfg();
-            ic->schedule = pc.mode != xsink::PaceMode::Burst;       // the game's Presents are stamped unless the burst spacing is forced
+            xsink::PaceCfg pc = SinkPaceCfg();
+            if (pc.mode == xsink::PaceMode::Off)
+            {
+                // Off is for dlssg (DLSS-G's own flip metering paces there); Intel presents its bursts back to back and has nothing that spaces them
+                pc.mode = xsink::PaceMode::Burst;
+                Log("intel: SinkPace=off is for dlssg: intel uses burst spacing");
+            }
+            ic->schedule = pc.mode != xsink::PaceMode::Burst && pc.mode != xsink::PaceMode::Off;       // the game's Presents are stamped unless the burst spacing is forced or the pacing is off
             sf->SetPace(pc);
         }
         IDXGIFactory2* sf2 = nullptr;

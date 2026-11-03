@@ -123,6 +123,108 @@ int main()
         CHECK(pacesched::PickStamp(e, 205, st) && st == 199);   // in step again
         // a TEST present never gets this far: the stamp chain does not stamp it (xintel::StampChain), so no stamp for it exists here
     }
+    // PickStampBy: the same pairing on AppStamp entries, by the CPU time of the Present only - a GPU time never decides it
+    {
+        std::deque<pacesched::AppStamp> s { { 100, 1 }, { 200, 2 }, { 300, 3 } };
+        const auto cpu = [](const pacesched::AppStamp& a) { return a.cpu; };
+        pacesched::AppStamp st;
+        CHECK(pacesched::PickStampBy(s, 250, st, cpu) && st.cpu == 200 && st.fence == 2);
+        CHECK(s.size() == 1 && s.front().fence == 3);
+        CHECK(!pacesched::PickStampBy(s, 250, st, cpu));
+        CHECK(pacesched::PickStampBy(s, 400, st, cpu) && st.fence == 3 && s.empty());
+        // the GPU time of Present 2 (say 260) is later than the burst's arrival (250): the burst still belongs to Present 2
+        pacesched::GpuStampRing g;
+        g.Publish(1, 140);
+        long long t = 0;
+        std::deque<pacesched::AppStamp> p { { 100, 1 }, { 200, 2 }, { 300, 3 } };
+        CHECK(pacesched::PickStampBy(p, 250, st, cpu) && st.fence == 2);
+        CHECK(!g.Get(st.fence, t));                              // its GPU time is not there: the caller uses st.cpu
+        g.Publish(2, 260);
+        CHECK(g.Get(st.fence, t) && t == 260);                   // later: the GPU time is the value (260 > the arrival 250 is fine)
+    }
+    // GpuStampRing: consecutive values, the last 64 kept, 0 = never signalled
+    {
+        pacesched::GpuStampRing g;
+        long long t = 0;
+        CHECK(!g.Get(0, t));
+        CHECK(!g.Get(1, t));
+        g.Publish(1, 1000);
+        g.Publish(2, 2000);
+        CHECK(g.Get(1, t) && t == 1000);
+        CHECK(g.Get(2, t) && t == 2000);
+        CHECK(!g.Get(3, t));
+        g.Publish(2, 9999);                                      // a repeat or an older value changes nothing
+        CHECK(g.Get(2, t) && t == 2000);
+        for (uint64_t v = 3; v <= 100; ++v)
+            g.Publish(v, static_cast<long long>(v) * 1000);
+        CHECK(g.Get(100, t) && t == 100000);
+        CHECK(g.Get(37, t) && t == 37000);                       // 64 back from 100: still there
+        CHECK(!g.Get(36, t));                                    // 65 back: forgotten, the CPU time is used
+        CHECK(!g.Get(101, t));
+    }
+    // Lag: raised at once to scheduled + late (capped at maxLag intervals), falls 2 % per batch, small lates do not count
+    {
+        pacesched::Lag lag;
+        lag.Late(0, 0.3, 16.0, 0.5);                             // under kLagLateMs: nothing
+        CHECK(Near(lag.ms, 0));
+        lag.Late(0, 2.0, 16.0, 0.5);
+        CHECK(Near(lag.ms, 2.0));
+        lag.Late(0, 1.0, 16.0, 0.5);                             // less than the lag now: never lowered by a late frame
+        CHECK(Near(lag.ms, 2.0));
+        lag.Late(2.0, 1.5, 16.0, 0.5);                           // late on top of the lag the batch was scheduled with: 3.5
+        CHECK(Near(lag.ms, 3.5));
+        lag.Late(3.5, 20.0, 16.0, 0.5);                          // capped at half an interval
+        CHECK(Near(lag.ms, 8.0));
+        lag.EndFrame();
+        CHECK(Near(lag.ms, 8.0 * 0.98));
+        for (int i = 0; i < 34; ++i)
+            lag.EndFrame();
+        CHECK(lag.ms < 4.1 && lag.ms > 3.8);                     // about half in ~35 batches
+        pacesched::Lag none;
+        none.Late(0, 5.0, 16.0, 0.0);                            // MaxLag=0: no lag
+        CHECK(Near(none.ms, 0));
+        // the base with a lag: the stamp plus the lag
+        CHECK(pacesched::NextBase(0, 1000, 80, 1600) == 1080);
+    }
+    // GpuBase: GPU stamps track the offset to the CPU time; a miss stays continuous, a pause resets, no GPU stamp yet = CPU time
+    {
+        const long long iv = 1600, off = 700;                   // the GPU stamp trails the CPU time of its Present by 700 ticks
+        pacesched::GpuBase gb;
+        // first: no GPU stamp yet - the CPU time as it is
+        long long base = gb.Next(0, false, 0, 1000, 0, iv);
+        CHECK(base == 1000 && !gb.have);
+        gb.Reset();
+        // first GPU stamp: set anew, offset learned
+        base = gb.Next(0, true, 1000 + off, 1000, 0, iv);
+        CHECK(base == 1000 + off && gb.have && Near(gb.offset, off));
+        // steady state with exact stamps: stays on the grid
+        for (int i = 1; i <= 5; ++i)
+            base = gb.Next(base, true, 1000 + off + i * iv, 1000 + i * iv, 0, iv);
+        CHECK(base == 1000 + off + 5 * iv);
+        // a miss in steady state: the CPU time moved by the offset = the same grid point, no jump (a raw CPU time would be 700 early)
+        const long long miss = gb.Next(base, false, 0, 1000 + 6 * iv, 0, iv);
+        CHECK(miss == 1000 + off + 6 * iv);
+        CHECK(gb.missRun == 1);
+        // a GPU stamp ends the run of misses
+        base = gb.Next(miss, true, 1000 + off + 7 * iv, 1000 + 7 * iv, 0, iv);
+        CHECK(gb.missRun == 0 && base == 1000 + off + 7 * iv);
+        // a miss after a long pause (more than an interval off): reset to the corrected CPU time, not the stale predicted base
+        const long long later = 1000 + 40 * iv;
+        CHECK(gb.Next(base, false, 0, later, 0, iv) == later + off);
+        // three misses in a row keep the offset, the fourth takes the CPU time as it is
+        gb.Reset();
+        base = gb.Next(0, true, 5000 + off, 5000, 0, iv);
+        for (int i = 1; i <= 3; ++i)
+            base = gb.Next(base, false, 0, 5000 + i * iv, 0, iv);
+        CHECK(base == 5000 + off + 3 * iv);
+        base = gb.Next(base, false, 0, 5000 + 4 * iv, 0, iv);   // 4th: CPU time as it is, drawn a fifth of the way from the grid
+        CHECK(base == (5000 + off + 4 * iv) + (5000 + 4 * iv - (5000 + off + 4 * iv)) / 5);
+        // the offset is smoothed
+        gb.Reset();
+        gb.Next(0, true, 1000 + 800, 1000, 0, iv);
+        gb.Next(1000 + 800, true, 1000 + iv + 800 + 80, 1000 + iv, 0, iv);
+        CHECK(Near(gb.offset, 800 + 80.0 / 8));
+    }
     if (g_fail)
     {
         printf("pace_sched_test: %d FAILED\n", g_fail);

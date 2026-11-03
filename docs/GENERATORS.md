@@ -156,7 +156,7 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     `xefgCudaXellCountsRenderedOnly` stays 0.
   - *Sink.* `InitFromSwapChainDesc` hands Intel a `SinkFactory` (spaced mode); `SetEnabled` / `SetNumInterpolatedFrames` set the sink's burst
     (generated + 1; the factory remembers it, so a re-created chain starts with it). `InitFromSwapChain` (a chain the game made) cannot be sunk: the library presents on it itself (logged).
-  - *Pacing policy.* `F5LOW_SINK_PACE=auto` (default; `SinkPace=` in f5low.ini), `schedule` or `burst`. Auto picks per burst size (logged:
+  - *Pacing policy.* `F5LOW_SINK_PACE=auto` (default; `SinkPace=` in f5low.ini), `schedule`, `burst` or `off`. Auto picks per burst size (logged:
     "N frames per application frame: pacing by ..."): the schedule at 2x, the burst spacing from 3x. Why (harness A/B, 1.3.4.95, RTX 5070 Ti,
     20 s): at 2x the schedule removes the burst-start jitter (2x/30 gap sd 0.69 -> 0.24, pm_sd 2.0 -> 0.5, late <= 1 %). From 3x the first
     generated frame of every burst is late (~3 ms, about one late frame per batch, 12-20 % of generated frames at 4x/6x at 60 fps) and gap sd /
@@ -167,6 +167,16 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     the same picture (6x late 11 % / 23 %, gap sd 1.5 against 0.70). Only lead 6 at 4x/60 reaches late ~1 %, with a gap sd still six times
     the burst spacing's. A bigger lead costs latency and, past about one frame time, raises the late share (the frames wait behind the burst). Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
     arrival offsets and late frames per burst frame j.
+  - *Display-paced presents and `off`.* A present with V-Sync (sync interval > 0) or flags other than tearing is paced by the display, and the
+    sink stands aside as the own generator does (`DisplayPaced` in xefg_own.h; `sink/release_rule.h` mirrors it): such a frame goes out as soon
+    as its staging copy is queued, with no wait for a time, and it does not feed the lead rule (never "late"), the burst interval, the spacing
+    or the schedule (no stamps are used while it lasts, and the stamp queue is capped at 8). When the state changes (V-Sync on or off) the
+    burst and schedule state is reset and learned again; one log line per change (`sink: display-paced (V-Sync): frames go out as they come`,
+    at most one per second). `SinkPace=off` does the same for every frame, V-Sync or not: pass-through, no burst spacing, no schedule, no
+    stamps. It is the A/B switch for DLSS-G: on RTX 40/50 DLSS-G sets the driver's flip metering itself, so with `off` the display
+    hardware spaces the flips and our timer is not a second pacer on the same chain. `off` is meant for `dlssg`: for `intel` it is mapped to `burst` (logged), because Intel presents its bursts back to back and nothing else spaces them.
+    A `DXGI_PRESENT_TEST` present is forwarded to the real chain and never queued. A mixed stream (generated frames sync 0, the real frame
+    sync 1) does not flip the state per frame: the new state must hold for burst + 1 frames in a row. Default stays `auto` until a game A/B decides.
   - *Schedule mode.* **schedule**: the sink releases a burst on the own
     generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
     proxy chain behind a thin wrapper (`xintel::StampChain`; the call is forwarded untouched, every other method passes through; it holds its
@@ -180,8 +190,30 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     sooner than half a step after the last (`pacesched::Bound`; no bunching). First frames (fewer than 6 stamps), no wrapper (the game's own
     chain from `InitFromSwapChain`), FG off (burst 1) and a changed burst size or resized chain fall back to / restart from the burst
     spacing; a short burst (a menu) is released on its planned time for frame 0 and as it comes after. dlssg is unchanged (burst spacing).
-    The pieces shared with the own generator are in `src/pace_sched.h` (and `pace_lead.h`). Base: the Present call, not the app frame's GPU-ready
-    stamp as in Own; a late app GPU frame therefore shows up as late generated frames and raises the lead. Only our own GPU wait counts as
+    The pieces shared with the own generator are in `src/pace_sched.h` (and `pace_lead.h`). Base: the app frame's GPU-ready stamp as in Own (`SinkGpuStamps=1`,
+    default; `0` takes the CPU time of the Present for an A/B). `AppPresent` signals a fence of the sink's own on the application's queue (the
+    queue the host gave `InitFromDesc`, passed with `SinkFactory::SetStampQueue`, as Own's `appFence`; NOT the queue the library made its
+    chain with: Intel presents on a queue of its own, where a signal would only mean "Intel finished the frame before"; both queues are
+    logged once per chain, `sink: chain made on library queue ...`; no application queue or another device: CPU stamps, counted; a
+    queue `Signal`, nothing waits on the game's thread) and a
+    watcher thread (as Own's) takes the time the fence completed. The pairing of a burst with a Present stays by the CPU time of the Present
+    (`pacesched::PickStampBy`; a GPU time can be later than the burst's arrival, because the library hands over its first generated frame
+    before the GPU finished the game's frame), and the base is read when the pacer thread reaches the batch's first frame (`ResolveBatch`),
+    waiting at most two app frame intervals (4..50 ms) for a GPU time that is not there yet. No GPU time (device removed, the wait
+    ran out): counted as a miss ("schedule bases" line of the sink statistics, with the lag and how far the GPU stamp trails the Present), and
+    the base is drawn (`NextBase`) towards the Present's CPU time moved by the smoothed GPU-minus-CPU offset of the GPU-stamped batches (`pacesched::GpuBase`), not the raw CPU time, which sits a GPU latency off the GPU
+    stamps and made the base jump there and back; the CPU time is the base only before the first GPU stamp, after a reset, with no
+    application queue / `SinkGpuStamps=0`, or after 3 misses in a row. The watcher sleeps until a value is signalled. Precision: the time is a thread's wake-up after the fence completed (tens of microseconds to ~1 ms late), and a
+    GPU more than a frame behind stamps several frames at one wake-up (those are late, never early). Lag (`pacesched::Lag`, `MaxLag=`,
+    default 0.5 app frames, 0 = none): the base runs behind the GPU stamp by as much as generated frames came out late lately, as Own's
+    `paceLag` (raised at once to the most a frame was late on top of the lag its batch was scheduled with, 0.98 per batch down, capped at
+    MaxLag app frames). Lead and lag: base = stamp + lag, frame j at base + Offset(lead, step, j + 1); the lag moves the batch later, the lead
+    earlier by (step - lead). Own uses the lead on its D3D12 path and the lag on its CUDA path, never both; the sink has both, the lead
+    first and the lag as overflow: a late frame raises the lag only when `PaceLead` is off or the batch's lead was already at its cap (a
+    step), because raising both for one late frame overshot by 1-3 ms. The lag falls 2 % per arriving batch and is reset with the
+    schedule (`MaxLag=0` or `PaceLead=off` take either out). The defaults (`SinkGpuStamps` on, this lag rule) are not game-tested yet: a game
+    A/B is pending. `kAutoMaxBurst` is unchanged: `SinkPace=schedule` at 3x-6x uses
+    the GPU stamps and the lag, the A/B decides whether Auto may follow. Only our own GPU wait counts as
     late for the lead (a frame that arrived after its time is presented on arrival and does not raise it). After a late frame the lead
     stays raised for up to 128 application frames (`pacelead::kWindow`) and eases down by 1/16 per frame, so a menu (short bursts) that
     follows keeps the higher lead's latency for a few seconds. A Present with `DXGI_PRESENT_TEST` is neither stamped nor sampled.
@@ -225,10 +257,11 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     process-wide otherwise). File I/O and LoadLibrary only, safe under the loader lock; returns 1 when loaded, 0 (logged) otherwise. The
     module is NOT unlock-patched there (the RTX 20-40 tier needs the CUDA device behind the game's D3D12 device, known only at context
     time), so on RTX 20-40 the game's own DLSS-G must stay off while F5Low DLSS-G is on.
-  - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G paces its own frames (it presents from a
-    thread of its own, with the driver's flip metering) and the sink queues each present and shows it on the real chain, spacing a full
-    burst by the smoothed burst interval (`SetBurst(n + 1)` from the multiplier). Logged once per context: `dlssg: DLSS-G paces its own
-    frames (host pacer handed over)`.
+  - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G makes the frames (it presents from a
+    thread of its own, with the driver's flip metering) and our sink paces them per `SinkPace` (as for `intel`): the game's Presents
+    are stamped (the thin wrapper chain), and with `auto` the frames go out on the schedule at 2x (`kAutoMaxBurst`) and by the smoothed
+    burst interval above; `schedule` / `burst` force one. `SetBurst(n + 1)` follows what DLSS-G really runs: a frame without inputs is
+    burst 1 (out on arrival). Logged once per context: `dlssg: DLSS-G makes the frames, our sink paces them (SinkPace auto|schedule|burst|off)`.
   - *Latency.* Reflex is required and PCL present markers around the game's `Present` (a thin wrapper chain sets them). The driver
     multiplies a Reflex interval by DLSS-G's multiplier, so a shown-frame cap through Reflex must not be divided again: OptiScaler
     asks `xefgCudaDriverMultipliesReflexCap()` (below). XeLL is not used by this generator.
