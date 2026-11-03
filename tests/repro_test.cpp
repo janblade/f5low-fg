@@ -35,6 +35,19 @@
 //   REPRO_BAR=1    the picture is a bright-yellow bar (120 px wide, full height) moving 12 px per app frame on a dark ground, motion
 //                   vectors (-8, 0) to match: with SINK_PROBE the sink reads row 540 of every frame shown, so the steps between
 //                   shown frames say whether they are in order (docs/GENERATORS.md)
+//   REPRO_MVFMT=n   the motion vectors texture is made in DXGI format n (a number: 34 R16G16_FLOAT, 35 _UNORM, 37 _SNORM, ...) and filled
+//                   in that format, the value encoded for it (normalized / integer formats: the sample times the motion scale the app
+//                   tags in the frame constants gives the same motion as the R16G16_TYPELESS run; printed as "motion format ...")
+//   REPRO_DEPTHFMT=n  the same for the depth texture (D32_FLOAT 40, R32_TYPELESS 39, D24_UNORM_S8_UINT 45, D16_UNORM 55, ...); a
+//                   depth-stencil texture where the format is one (its own proper view needs no more than the flag)
+//   REPRO_MVFMT2=n  halfway through the frames on the motion vectors switch to format n (a new texture, its scale in the frame constants
+//                   with it; not with REPRO_NOIDLE): a refused format and back again shows the DLL telling XeLL generation off and on
+//   REPRO_MVSCALE=n  with REPRO_MVFMT: the magnitude of the motion scale the app tags (default 16 for a normalized format, 1 for the others;
+//                   the sign is chosen by the format). 8 with the bar's -8 px makes the sample exactly 1.0 (every normalized encoding holds it
+//                   exactly), so the run can be compared bit by bit with the R16G16_FLOAT one
+//   REPRO_NOFILL=1  with REPRO_MVFMT / REPRO_DEPTHFMT: any format number, the texture created and tagged but never filled (what a library
+//                   accepts or refuses at the tag; the picture is no use)
+//   REPRO_LOGLEVEL=n  the DLL's logging callback level (0 debug, 1 info, 2 warning = default, 3 error)
 //   REPRO_HIST=1   after every frame with frame generation on, GetLastPresentStatus: a histogram of frames presented per app frame
 //                   and the number of times the window had lost the foreground, printed at the end
 //   REPRO_FPS=n     the app produces n frames per second, not as fast as the GPU lets it
@@ -174,6 +187,180 @@ static int EnvInt(const char* name, int def)
 {
     char v[16] = {};
     return GetEnvironmentVariableA(name, v, sizeof(v)) ? atoi(v) : def;
+}
+
+// ---- REPRO_MVFMT / REPRO_DEPTHFMT: the inputs in another DXGI format -------------------------------------------------------
+// What one texel of a format is made of, to write a value into it the way a shader reading it typed would decode it.
+enum class Enc { None, Float16, Float32, Unorm, Snorm, Uint, Sint, Float11_11_10, Unorm10_10_10_2 };
+struct FmtInfo
+{
+    Enc enc = Enc::None;
+    uint32_t bytes = 0;      // bytes per texel
+    uint32_t chan = 0;       // channels (2 for a motion pair; the rest are written 0)
+    uint32_t bits = 0;       // bits per channel (Unorm / Snorm / Uint / Sint)
+};
+// Colour-type formats a motion vector texture could plausibly have. Typeless ones are written as the float of their size.
+static FmtInfo MotionFmt(int f)
+{
+    switch (f)
+    {
+    case 1: case 2: return { Enc::Float32, 16, 4, 32 };
+    case 3: return { Enc::Uint, 16, 4, 32 };
+    case 4: return { Enc::Sint, 16, 4, 32 };
+    case 5: case 6: return { Enc::Float32, 12, 3, 32 };
+    case 9: case 10: return { Enc::Float16, 8, 4, 16 };
+    case 11: return { Enc::Unorm, 8, 4, 16 };
+    case 12: return { Enc::Uint, 8, 4, 16 };
+    case 13: return { Enc::Snorm, 8, 4, 16 };
+    case 14: return { Enc::Sint, 8, 4, 16 };
+    case 15: case 16: return { Enc::Float32, 8, 2, 32 };
+    case 17: return { Enc::Uint, 8, 2, 32 };
+    case 18: return { Enc::Sint, 8, 2, 32 };
+    case 23: case 24: return { Enc::Unorm10_10_10_2, 4, 3, 10 };
+    case 26: return { Enc::Float11_11_10, 4, 3, 0 };
+    case 27: case 28: return { Enc::Unorm, 4, 4, 8 };
+    case 31: return { Enc::Snorm, 4, 4, 8 };
+    case 33: case 34: return { Enc::Float16, 4, 2, 16 };
+    case 35: return { Enc::Unorm, 4, 2, 16 };
+    case 36: return { Enc::Uint, 4, 2, 16 };
+    case 37: return { Enc::Snorm, 4, 2, 16 };
+    case 38: return { Enc::Sint, 4, 2, 16 };
+    case 41: return { Enc::Float32, 4, 1, 32 };          // one channel: x only (not a usable motion vector; probed to see what is refused)
+    case 54: return { Enc::Float16, 2, 1, 16 };
+    case 61: return { Enc::Unorm, 1, 1, 8 };             // R8_UNORM: x only
+    case 48: case 49: return { Enc::Unorm, 2, 2, 8 };
+    case 50: return { Enc::Uint, 2, 2, 8 };
+    case 51: return { Enc::Snorm, 2, 2, 8 };
+    case 52: return { Enc::Sint, 2, 2, 8 };
+    default: return {};
+    }
+}
+static uint32_t Float32Bits(float f)
+{
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    return x;
+}
+// A non-negative float as the 11-bit (5 exponent, 6 mantissa) unsigned float of R11G11B10_FLOAT.
+static uint32_t SmallFloat(float f, int mantBits)
+{
+    if (f <= 0.0f)
+        return 0;
+    int e;
+    const float m = std::frexp(f, &e);         // f = m * 2^e, m in [0.5, 1)
+    const int exp = e - 1 + 15;
+    if (exp <= 0 || exp >= 31)
+        return 0;
+    const uint32_t mant = static_cast<uint32_t>((m * 2.0f - 1.0f) * static_cast<float>(1 << mantBits) + 0.5f);
+    return (static_cast<uint32_t>(exp) << mantBits) + mant;
+}
+// One channel value v (a real number) in `bits` bits of a normalized / integer encoding.
+static uint32_t EncodeChannel(Enc enc, uint32_t bits, float v)
+{
+    const uint32_t mask = bits >= 32 ? 0xFFFFFFFFu : (1u << bits) - 1u;
+    switch (enc)
+    {
+    case Enc::Unorm: {
+        const float c = v < 0 ? 0 : v > 1 ? 1 : v;
+        return static_cast<uint32_t>(std::llround(static_cast<double>(c) * static_cast<double>(mask))) & mask;
+    }
+    case Enc::Snorm: {
+        const double top = static_cast<double>((1ull << (bits - 1)) - 1ull);
+        const double c = v < -1 ? -1 : v > 1 ? 1 : v;
+        return static_cast<uint32_t>(static_cast<int32_t>(std::llround(c * top))) & mask;
+    }
+    case Enc::Uint: return static_cast<uint32_t>(v < 0 ? 0 : std::llround(v)) & mask;
+    case Enc::Sint: return static_cast<uint32_t>(static_cast<int32_t>(std::llround(v))) & mask;
+    default: return 0;
+    }
+}
+// The motion scale the app tags with a format, so that sample * scale is the motion: a signed or float format holds a negative
+// motion as it is (a normalized one as -0.5 times 16); an unsigned one cannot hold a negative number, so its scale is negative.
+static float MotionScaleFor(const FmtInfo& fi)
+{
+    const bool isSigned = fi.enc == Enc::Float16 || fi.enc == Enc::Float32 || fi.enc == Enc::Snorm || fi.enc == Enc::Sint;
+    const bool norm = fi.enc == Enc::Unorm || fi.enc == Enc::Snorm || fi.enc == Enc::Unorm10_10_10_2;
+    const float s = norm ? 16.0f : 1.0f;
+    return isSigned ? s : -s;
+}
+// The texel for motion (mx, my) with scale (sx, sy): writes fi.bytes bytes.
+static void EncodeMotion(const FmtInfo& fi, float mx, float my, float sx, float sy, uint8_t* t)
+{
+    memset(t, 0, fi.bytes);
+    const float v[2] = { mx / sx, my / sy };
+    switch (fi.enc)
+    {
+    case Enc::Float16:
+        for (uint32_t c = 0; c < fi.chan && c < 2; ++c)
+        {
+            const uint16_t h = Half(v[c]);
+            memcpy(t + c * 2, &h, 2);
+        }
+        break;
+    case Enc::Float32:
+        for (uint32_t c = 0; c < fi.chan && c < 2; ++c)
+        {
+            const uint32_t b = Float32Bits(v[c]);
+            memcpy(t + c * 4, &b, 4);
+        }
+        break;
+    case Enc::Unorm10_10_10_2: {
+        const uint32_t w = EncodeChannel(Enc::Unorm, 10, v[0]) | (EncodeChannel(Enc::Unorm, 10, v[1]) << 10);
+        memcpy(t, &w, 4);
+        break;
+    }
+    case Enc::Float11_11_10: {
+        const uint32_t w = SmallFloat(v[0], 6) | (SmallFloat(v[1], 6) << 11);
+        memcpy(t, &w, 4);
+        break;
+    }
+    default: // Unorm / Snorm / Uint / Sint: 8, 16 or 32 bits per channel
+        for (uint32_t c = 0; c < fi.chan && c < 2; ++c)
+        {
+            const uint32_t b = EncodeChannel(fi.enc, fi.bits, v[c]), n = fi.bits / 8;
+            memcpy(t + c * n, &b, n);
+        }
+    }
+}
+// Depth: bytes per texel of plane 0, how d in [0, 1] is stored, and whether the texture is made a depth-stencil one.
+struct DepthFmt
+{
+    uint32_t bytes = 0;
+    int kind = 0;        // 1 float32, 2 unorm24, 3 unorm16, 4 float16
+    bool ds = false;
+};
+static DepthFmt DepthFor(int f)
+{
+    switch (f)
+    {
+    case 19: case 20: case 39: case 40: return { 4, 1, true };    // R32G8X24_TYPELESS, D32_FLOAT_S8X24_UINT, R32_TYPELESS, D32_FLOAT
+    case 41: return { 4, 1, false };                              // R32_FLOAT
+    case 44: case 45: return { 4, 2, true };                      // R24G8_TYPELESS, D24_UNORM_S8_UINT
+    case 53: case 55: return { 2, 3, true };                      // R16_TYPELESS, D16_UNORM
+    case 56: return { 2, 3, false };                              // R16_UNORM
+    case 54: return { 2, 4, false };                              // R16_FLOAT
+    default: return {};
+    }
+}
+static void EncodeDepth(const DepthFmt& df, float d, uint8_t* t)
+{
+    if (df.kind == 1)
+        memcpy(t, &d, 4);
+    else if (df.kind == 2)
+    {
+        const uint32_t v = static_cast<uint32_t>(d * 16777215.0f + 0.5f) & 0xFFFFFFu;
+        memcpy(t, &v, 4);
+    }
+    else if (df.kind == 3)
+    {
+        const uint16_t v = static_cast<uint16_t>(d * 65535.0f + 0.5f);
+        memcpy(t, &v, 2);
+    }
+    else
+    {
+        const uint16_t v = Half(d);
+        memcpy(t, &v, 2);
+    }
 }
 
 // After a device removal: the command lists the GPU had not finished, with the operations around the last one that
@@ -432,7 +619,7 @@ int main(int argc, char** argv)
         return 0;
     if (!h)
         return 1;
-    xefgSwapChainSetLoggingCallback(h, XEFG_SWAPCHAIN_LOGGING_LEVEL_WARNING, XefgLog, nullptr);
+    xefgSwapChainSetLoggingCallback(h, static_cast<xefg_swapchain_logging_level_t>(EnvInt("REPRO_LOGLEVEL", XEFG_SWAPCHAIN_LOGGING_LEVEL_WARNING)), XefgLog, nullptr);
 
     // XeLL, as OptiScaler hands it over (Intel's library wants it; ours ignores it)
     using PFN_xellD3D12CreateContext = int(__cdecl*)(ID3D12Device*, void**);
@@ -578,21 +765,51 @@ int main(int argc, char** argv)
 
     // The game's inputs: motion R16G16_TYPELESS, depth R32G8X24_TYPELESS (depth-stencil), 1280x720, in
     // PIXEL_SHADER_RESOURCE when tagged
-    ID3D12Resource* mv = Texture(rw, rh, DXGI_FORMAT_R16G16_TYPELESS, D3D12_RESOURCE_FLAG_NONE);
-    ID3D12Resource* depth = Texture(rw, rh, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    // REPRO_MVFMT / REPRO_DEPTHFMT: another DXGI format for either (encoded to give the same motion / depth)
+    const int mvFmtNum = EnvInt("REPRO_MVFMT", 0), depthFmtNum = EnvInt("REPRO_DEPTHFMT", 0);
+    FmtInfo mvFi = mvFmtNum ? MotionFmt(mvFmtNum) : FmtInfo { Enc::Float16, 4, 2, 16 };
+    const DepthFmt depthDf = depthFmtNum ? DepthFor(depthFmtNum) : DepthFmt { 4, 1, true };
+    const bool noFill = EnvInt("REPRO_NOFILL", 0) == 1;
+    if (!noFill && ((mvFmtNum && !mvFi.bytes) || (depthFmtNum && !depthDf.bytes)))
+    {
+        printf("REPRO_MVFMT / REPRO_DEPTHFMT: format %d has no encoder in this test\n", mvFmtNum ? mvFmtNum : depthFmtNum);
+        return 1;
+    }
+    float mvScale = mvFmtNum ? MotionScaleFor(mvFi) : 1.0f;
+    if (const int over = EnvInt("REPRO_MVSCALE", 0); over > 0 && mvFmtNum)
+        mvScale = mvScale < 0 ? -static_cast<float>(over) : static_cast<float>(over);
+    if (mvFmtNum || depthFmtNum)
+        printf("motion format %d (%u bytes, scale %g), depth format %d (%u bytes%s)\n", mvFmtNum ? mvFmtNum : 33, mvFi.bytes, mvScale,
+               depthFmtNum ? depthFmtNum : 19, depthDf.bytes, depthDf.ds ? ", depth-stencil" : "");
+    ID3D12Resource* mv = Texture(rw, rh, mvFmtNum ? static_cast<DXGI_FORMAT>(mvFmtNum) : DXGI_FORMAT_R16G16_TYPELESS, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* depth = Texture(rw, rh, depthFmtNum ? static_cast<DXGI_FORMAT>(depthFmtNum) : DXGI_FORMAT_R32G8X24_TYPELESS,
+                                    depthDf.ds || (noFill && depthFmtNum) ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_NONE);
+    if (!mv || !depth)
+    {
+        printf("the test texture could not be created in that format\n");
+        return 1;
+    }
     ID3D12CommandAllocator* al = nullptr;
     ID3D12GraphicsCommandList* cl = nullptr;
     g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al));
     g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&cl));
     ID3D12CommandList* ls[] = { cl };
-    Fill(cl, mv, 4, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [bar](UINT, UINT, uint8_t* t) {
-        const uint16_t v[2] = { Half(bar ? -8.0f : -4.0f), Half(0.0f) }; // a steady pan, 4 px per frame (REPRO_BAR: 8 render px = the bar's 12 output px)
-        memcpy(t, v, 4);
-    });
-    Fill(cl, depth, 4, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [rw](UINT x, UINT, uint8_t* t) {
-        const float d = 0.1f + 0.8f * static_cast<float>(x) / static_cast<float>(rw);
-        memcpy(t, &d, 4);
-    });
+    if (noFill)
+    {
+        Transition(cl, mv, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Transition(cl, depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    else
+    {
+        Fill(cl, mv, mvFi.bytes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [bar, mvFi, mvScale](UINT, UINT, uint8_t* t) {
+            // a steady pan, 4 px per frame (REPRO_BAR: 8 render px = the bar's 12 output px)
+            EncodeMotion(mvFi, bar ? -8.0f : -4.0f, 0.0f, mvScale, mvScale, t);
+        });
+        Fill(cl, depth, depthDf.bytes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [rw, depthDf](UINT x, UINT, uint8_t* t) {
+            const float d = 0.1f + 0.8f * static_cast<float>(x) / static_cast<float>(rw);
+            EncodeDepth(depthDf, d, t);
+        });
+    }
     cl->Close();
     g_q->ExecuteCommandLists(1, ls);
     Idle();
@@ -606,7 +823,7 @@ int main(int argc, char** argv)
     int failures = 0;
     unsigned hist[16] {};       // REPRO_HIST: app frames by the number of frames presented for them
     xefg_swapchain_frame_constant_data_t fc {};
-    fc.motionVectorScaleX = fc.motionVectorScaleY = 1.0f;
+    fc.motionVectorScaleX = fc.motionVectorScaleY = mvScale;
     fc.frameRenderTime = 8.0f;
     for (int frame = 0; frame < framesOff + framesOn && !failures; ++frame)
     {
@@ -655,6 +872,26 @@ int main(int argc, char** argv)
         ID3D12CommandAllocator* fa = noIdle ? ring[ri] : al;
         fa->Reset();
         cl->Reset(fa, nullptr);
+        if (const int f2 = EnvInt("REPRO_MVFMT2", 0); f2 && !noIdle && frame == framesOff + framesOn / 2)
+        {
+            const FmtInfo fi2 = MotionFmt(f2);
+            if (!fi2.bytes)
+            {
+                printf("REPRO_MVFMT2: format %d has no encoder in this test\n", f2);
+                return 1;
+            }
+            mv->Release();     // the GPU is idle (every frame ends with Idle)
+            mv = Texture(rw, rh, static_cast<DXGI_FORMAT>(f2), D3D12_RESOURCE_FLAG_NONE);
+            mvFi = fi2;
+            mvScale = MotionScaleFor(fi2);
+            if (const int over = EnvInt("REPRO_MVSCALE", 0); over > 0)
+                mvScale = mvScale < 0 ? -static_cast<float>(over) : static_cast<float>(over);
+            fc.motionVectorScaleX = fc.motionVectorScaleY = mvScale;
+            Fill(cl, mv, fi2.bytes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, [bar, fi2, mvScale](UINT, UINT, uint8_t* t) {
+                EncodeMotion(fi2, bar ? -8.0f : -4.0f, 0.0f, mvScale, mvScale, t);
+            });
+            printf("frame %d: the motion vectors are now in format %d (scale %g)\n", frame, f2, mvScale);
+        }
         const UINT barX = static_cast<UINT>(frame * 12) % sd.Width;
         Fill(cl, bb, 4, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT, [frame, bar, barX](UINT x, UINT y, uint8_t* t) {
             if (bar)
@@ -689,10 +926,12 @@ int main(int argc, char** argv)
             rd.resourceSize = { rw, rh };
             rd.type = XEFG_SWAPCHAIN_RES_MOTION_VECTOR;
             rd.pResource = mv;
-            xefgSwapChainD3D12TagFrameResource(h, cl, static_cast<uint32_t>(frame), &rd);
+            const int tagMv = xefgSwapChainD3D12TagFrameResource(h, cl, static_cast<uint32_t>(frame), &rd);
             rd.type = XEFG_SWAPCHAIN_RES_DEPTH;
             rd.pResource = depth;
-            xefgSwapChainD3D12TagFrameResource(h, cl, static_cast<uint32_t>(frame), &rd);
+            const int tagDepth = xefgSwapChainD3D12TagFrameResource(h, cl, static_cast<uint32_t>(frame), &rd);
+            if (frame == framesOff || frame == framesOff + 1)
+                printf("frame %d: TagFrameResource motion %d, depth %d\n", frame, tagMv, tagDepth);
             if (timeIt)
                 printf("frame %d: tags took %.2f ms\n", frame, ms(t0));
         };
