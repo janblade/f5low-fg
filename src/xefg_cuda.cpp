@@ -37,6 +37,7 @@
 namespace
 {
 HMODULE g_real = nullptr;
+std::atomic<bool> g_realFirstLoad { false };    // f5low's load of the shared library (Real()) was the first one in the process (no other loader had it)
 std::atomic<bool> g_realContext { false };     // a context was made through g_real (the shared library; generators/intel.h asks before it patches)
 FILE* g_log = nullptr;
 std::mutex g_logLock;           // opening and the line count; never held for file I/O after the first open
@@ -784,8 +785,11 @@ xsink::PaceCfg SinkPaceCfg()
     const std::string m = Setting("F5LOW_SINK_PACE", "SinkPace", "auto");
     c.mode = m == "burst" ? xsink::PaceMode::Burst : m == "schedule" ? xsink::PaceMode::Schedule : xsink::PaceMode::Auto;
     c.leadFixedMs = PaceLeadSetting(&c.leadAuto);
-    c.wideCap = Setting("F5LOW_TEST_SINK_LEADCAP", "SinkLeadCap", "") == "wide";
-    const double t = atof(Setting("F5LOW_TEST_SINK_LEAD_MS", "SinkTestLeadMs", "0").c_str());
+    // Test switches: environment only, never the ini (a stray ini line must not change a player's pacing)
+    char tv[32] = {};
+    c.wideCap = GetEnvironmentVariableA("F5LOW_TEST_SINK_LEADCAP", tv, sizeof(tv)) > 0 && !strcmp(tv, "wide");
+    tv[0] = 0;
+    const double t = GetEnvironmentVariableA("F5LOW_TEST_SINK_LEAD_MS", tv, sizeof(tv)) > 0 && GetEnvironmentVariableA("F5LOW_TEST_SINK_LEAD_MS", tv, sizeof(tv)) < sizeof(tv) ? atof(tv) : 0.0;
     c.testLeadMs = std::isfinite(t) && t > 0 ? t : 0;
     return c;
 }
@@ -906,8 +910,11 @@ FARPROC Real(const char* name)
         const char* from = "";
         const std::wstring path = RealLibraryPath(&from);
         // The full path: a libxess_fg.dll the game loaded from its own folder is not taken by name instead
+        // The process' modules before the load: was it ours that brought the library in? (Generator=intel patches it only then.)
+        const std::vector<HMODULE> before = xintel::ProcessModules();
         g_real = LoadLibraryExW(longpath::ExtendIfLong(path).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        Log("real library %S (%s): %p", path.c_str(), from, static_cast<void*>(g_real));
+        g_realFirstLoad = g_real && !before.empty() && std::find(before.begin(), before.end(), g_real) == before.end();
+        Log("real library %S (%s): %p%s", path.c_str(), from, static_cast<void*>(g_real), g_realFirstLoad ? "" : " (already loaded by someone else, or unknown)");
     });
     FARPROC p = g_real ? GetProcAddress(g_real, name) : nullptr;
     if (!p)
@@ -1187,6 +1194,16 @@ xefg_swapchain_result_t xefgSwapChainDestroy(xefg_swapchain_handle_t h)
     }
     if (auto ic = xintel::Find(h))
     {
+        {
+            // before the library lets go of its chain: no more stamps, and our wrapper chain (a reference on Intel's) goes first
+            std::lock_guard<std::mutex> lk(ic->mu);
+            ic->stampTarget = nullptr;
+            if (ic->stampChain)
+            {
+                ic->stampChain->Release();
+                ic->stampChain = nullptr;
+            }
+        }
         FORWARDH(xefgSwapChainDestroy, h);
         {
             std::lock_guard<std::mutex> lk(xintel::g_ctxMu);
@@ -1469,7 +1486,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         std::shared_ptr<xintel::Ctx> c;
         const char* srcFrom = "";
         const std::wstring srcPath = RealLibraryPath(&srcFrom);     // exactly where the own generator reads libxess_fg from
-        if (xintel::Lib* lib = xintel::Get(srcPath, srcFrom, g_self, g_real, g_realContext.load(), why))
+        if (xintel::Lib* lib = xintel::Get(srcPath, srcFrom, g_self, g_real, g_realFirstLoad.load(), g_realContext.load(), why))
         {
             Log("intel: %s", lib->how.c_str());
             Log("intel: %s", lib->unlockNote.c_str());
@@ -1788,10 +1805,17 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
             return r;
         }
         std::lock_guard<std::mutex> lk(ic->mu);
-        if (ic->sinkFac)
-            ic->sinkFac->Release();
+        // a re-init: the chain the game holds wraps the OLD Intel chain; it is dropped here and made anew at GetSwapChainPtr
+        if (ic->stampChain)
+        {
+            ic->stampChain->Release();
+            ic->stampChain = nullptr;
+        }
+        xsink::SinkFactory* old = ic->sinkFac;
         ic->sinkFac = sf;
-        ic->stampTarget.store(sf);
+        ic->stampTarget = sf;           // the new target first, then the old factory goes
+        if (old)
+            old->Release();
         ic->ApplyBurst();
         Log("intel: sink pacing %s", !ic->schedule ? "burst (forced: the sink's measured burst interval)"
                                       : "auto (the game's Presents are stamped; own D3D12 schedule + PaceLead where it is not worse than the burst spacing) or forced schedule");

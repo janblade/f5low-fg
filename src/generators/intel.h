@@ -74,16 +74,20 @@ inline bool HasExport(const uint8_t* base, size_t size, const char* name)
         const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
         if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
             return false;
+        // the image size the headers claim must fit what is mapped; everything below is read inside it
+        if (nt->OptionalHeader.SizeOfImage == 0 || nt->OptionalHeader.SizeOfImage > size)
+            return false;
+        size = nt->OptionalHeader.SizeOfImage;
         const IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-        if (!dd.VirtualAddress || dd.VirtualAddress + sizeof(IMAGE_EXPORT_DIRECTORY) > size)
+        if (!dd.VirtualAddress || static_cast<size_t>(dd.VirtualAddress) + sizeof(IMAGE_EXPORT_DIRECTORY) > size)
             return false;
         const auto* ex = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dd.VirtualAddress);
         if (ex->AddressOfNames + 4ull * ex->NumberOfNames > size)
             return false;
         const auto* names = reinterpret_cast<const DWORD*>(base + ex->AddressOfNames);
         for (DWORD i = 0; i < ex->NumberOfNames && !found; ++i)
-            if (names[i] < size && strncmp(reinterpret_cast<const char*>(base + names[i]), name, size - names[i]) == 0 &&
-                reinterpret_cast<const char*>(base + names[i])[strlen(name)] == 0)
+            if (static_cast<size_t>(names[i]) + strlen(name) + 1 <= size &&       // the whole name, with its NUL, lies inside the image
+                memcmp(base + names[i], name, strlen(name) + 1) == 0)
                 found = true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -143,9 +147,12 @@ inline Lib g_lib;
 inline std::mutex g_libMu;
 
 // The libxess_fg at `fgPath` (what the own generator reads, `from` says where that came from), once per process. `selfPath`: our own DLL.
-// realModule / realHadContext: the shared library f5low's own forwarding loaded (Real() in xefg_cuda.cpp), and whether a context was ever
-// made through it. Same module with no context made through it: ours, still safe to patch.
-inline Lib* Get(const std::wstring& fgPath, const char* from, const std::wstring& selfPath, HMODULE realModule, bool realHadContext, std::string& why)
+// realModule / realFirstLoad / realHadContext: the shared library f5low's own forwarding loaded (Real() in xefg_cuda.cpp), whether that
+// load was the FIRST one in the process (no other loader had it before), and whether a context was ever made through it. Only the same
+// module, first loaded by us, with no context made through it, counts as ours and is still safe to patch: if another loader had it first
+// (OptiScaler, the game) it may have a live context on the same file.
+inline Lib* Get(const std::wstring& fgPath, const char* from, const std::wstring& selfPath, HMODULE realModule, bool realFirstLoad, bool realHadContext,
+                std::string& why)
 {
     std::lock_guard<std::mutex> lk(g_libMu);
     Lib& l = g_lib;
@@ -174,9 +181,9 @@ inline Lib* Get(const std::wstring& fgPath, const char* from, const std::wstring
             else
             {
                 const bool preloaded = before.empty() || std::find(before.begin(), before.end(), l.fg) != before.end();   // no list: assume the worst
-                const bool oursEarlier = preloaded && l.fg == realModule && !realHadContext;
+                const bool oursEarlier = preloaded && l.fg == realModule && realFirstLoad && !realHadContext;
                 l.how = "libxess_fg from " + xdlssg::Narrow(fgPath) + " (" + from + "), " +
-                        (!preloaded ? "loaded by f5low" : oursEarlier ? "loaded earlier by f5low's own forwarding, no context made through it" : "already loaded in this process");
+                        (!preloaded ? "loaded by f5low" : oursEarlier ? "loaded earlier by f5low's own forwarding (the first load in the process), no context made through it" : "already loaded in this process");
                 if (!UnlockWanted())
                     l.unlockNote = "unlock off (F5LOW_INTEL_UNLOCK): Intel's own maximum";
                 else if (preloaded && !oursEarlier)
@@ -185,7 +192,9 @@ inline Lib* Get(const std::wstring& fgPath, const char* from, const std::wstring
                 else
                 {
                     // libxell: the one in the process (libxess_fg looks it up by that name), else the one next to libxess_fg
-                    l.ll = GetModuleHandleW(L"libxell.dll");
+                    // one step: the lookup and the reference we keep on the module we are about to patch (it is never unloaded, and loaded
+                    // again unpatched, under us); the reference lasts for the life of the process
+                    GetModuleHandleExW(0, L"libxell.dll", &l.ll);
                     std::string llNote = "the libxell.dll already in the process";
                     if (!l.ll)
                     {
@@ -197,12 +206,6 @@ inline Lib* Get(const std::wstring& fgPath, const char* from, const std::wstring
                             l.ll = LoadLibraryExW(longpath::ExtendIfLong(llPath).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
                             llNote = "libxell.dll loaded from " + xdlssg::Narrow(dir) + " (none in the process yet)";
                         }
-                    }
-                    else
-                    {
-                        // a reference of our own on the module we are about to patch: it is never unloaded (and loaded again unpatched) under us
-                        HMODULE keep = nullptr;
-                        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(l.ll), &keep);
                     }
                     if (!l.ll)
                         l.unlockNote = "unlock skipped: no libxell.dll in the process and none next to libxess_fg - Intel's own maximum";
@@ -250,9 +253,9 @@ public:
     uint32_t numInterp = 1;
     uint32_t maxGen = 3;
     unsigned statFrames = 0;
-    bool schedule = false;                      // the sink releases on the schedule (F5LOW_SINK_PACE), so the game's Presents are stamped
-    StampChain* stampChain = nullptr;           // what the game presents on in schedule mode (our reference), made at GetSwapChainPtr
-    std::atomic<xsink::SinkFactory*> stampTarget { nullptr };   // the factory the stamps go to (sinkFac, read without the lock)
+    std::atomic<bool> schedule { false };       // the sink releases on the schedule (F5LOW_SINK_PACE), so the game's Presents are stamped
+    StampChain* stampChain = nullptr;           // what the game presents on in schedule mode (our reference), made at GetSwapChainPtr; under mu
+    xsink::SinkFactory* stampTarget = nullptr;  // the factory the stamps go to (a plain pointer to sinkFac's object, under mu: the chain stamps with mu held)
 
     ~Ctx();
     // Frames per application frame the sink expects (called with mu held; the factory remembers it for a chain made later)
@@ -270,30 +273,36 @@ public:
 class StampChain final : public scproxy::LogSwapChain
 {
     std::weak_ptr<Ctx> ctx;
-    void Stamp()
+    // With the context's lock held: the target is only released/replaced under it (Destroy, a re-init), so it is alive here
+    void Stamp(UINT flags)
     {
+        if (flags & DXGI_PRESENT_TEST)      // a test present shows nothing: no stamp, no interval sample
+            return;
         if (std::shared_ptr<Ctx> c = ctx.lock())
-            if (xsink::SinkFactory* f = c->stampTarget.load())
-                f->AppPresent(xsink::Now());
+        {
+            std::lock_guard<std::mutex> lk(c->mu);
+            if (c->stampTarget)
+                c->stampTarget->AppPresent(xsink::Now());
+        }
     }
 
 public:
     StampChain(IDXGISwapChain4* intelChain, std::weak_ptr<Ctx> c) : scproxy::LogSwapChain(intelChain), ctx(std::move(c)) {}
     HRESULT STDMETHODCALLTYPE Present(UINT si, UINT fl) override
     {
-        Stamp();
+        Stamp(fl);
         return r->Present(si, fl);
     }
     HRESULT STDMETHODCALLTYPE Present1(UINT si, UINT fl, const DXGI_PRESENT_PARAMETERS* p) override
     {
-        Stamp();
+        Stamp(fl);
         return r->Present1(si, fl, p);
     }
 };
 
 inline Ctx::~Ctx()
 {
-    stampTarget.store(nullptr);
+    stampTarget = nullptr;
     if (stampChain)
         stampChain->Release();
     if (sinkFac)

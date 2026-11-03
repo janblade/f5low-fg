@@ -405,17 +405,18 @@ int main(int argc, char** argv)
     LARGE_INTEGER qf, qa, qb;
     QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&qa);
+    // REPRO_PRELOAD=<libxess_fg.dll>: that library is loaded in this process BEFORE CreateContext (a Generator=intel run must then skip its
+    // unlock: the library may already have contexts, see generators/intel.h)
+    if (char pre[1024]; GetEnvironmentVariableA("REPRO_PRELOAD", pre, sizeof(pre)))
+        printf("REPRO_PRELOAD %s: %p\n", pre, static_cast<void*>(LoadLibraryA(pre)));
     // REPRO_FORWARD_FIRST=1: a call on a null handle before CreateContext, which f5low forwards to the shared libxess_fg (loading it): a
-    // Generator=intel run must still unlock (the module is f5low's own, no context was made through it)
+    // Generator=intel run must still unlock (the module is f5low's own, no context was made through it) - but NOT together with REPRO_PRELOAD:
+    // then another loader had the library first and may have contexts on it, the unlock must be skipped (generators/intel.h, Get)
     if (EnvInt("REPRO_FORWARD_FIRST", 0) == 1)
     {
         LOADFN(dll, xefgSwapChainGetPipelineBuildStatus);
         printf("forwarded call before CreateContext: %d\n", xefgSwapChainGetPipelineBuildStatus ? xefgSwapChainGetPipelineBuildStatus(nullptr) : -99);
     }
-    // REPRO_PRELOAD=<libxess_fg.dll>: that library is loaded in this process BEFORE CreateContext (a Generator=intel run must then skip its
-    // unlock: the library may already have contexts, see generators/intel.h)
-    if (char pre[1024]; GetEnvironmentVariableA("REPRO_PRELOAD", pre, sizeof(pre)))
-        printf("REPRO_PRELOAD %s: %p\n", pre, static_cast<void*>(LoadLibraryA(pre)));
     const int createRc = xefgSwapChainD3D12CreateContext(g_dev, &h);
     QueryPerformanceCounter(&qb);
     printf("CreateContext: %d (took %.1f ms on this thread)\n", createRc, 1000.0 * static_cast<double>(qb.QuadPart - qa.QuadPart) / static_cast<double>(qf.QuadPart));
