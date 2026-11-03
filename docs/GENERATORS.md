@@ -329,6 +329,69 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 - Vulkan: the host is D3D12 (D3D11 and Vulkan games reach it through OptiScaler's bridges).
 - Upscaling: generators never upscale; OptiScaler does that before the frame reaches the host.
 
+## Motion and depth formats
+
+Which DXGI formats the tagged motion vectors and depth may have, **measured** against Intel's library (libxess_fg 1.3.4.95 with
+libxell 1.3.2.10, through f5low's `intel` generator), not read from its guide ("R16G16_FLOAT or similar", "any depth format").
+A game log (Enshrouded through OptiScaler's Vulkan bridge) tagged R16G16_SNORM: Intel generated, the own generator
+ignored the tag, generated nothing and still told XeLL "frame generation on" (the game's frame rate fell by about half).
+
+*Probe.* `tests\repro_test.cpp` with `REPRO_MVFMT=<DXGI format number>` / `REPRO_DEPTHFMT=<n>`: the texture is made and filled in
+that format, the value encoded the way a typed read decodes it. The moving bar of `REPRO_BAR=1` has motion -8 px, so the encoded
+sample times the motion scale tagged in the frame constants is -8: floats hold -8 (scale 1), a normalized format holds +-0.5 with
+scale 16 (negative for the unsigned ones, which cannot hold a minus; `REPRO_MVSCALE=8` makes it +-1.0, exact in every encoding), an
+integer format holds -8 (or 8 with scale -1). Run: `F5LOW_GENERATOR=intel XEFG_CUDA_INTEL_LIBRARY=<libxess_fg.dll> REPRO_FRONT=1
+REPRO_BAR=1 REPRO_OFF=60 REPRO_ON=200 REPRO_INTERP=2 REPRO_HIST=1 REPRO_LOGLEVEL=0 F5LOW_SINK_STATS=1 SINK_PROBE=1 XEFG_CUDA_LOG=1
+repro_test.exe f5low.dll libxell.dll` (no PresentMon). What it records: Intel's `TagFrameResource` result, everything its logging
+callback says at debug level, `GetLastPresentStatus` (frames presented, generation on) and the sink probe's steps between the shown
+frames: 4 px per shown frame everywhere in the baseline run (repro_test's own inputs: motion R16G16_TYPELESS (33) holding half floats,
+depth R32G8X24_TYPELESS (19)), so any other step list means the generated frames sit in
+the wrong place. `REPRO_NOFILL=1` makes a texture in any format number and never fills it: what the tag accepts, no picture.
+
+*What Intel does.* It never refuses a format: `TagFrameResource` returned 0 for every one below (also BC1, sRGB, B8G8R8A8 as motion; integer
+and colour formats as depth), and its log said nothing but "Reset called" / "Required descriptor size". It reads the texture
+through a typed view as float, so what a float view decodes works with the application's motion scale: typeless as float, UNORM to
+[0, 1], SNORM to [-1, 1]. The integer formats are accepted too, but their integers are read as float bit patterns: wrong motion.
+
+| Motion format (number) | Intel | Own generator now |
+|---|---|---|
+| R16G16_TYPELESS / FLOAT (33, 34) | generates, steps 4 px | copied as it is (the pack's layout) |
+| R16G16_UNORM (35) | generates, steps 4 px | converted (was: copied as if half floats = wrong motion) |
+| R16G16_SNORM (37) | generates, steps 4 px | converted (was: ignored, nothing generated) |
+| R16G16B16A16_TYPELESS / FLOAT / UNORM / SNORM (9, 10, 11, 13) | generates, steps 4 px | converted |
+| R32G32_TYPELESS / FLOAT, R32G32B32_TYPELESS / FLOAT, R32G32B32A32_TYPELESS / FLOAT (15, 16, 5, 6, 1, 2) | generates, steps 4 px | converted |
+| R8G8_TYPELESS / UNORM / SNORM (48, 49, 51) | generates, steps 4 px | converted |
+| R8G8B8A8_TYPELESS / UNORM / SNORM (27, 28, 31) | generates, steps 4 px | converted |
+| R10G10B10A2_TYPELESS / UNORM (23, 24) | generates, steps 4 px | converted |
+| R11G11B10_FLOAT (26) | generates, steps 4 px | converted |
+| R32_FLOAT, R16_FLOAT, R8_UNORM (41, 54, 61): one channel, x only | generates (y reads 0, the probe's motion is horizontal) | refused (a vector needs two channels) |
+| R16G16_UINT, R32G32_UINT, R16G16B16A16_UINT, R8G8_UINT (36, 17, 12, 50; the other UINT formats were not probed) | accepts, generated frames not moved (steps 3 / 4 / 5 px) | refused |
+| R16G16_SINT, R32G32_SINT, R16G16B16A16_SINT, R8G8_SINT (38, 18, 14, 52; the other SINT formats were not probed) | accepts, garbage motion (the bar is missing from most shown frames) | refused |
+| R8G8B8A8_UNORM_SRGB, B8G8R8A8, BC1 (29, 87, 71) | accepts (no picture checked) | refused |
+
+| Depth format (number) | Intel | Own generator now |
+|---|---|---|
+| D32_FLOAT, R32_FLOAT, R32_TYPELESS (40, 41, 39) | generates | copied as it is |
+| R32G8X24_TYPELESS, D32_FLOAT_S8X24_UINT (19, 20) | generates | plane 0 copied as it is (a region in a larger one: whole copy, read at its offset) |
+| R24G8_TYPELESS, D24_UNORM_S8_UINT (44, 45) | generates | plane 0 converted (24-bit UNORM to float) |
+| R16_TYPELESS, D16_UNORM, R16_UNORM (53, 55, 56) | generates | converted (16-bit UNORM to float) |
+| R16_FLOAT (54) | generates | converted |
+| R32_UINT, R32_SINT, R16_UINT (42, 43, 57) | accepts | refused |
+
+The probe's picture does not depend on the depth (the bar on a flat ground has no disocclusion to fill), so for depth "generates" is
+the tag and the status, not a check of the decoding; the own generator's depth conversions are checked against exact values in
+`tests\convert_test.cpp` and give the same generated frames as the 32-bit float run in `tests\format_check.ps1`.
+
+*What f5low does.* `src\xefg_formats.h` is the table (host code, tested in `tests\convert_test.cpp`), `src\xefg_convert.hlsl` the
+conversion (a normalized format is decoded as a typed read would, to the pack's R16G16_FLOAT; the motion scale the application tags
+multiplies it afterwards, as with Intel). A format it refuses is **logged once per format change** ("tag motion: motion vectors in
+DXGI format 36 (R16G16_UINT) are not supported - no frames generated while they are tagged"; the same for a texture whose size or
+region does not fit the pack), `TagFrameResource` still returns success (as Intel's does for everything), the present reports
+`framesPresented` 1 and `isFrameGenEnabled` 0, and XeLL is told `SetFgEnabled(0)` until a tag it can use arrives (then on again; the
+log says so). Pacing is not touched. Run `tests\format_check.ps1 -IntelLib <libxess_fg.dll>` (GPU) to check all of this: the generated frame of
+every taken format is bit for bit the baseline's (motion R16G16_TYPELESS, depth R32G8X24_TYPELESS); a frame's tags decide once per frame at
+Present, a refused state ends after two usable frames, and the warning is logged once per format change (`StepInputs` in `src\xefg_formats.h`).
+
 ## Exports that are not Intel's API
 
 - `int __cdecl f5lowGetStatus(char* reason, int reasonSize)` - what the host decided for the most recent context

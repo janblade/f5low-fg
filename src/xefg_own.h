@@ -46,6 +46,7 @@
 #include "pace_sched.h"
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
+#include "xefg_formats.h"
 
 #include <dxgi1_6.h>
 
@@ -71,21 +72,6 @@ namespace xefgown
 {
 using namespace xefgio;
 
-inline uint32_t TexelBytesOf(DXGI_FORMAT f)
-{
-    switch (f)
-    {
-    case 27: case 28: case 29:                 // R8G8B8A8
-    case 87: case 90: case 91:                 // B8G8R8A8 (HUD-less colour / UI texture of a B8G8R8A8 swap chain)
-    case 23: case 24: case 25:                 // R10G10B10A2 (HDR10)
-    case 33: case 34: case 35:                 // R16G16
-    case 39: case 40: case 41:                 // R32 (depth)
-    case 19: case 20: case 21:                 // R32G8X24, plane 0 is the 32-bit float
-        return 4;
-    default: return 0;
-    }
-}
-
 // The back buffers XeFG takes: R8G8B8A8 (the pack's own), B8G8R8A8 (the same graph, red and blue swapped on
 // the way in and out) and R10G10B10A2 HDR10 (the pack's hdr\ part). FP16 / scRGB Intel refuses too.
 // The colour family of a 4-byte format: 1 R8G8B8A8, 2 B8G8R8A8, 3 R10G10B10A2, 0 none of them (motion vectors, depth).
@@ -99,27 +85,9 @@ inline int ColourFamily(DXGI_FORMAT f)
     default: return 0;
     }
 }
-// Motion and depth formats XeSS-FG takes (its guide: motion "R16G16_FLOAT or similar", depth "any depth format") that
-// the pack's buffers do not hold as they are: copied raw and turned into R16G16_FLOAT / 32-bit float depth on our list
-// (xefg_convert.hlsl, ConvertIn). kind as the shader's Kind; stride: bytes per texel of the raw copy. False: no conversion.
-inline bool ConversionOf(bool motion, DXGI_FORMAT f, uint32_t& kind, uint32_t& stride)
-{
-    if (motion)
-        switch (f)
-        {
-        case 9: case 10: kind = 0; stride = 8; return true;   // R16G16B16A16_FLOAT
-        case 15: case 16: kind = 1; stride = 8; return true;  // R32G32_FLOAT
-        case 1: case 2: kind = 1; stride = 16; return true;   // R32G32B32A32_FLOAT
-        default: return false;
-        }
-    switch (f)
-    {
-    case 44: case 45: case 46: kind = 2; stride = 4; return true; // D24_UNORM_S8_UINT, plane 0
-    case 53: case 55: case 56: kind = 3; stride = 2; return true; // D16_UNORM / R16_UNORM
-    case 54: kind = 4; stride = 2; return true;                   // R16_FLOAT
-    default: return false;
-    }
-}
+// Motion and depth formats (xefg_formats.h: MotionTake / DepthTake, the formats Intel's library reads, measured with repro_test) that the
+// pack's buffers do not hold as they are are copied raw and turned into R16G16_FLOAT / 32-bit float depth on our list (xefg_convert.hlsl,
+// ConvertIn); the integer ones and anything else are refused (CopyIn).
 
 // One tagged input's conversion for a frame (ConvertIn); kind < 0: copied as it is.
 struct Conversion
@@ -324,6 +292,18 @@ public:
     static constexpr uint32_t kXellMaxGenerated = 3;
     std::atomic<bool> xellCountsShown { false };  // XeLL told about our frames (xefgCudaXellCountsRenderedOnly: 0)
     bool xellFgOn = false;                  // under mu: what XeLL was last told by SetFgEnabled
+    // Under mu: the motion vectors / depth the application tags cannot be used (a format we refuse, a size that does not fit the pack):
+    // nothing is generated for them, so XeLL is told frame generation is off until usable ones arrive again. Told "on" with 0 generated
+    // frames it paces the game for frames that never come (a game's frame rate dropped by about half). Decided once per frame at
+    // Present (StepInputs), from what the frame's tags did: taggedMv / taggedDepth (a tag arrived), haveMv / haveDepth (one was taken).
+    xefgown::InputsState inputs;
+    bool taggedMv = false, taggedDepth = false;
+    bool xellInputsRefused = false;         // what XellSync last used of inputs.refused
+    // XeLL calls are decided under mu and sent after it; a sequence number says which came last, and the send mutex (never held
+    // together with a call into libxell from under mu) drops a call that a later one has overtaken.
+    uint64_t xellSeq = 0;                   // under mu
+    std::mutex xellSendMu;
+    uint64_t xellSentSeq = 0;               // under xellSendMu
     uint32_t xellMaxGen = 0;                // under mu: the generated frames per rendered one XeLL was told with it
     bool xellDisplayDirty = true;           // under mu: SetDisplayInfo due on the next present
     std::atomic<uint32_t> xellCountFailed { 0xffffffffu };
@@ -340,10 +320,22 @@ public:
         int on = -1;    // -1: nothing to tell
         ID3D12CommandQueue* queue = nullptr;    // the application's queue (held by Own for its lifetime) or null
         uint32_t maxGen = 0;                    // generated frames per rendered one while on
+        uint64_t seq = 0;                       // order of decision (under mu); a call older than one already sent is dropped
+        std::mutex* sendMu = nullptr;
+        uint64_t* sentSeq = nullptr;
         void Send() const
         {
             if (on < 0)
                 return;
+            std::unique_lock<std::mutex> lk;
+            if (sendMu)
+            {
+                lk = std::unique_lock<std::mutex>(*sendMu);
+                if (seq && sentSeq && seq <= *sentSeq)
+                    return;
+                if (seq && sentSeq)
+                    *sentSeq = seq;
+            }
             if (x.setAppQueue)
                 x.setAppQueue(x.ctx, queue);
             x.setFgEnabled(x.ctx, static_cast<uint32_t>(on), on ? maxGen : 0);
@@ -406,17 +398,29 @@ public:
         const uint32_t gen = std::max(1u, std::min(numInterp, maxInterp));
         const bool fits = gen <= kXellMaxGenerated;
         xellCountsShown = xellLinked && fits;
-        const bool on = xellLinked && fits && enabled;
+        const bool inputsOk = !inputs.refused;
+        xellInputsRefused = inputs.refused;
+        const bool on = xellLinked && fits && enabled && inputsOk;
         if (!xellLinked || (on == xellFgOn && (!on || gen == xellMaxGen)))
             return {};
         xellFgOn = on;
         xellMaxGen = on ? gen : 0;
         xellDisplayDirty = true;
         XLog("xell: frame generation %s for XeLL%s", on ? "on" : "off",
-             !fits && enabled ? " (more generated frames than XeLL takes: it counts the game's own)" : "");
+             !fits && enabled ? " (more generated frames than XeLL takes: it counts the game's own)"
+             : !inputsOk && enabled ? " (the tagged motion vectors / depth cannot be used: no frames are generated)" : "");
         if (on)
             XLog("xell: up to %u generated per rendered frame", gen);
-        return { xell, on ? 1 : 0, appQueue, gen };
+        return Stamp({ xell, on ? 1 : 0, appQueue, gen });
+    }
+
+    // Under mu: a decided XeLL call gets its place in the order.
+    XellCall Stamp(XellCall c)
+    {
+        c.seq = ++xellSeq;
+        c.sendMu = &xellSendMu;
+        c.sentSeq = &xellSentSeq;
+        return c;
     }
 
     // Under mu, when the context goes (Destroy) or links anew: XeLL is not left counting frames we no longer make
@@ -427,7 +431,7 @@ public:
         xellFgOn = false;
         xellMaxGen = 0;
         XLog("xell: frame generation off for XeLL (context gone)");
-        return { xell, 0 };
+        return Stamp({ xell, 0 });
     }
 
     // The display's refresh period in ns, as Intel's SetDisplayInfo carries it (1e9 / Hz: 5555556 at 180 Hz); 0 unknown
@@ -961,6 +965,8 @@ public:
         ++tagsThisFrame;
         TagCopy(g, rd);
         g->Release();
+        // Success whatever the format: Intel's library takes every tag the same way (repro_test, docs\GENERATORS.md); a tag we cannot use is
+        // logged by CopyIn; at Present the frame's tags decide whether frames are generated and what XeLL is told (StepInputs).
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
 
@@ -969,7 +975,7 @@ public:
     {
         const bool isColor = rd.type == XEFG_SWAPCHAIN_RES_HUDLESS_COLOR;
         const bool isUi = rd.type == XEFG_SWAPCHAIN_RES_UI;
-        const bool isMv = rd.type == XEFG_SWAPCHAIN_RES_MOTION_VECTOR;
+        const bool isMv = rd.type == XEFG_SWAPCHAIN_RES_MOTION_VECTOR, isDepth = rd.type == XEFG_SWAPCHAIN_RES_DEPTH;
         const uint32_t set = static_cast<uint32_t>(appFrame & 1);
         // A UI texture only counts with a pack that has the UI inputs (tools/pack_ui.py).
         if (!built || !stMv[set] || (isColor && !EnsureStaging(stHud, pg->Buf(GenSlot::Cur).bytes)) ||
@@ -977,8 +983,14 @@ public:
             return;
         ID3D12Resource* dst = isColor ? stHud[set] : isUi ? stUi[set] : isMv ? stMv[set] : stDepth[set];
         const Resource& pr = pg->InputRes(isColor ? GenSlot::Cur : isUi ? GenSlot::Ui : isMv ? GenSlot::Motion : GenSlot::Depth);
-        if (CopyIn(g, rd, dst, pr, isColor ? "hudless" : isUi ? "ui" : isMv ? "motion" : "depth", set))
+        const bool ok = CopyIn(g, rd, dst, pr, isColor ? "hudless" : isUi ? "ui" : isMv ? "motion" : "depth", set);
+        if (ok)
             (isColor ? hudless : isUi ? haveUi : isMv ? haveMv : haveDepth) = true;
+        // Only noted here; Present decides (a frame may tag twice, and one tag's refusal must not outvote another's success)
+        if (isMv)
+            taggedMv = true;
+        else if (isDepth)
+            taggedDepth = true;
     }
 
     // One allocator of the tag copies (FlushTags): its appFence value once submitted, the resources its copies read.
@@ -1138,6 +1150,7 @@ public:
         }
         Removed("the application's work, at its Present");
         Job j;
+        XellCall xs;                // SetFgEnabled for inputs that became unusable / usable again with this frame's tags (sent after mu)
         XellLink xr;                // XeLL report of this present (taken under mu, sent after it)
         uint32_t xrCount = 0;
         uint8_t xrDisplay[48] {};
@@ -1149,6 +1162,10 @@ public:
             if (!real || appBufs.empty() || !list || !presenter.joinable())
                 return real ? real->Present(sync, flags) : DXGI_ERROR_INVALID_CALL;
             FlushTags();
+            // The frame's tags decide whether motion / depth are usable (once per frame, with a recovery delay): XeLL is told when it changes
+            xefgown::StepInputs(inputs, taggedMv || taggedDepth, (taggedMv && !haveMv) || (taggedDepth && !haveDepth));
+            if (inputs.refused != xellInputsRefused)
+                xs = XellSync();
             const Resource* ox = built && pg->HasPack() ? &pg->Output() : nullptr;
             const DXGI_FORMAT bf = scDesc.Format;
             const bool fmtKnown = bf == DXGI_FORMAT_R8G8B8A8_UNORM || bf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || IsBgra(bf) || IsHdr10(bf);
@@ -1193,6 +1210,7 @@ public:
             j.conv[1] = pendConv[1];
             pendConv[0] = pendConv[1] = {};
             haveMv = haveDepth = hudless = haveUi = false;
+            taggedMv = taggedDepth = false;
             tagsThisFrame = 0;
             // What this call will put out (GetLastPresentStatus), as the presenter will decide it.
             const bool willGen = j.usable && lastUsable && !j.reset;
@@ -1229,6 +1247,7 @@ public:
             appIndex = (appIndex + 1) % static_cast<UINT>(appBufs.size());
             Interval(t0);
         }
+        xs.Send();
         if (xrSend)
         {
             // As Intel's, inside the game's present: between its PRESENT_START and PRESENT_END markers
@@ -3886,10 +3905,12 @@ private:
                 uint32_t set)
     {
         const D3D12_RESOURCE_DESC d = rd.pResource->GetDesc();
-        // Motion and depth in another format Intel takes: copied raw into stRaw, converted on our list (ConvertIn).
+        // Motion and depth: what to do with the tagged format (xefg_formats.h): copied as it is (the pack's own layout), or copied raw into
+        // stRaw and converted on our list (ConvertIn), or refused (no frames are generated while it is tagged).
         const bool isMv = rd.type == XEFG_SWAPCHAIN_RES_MOTION_VECTOR, isDepth = rd.type == XEFG_SWAPCHAIN_RES_DEPTH;
         uint32_t kind = 0, stride = 0;
-        bool convert = (isMv || isDepth) && pr.texel == 4 && !convFailed && !rawFailed && ConversionOf(isMv, d.Format, kind, stride);
+        const Take take = isMv ? MotionTake(d.Format, kind, stride) : isDepth ? DepthTake(d.Format, kind, stride) : Take::Raw;
+        bool convert = (isMv || isDepth) && take == Take::Convert && pr.texel == 4 && !convFailed && !rawFailed;
         // HUD-less colour and UI texture: their region is the interpolation area (letterboxing), but the layers read
         // them at the area's offset in the whole texture, so an output-sized one is copied whole.
         const bool colour = rd.type == XEFG_SWAPCHAIN_RES_HUDLESS_COLOR || rd.type == XEFG_SWAPCHAIN_RES_UI;
@@ -3900,30 +3921,56 @@ private:
         // D3D12 copies a depth-stencil texture only whole: a 32-bit float depth region in a larger one goes the convert
         // path too, which copies the whole texture and reads the region in the shader (Kind 5, the bits as they are).
         if (!convert && isDepth && !whole && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && pr.texel == 4 &&
-            TexelBytesOf(d.Format) == 4 && !convFailed && !rawFailed)
+            take == Take::Raw && !convFailed && !rawFailed)
         {
             convert = true;
             kind = 5;
             stride = 4;
         }
-        const uint32_t tb = convert ? pr.texel : TexelBytesOf(d.Format);
+        const uint32_t tb = isMv || isDepth ? (convert ? pr.texel : take == Take::Raw ? 4u : 0u) : TexelBytesOf(d.Format);
         // Depth: the pack's buffer is output-sized (a "pack 2") and takes the render-size region at its top left.
         const bool fits = rd.type == XEFG_SWAPCHAIN_RES_DEPTH ? sw <= pr.w && sh <= pr.h : sw == pr.w && sh == pr.h;
         // The region inside the tagged texture (the copy box below).
         const bool inTex = full || (rd.resourceBase.x + static_cast<uint64_t>(sw) <= d.Width && rd.resourceBase.y + static_cast<uint64_t>(sh) <= d.Height);
         // Same texel size is not enough: the HUD-less colour is the swap chain's own format family (the R <-> B swap
-        // follows the swap chain), an 8-bit UI texture has its byte order, motion vectors and depth are no colour format.
+        // follows the swap chain), an 8-bit UI texture has its byte order. Motion vectors and depth have their format decided above.
         const int fam = ColourFamily(d.Format), scFam = ColourFamily(scDesc.Format);
         const bool family = rd.type == XEFG_SWAPCHAIN_RES_HUDLESS_COLOR ? fam == scFam
                             : rd.type == XEFG_SWAPCHAIN_RES_UI           ? fam != 0 && (scFam == 3 || fam == scFam)
-                                                                         : fam == 0;
+                                                                         : true;
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 || !tb || tb != pr.texel || !fits || !inTex || !family)
         {
-            if (!warnedTag[rd.type])
-                XLog("tag %s: %llux%u fmt=%d region %ux%u does not match the pack's %ux%u texel %u - ignored", what, d.Width, d.Height,
-                     static_cast<int>(d.Format), sw, sh, pr.w, pr.h, pr.texel);
-            warnedTag[rd.type] = true;
+            // Logged once for each format (and kind of reason) a type is refused with, again after a tag of it was taken in between.
+            const bool badFormat = (isMv || isDepth) && take == Take::No && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            // a format we convert, but the conversion cannot run (its pipeline or its raw buffer failed): not a size problem either
+            const bool noConversion = (isMv || isDepth) && take == Take::Convert && !convert;
+            const uint32_t key = 1u + static_cast<uint32_t>(d.Format) + (badFormat ? 0x10000u : noConversion ? 0x20000u : 0u);
+            if (warnedTagKey[rd.type] != key)
+            {
+                const char* nm = FormatName(d.Format);
+                if (badFormat)
+                    XLog("tag %s: %s in DXGI format %d%s%s%s %s not supported - no frames generated while %s tagged", what,
+                         isMv ? "motion vectors" : "depth", static_cast<int>(d.Format), *nm ? " (" : "", nm, *nm ? ")" : "",
+                         isMv ? "are" : "is", isMv ? "they are" : "it is");
+                else if (noConversion)
+                    XLog("tag %s: fmt=%d %s needs the format conversion, which is not available (its pipeline or buffer could not be made) - no frames generated while it is tagged",
+                         what, static_cast<int>(d.Format), nm);
+                else
+                    XLog("tag %s: %llux%u fmt=%d region %ux%u does not match the pack's %ux%u texel %u - ignored%s", what, d.Width,
+                         d.Height, static_cast<int>(d.Format), sw, sh, pr.w, pr.h, pr.texel,
+                         isMv || isDepth ? ", no frames generated while it is tagged" : "");
+            }
+            warnedTagKey[rd.type] = key;
+            goodRun[rd.type] = 0;
             return false;
+        }
+        // The logged refusal is forgotten only after the type was taken in kGoodFramesToRecover different frames in a row, so tags that
+        // alternate between a good and a refused format log once, not every other frame.
+        if (warnedTagKey[rd.type] && goodRunFrame[rd.type] != appFrame)
+        {
+            goodRunFrame[rd.type] = appFrame;
+            if (++goodRun[rd.type] >= xefgown::kGoodFramesToRecover)
+                warnedTagKey[rd.type] = 0;
         }
         // The region may sit in a larger texture (depth); it lands at the pack's own row pitch.
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
@@ -4130,7 +4177,9 @@ private:
     bool inFullscreen = false;      // the real swap chain is in exclusive fullscreen: no generation
     bool hasPrev = false;                   // presenter: prev holds the previous app frame
     bool lastUsable = false;                // app thread: the previous frame could take part in generation
-    bool warnedTag[8] {};
+    uint32_t goodRun[8] {};
+    uint64_t goodRunFrame[8] {};
+    uint32_t warnedTagKey[8] {};        // per tag type: the refusal last logged (format + kind of reason), 0 after a tag was taken
     bool dumped = false;
     const Frame* showing = nullptr;         // presenter: the frame Show is presenting (Hitch)
     unsigned hitches = 0;                   // hitch lines in the second from hitchSecond (PresentReal)
