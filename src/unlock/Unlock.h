@@ -726,14 +726,17 @@ namespace nvapi
 inline bool Install(int targetSm, HMODULE ngx, HMODULE plugin, std::string& why);
 inline void LogSummary(const char* tierName, bool final);
 inline bool InstallTestE9Hook(std::string& why);
+inline void WarnIfBypassed(const char* tierName);
 } // namespace nvapi
 
 // F5LOW_NVAPI_COUNT=1 (tests): the NVAPI hook also on tiers that need no rewrite, counting only
-inline bool NvapiCountWanted()
+// Test switches are on for the value 1 only (not on presence)
+inline bool EnvIsOne(const char* name)
 {
-    char v[8];
-    return GetEnvironmentVariableA("F5LOW_NVAPI_COUNT", v, sizeof v) != 0;
+    char v[8] = {};
+    return GetEnvironmentVariableA(name, v, sizeof v) != 0 && v[0] == '1' && v[1] == 0;
 }
+inline bool NvapiCountWanted() { return EnvIsOne("F5LOW_NVAPI_COUNT"); }
 
 inline std::mutex g_mu;
 inline Result g_result;
@@ -751,7 +754,7 @@ inline Result Apply(const std::wstring& dir, Tier tier)
     g_done = true;
     Result r;
     r.tier = tier;
-    if (char t[8]; GetEnvironmentVariableA("F5LOW_TEST_E9_QI", t, sizeof t))
+    if (EnvIsOne("F5LOW_TEST_E9_QI"))
         if (std::string why; !nvapi::InstallTestE9Hook(why))
             Log("unlock: TEST: the E9 hook on nvapi_QueryInterface was not placed: %s", why.c_str());
     const auto fail = [&](const std::string& why) {
@@ -825,9 +828,8 @@ inline Result Apply(const std::wstring& dir, Tier tier)
     // sm_75 (NvapiKernels.h). In place BEFORE the patches, because the patched module advertises a feature whose kernels only load this way;
     // a hook that cannot be placed fails the unlock like the CUDA loaders do. F5LOW_NVAPI_DISABLE=1 (tests) leaves it out.
     {
-        char off[8];
         const int target = tier == Tier::Ampere ? 86 : tier == Tier::Turing ? 75 : 0;
-        if (GetEnvironmentVariableA("F5LOW_NVAPI_DISABLE", off, sizeof off))
+        if (EnvIsOne("F5LOW_NVAPI_DISABLE"))
             Log("unlock: %s: TEST: the NVAPI kernel hook is disabled (F5LOW_NVAPI_DISABLE)", TierName(tier));
         else if (target != 0 || NvapiCountWanted())
         {
@@ -882,6 +884,7 @@ inline void LogAfterStart()
 {
     std::lock_guard lk(g_mu);
     nvapi::LogSummary(g_ngx ? TierName(g_result.tier) : "native", false);
+    nvapi::WarnIfBypassed(g_ngx ? TierName(g_result.tier) : "native");
     if (!g_done || !g_ngx)
         return;
     ListModules(L"nvngx_dlssg.dll", g_ngx, "DLSS-G module:");

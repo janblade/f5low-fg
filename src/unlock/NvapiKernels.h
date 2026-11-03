@@ -30,6 +30,7 @@ inline int g_targetSm = 0;                   // 86, 75; 0: count only
 inline std::atomic<void*> g_realQi { nullptr };     // the real nvapi_QueryInterface (what DLSS-G's GetProcAddress lookup returned)
 inline std::atomic<void*> g_createFn { nullptr };   // the real create function
 inline bool g_installed = false;
+inline std::atomic<bool> g_reachedLogged { false };
 inline std::atomic<unsigned> g_qiLookups { 0 };      // lookups of "nvapi_QueryInterface" by our modules
 inline std::deque<std::vector<uint8_t>> g_keep;      // the rewritten containers: alive for the process
 struct Cached
@@ -141,6 +142,8 @@ inline const std::vector<uint8_t>* RewrittenFor(const void* image, uint32_t size
 inline int WINAPI Wrapper(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h)
 {
     const auto real = reinterpret_cast<CreateFn>(g_createFn.load());
+    if (!g_reachedLogged.exchange(true)) // here, not in the GetProcAddress hook: that one can run under the loader lock
+        Log("dlssg kernels: nvapi kernel create reached our filter (target %s)", g_targetSm == 86 ? "sm_86" : g_targetSm == 75 ? "sm_75" : "count only");
     LARGE_INTEGER t0, t1, t2;
     QueryPerformanceCounter(&t0);
     const uint32_t size = static_cast<uint32_t>(c);
@@ -277,17 +280,26 @@ inline bool Install(int targetSm, HMODULE ngx, HMODULE plugin, std::string& why)
     // Our slots point into this DLL and the DLSS-G modules may outlive it: pin it
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&hkGetProcAddress), &self);
-    g_targetSm = targetSm;
+    // nvngx_dlssg first; sl.dlss_g and the target only after that slot worked (a failed install leaves nothing half-hooked)
     const int inNgx = PatchGetProcAddressSlots(ngx);
-    const int inPlugin = plugin ? PatchGetProcAddressSlots(plugin) : 0;
     if (inNgx == 0)
     {
         why = "the DLSS-G module does not import GetProcAddress from a table this can read";
         return false;
     }
+    g_targetSm = targetSm;
+    const int inPlugin = plugin ? PatchGetProcAddressSlots(plugin) : 0;
     Log("dlssg kernels: GetProcAddress slots of our DLSS-G modules hooked: nvngx_dlssg %d, sl.dlss_g %d (no global hook)", inNgx, inPlugin);
     g_installed = true;
     return true;
+}
+
+// After Streamline and DLSS-G started: a tier that needs the rewrite whose modules have not asked for nvapi_QueryInterface through the slot
+// (they may do it later, or reach it another way)
+inline void WarnIfBypassed(const char* tierName)
+{
+    if (g_installed && g_targetSm != 0 && g_qiLookups.load() == 0)
+        Log("dlssg kernels: WARNING %s path: DLSS-G has not asked through our import slot yet - kernels may load as shipped", tierName);
 }
 
 // One line with what happened so far (again only when it changed): "dlssg kernels: ..."; `final` (the context is gone) also says so when

@@ -269,7 +269,8 @@ int main()
         handle = 0;
         a = NvapiFatbin::CreateWithFallback(true, "", [&](bool ours) { ++calls; return ours ? -5 : -7; }, snapshot, written);
         CHECK(a.status == -7 && a.failed && a.retried && calls == 2);
-    }    if (g_fail)
+    }
+    if (g_fail)
     {
         std::printf("nvapi_fatbin_test: %d FAILED\n", g_fail);
         return 1;

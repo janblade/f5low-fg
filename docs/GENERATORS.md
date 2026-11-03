@@ -200,7 +200,8 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     Detours-style E9 hook on nvapi_QueryInterface). One log line at the end: `dlssg kernels: <tier> path, N of M retargeted|rewritten, K passed
     through, F failed (<first reason>), ..., took X ms` (the driver's JIT happens inside the create, so X is mostly JIT: a second start is
     faster through the driver's cache), or `hook installed, 0 kernel creations seen`. Test without a GPU: `tests/build_nvapi_fatbin_test.ps1`
-    (synthetic containers, the create flow with a fake driver call).  - *Credits.* The sl.dlss_g frame-count clamp and software-pacing approach is adapted from KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT, from
+    (synthetic containers, the create flow with a fake driver call).
+  - *Credits.* The sl.dlss_g frame-count clamp and software-pacing approach is adapted from KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT, from
     the RenoDX MFG Unlock addon by Dreamt and mavismmg): the notice is in `licenses/MFGUnlock_LICENSE.txt`.
   - *Later.* Story 2b: kernels tuned for RTX 20/30; story 3: tester proof on real RTX 40/30/20 cards; story 4: OptiScaler side (generator
     choice, Reflex cap, Streamline hand-over). Nothing NVIDIA-derived is ever written to disk or committed (`tools/audit.py` has an `nvidia`
