@@ -123,6 +123,69 @@ int main()
         CHECK(pacesched::PickStamp(e, 205, st) && st == 199);   // in step again
         // a TEST present never gets this far: the stamp chain does not stamp it (xintel::StampChain), so no stamp for it exists here
     }
+    // PickStampBy: the same pairing on AppStamp entries, by the CPU time of the Present only - a GPU time never decides it
+    {
+        std::deque<pacesched::AppStamp> s { { 100, 1 }, { 200, 2 }, { 300, 3 } };
+        const auto cpu = [](const pacesched::AppStamp& a) { return a.cpu; };
+        pacesched::AppStamp st;
+        CHECK(pacesched::PickStampBy(s, 250, st, cpu) && st.cpu == 200 && st.fence == 2);
+        CHECK(s.size() == 1 && s.front().fence == 3);
+        CHECK(!pacesched::PickStampBy(s, 250, st, cpu));
+        CHECK(pacesched::PickStampBy(s, 400, st, cpu) && st.fence == 3 && s.empty());
+        // the GPU time of Present 2 (say 260) is later than the burst's arrival (250): the burst still belongs to Present 2
+        pacesched::GpuStampRing g;
+        g.Publish(1, 140);
+        long long t = 0;
+        std::deque<pacesched::AppStamp> p { { 100, 1 }, { 200, 2 }, { 300, 3 } };
+        CHECK(pacesched::PickStampBy(p, 250, st, cpu) && st.fence == 2);
+        CHECK(!g.Get(st.fence, t));                              // its GPU time is not there: the caller uses st.cpu
+        g.Publish(2, 260);
+        CHECK(g.Get(st.fence, t) && t == 260);                   // later: the GPU time is the value (260 > the arrival 250 is fine)
+    }
+    // GpuStampRing: consecutive values, the last 64 kept, 0 = never signalled
+    {
+        pacesched::GpuStampRing g;
+        long long t = 0;
+        CHECK(!g.Get(0, t));
+        CHECK(!g.Get(1, t));
+        g.Publish(1, 1000);
+        g.Publish(2, 2000);
+        CHECK(g.Get(1, t) && t == 1000);
+        CHECK(g.Get(2, t) && t == 2000);
+        CHECK(!g.Get(3, t));
+        g.Publish(2, 9999);                                      // a repeat or an older value changes nothing
+        CHECK(g.Get(2, t) && t == 2000);
+        for (uint64_t v = 3; v <= 100; ++v)
+            g.Publish(v, static_cast<long long>(v) * 1000);
+        CHECK(g.Get(100, t) && t == 100000);
+        CHECK(g.Get(37, t) && t == 37000);                       // 64 back from 100: still there
+        CHECK(!g.Get(36, t));                                    // 65 back: forgotten, the CPU time is used
+        CHECK(!g.Get(101, t));
+    }
+    // Lag: raised at once to scheduled + late (capped at maxLag intervals), falls 2 % per batch, small lates do not count
+    {
+        pacesched::Lag lag;
+        lag.Late(0, 0.3, 16.0, 0.5);                             // under kLagLateMs: nothing
+        CHECK(Near(lag.ms, 0));
+        lag.Late(0, 2.0, 16.0, 0.5);
+        CHECK(Near(lag.ms, 2.0));
+        lag.Late(0, 1.0, 16.0, 0.5);                             // less than the lag now: never lowered by a late frame
+        CHECK(Near(lag.ms, 2.0));
+        lag.Late(2.0, 1.5, 16.0, 0.5);                           // late on top of the lag the batch was scheduled with: 3.5
+        CHECK(Near(lag.ms, 3.5));
+        lag.Late(3.5, 20.0, 16.0, 0.5);                          // capped at half an interval
+        CHECK(Near(lag.ms, 8.0));
+        lag.EndFrame();
+        CHECK(Near(lag.ms, 8.0 * 0.98));
+        for (int i = 0; i < 34; ++i)
+            lag.EndFrame();
+        CHECK(lag.ms < 4.1 && lag.ms > 3.8);                     // about half in ~35 batches
+        pacesched::Lag none;
+        none.Late(0, 5.0, 16.0, 0.0);                            // MaxLag=0: no lag
+        CHECK(Near(none.ms, 0));
+        // the base with a lag: the stamp plus the lag
+        CHECK(pacesched::NextBase(0, 1000, 80, 1600) == 1080);
+    }
     if (g_fail)
     {
         printf("pace_sched_test: %d FAILED\n", g_fail);

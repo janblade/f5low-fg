@@ -32,6 +32,31 @@
 // running at their time (the same "late" the own generator feeds it). A frame past its time is presented on arrival and followed no
 // sooner than half a step (Bound). Without stamps (no game-side wrapper) or before enough are seen, the burst spacing below applies.
 //
+// What a stamp is (GPU stamps, SinkGpuStamps=1 default): the own generator bases its schedule on the moment each application frame was
+// DONE ON THE GPU (xefg_own.h: appFence signalled on the application's queue behind the frame, a watcher thread takes the time its
+// completion event fired). The CPU time of the game's Present carries the game thread's jitter (several ms in RDR2), the GPU time does
+// not. The sink does the same: AppPresent signals a fence of its own on the chain's queue (the queue the game presents on, so the signal
+// lands behind the game's frame work submitted so far) and a watcher thread takes the time the GPU reached it. The Present call itself
+// only does the (non-blocking) Signal. The pairing of a burst with an application Present stays by the CPU time of the Present (PickStampBy:
+// a burst takes the newest Present not later than its first frame); the GPU time of that Present is the value the schedule is based on.
+// The library may hand the sink its first generated frame before the GPU has finished the application's frame, so the GPU time is not
+// there yet when the burst arrives: it is read when the pacer thread is about to release the batch's first frame (ResolveBatch), waiting
+// for it at most two app frame intervals (the generated frame cannot be shown before the application's frame is done anyway). No GPU
+// time then (no fence, device removed, the wait ran out): the CPU time of that Present, counted. Precision: the time is the wake-up of
+// a thread after the fence completed, so it trails the GPU's completion by the scheduler's latency (tens of microseconds to ~1 ms), and
+// when the GPU is more than one frame behind the watcher takes several frames at the same wake-up (the stamps of the late ones are too
+// late, never early); both are far below the CPU jitter this replaces.
+//
+// The lag (pacesched::Lag): the schedule runs behind the GPU timeline by as much as generated frames came out late lately, as the own
+// generator's paceLag (xefg_own.h): raised at once to the most a frame was late (on top of the lag its batch was scheduled with), 0.98 per
+// batch down, at most MaxLag app frames (f5low.ini MaxLag=, default 0.5; 0 = none). "Late" is the same as for the lead rule: only our own
+// GPU wait counts. Lead and lag: the batch base is the GPU stamp + lag; frame j goes out at base + Offset(lead, step, j + 1). The lag moves
+// the whole batch later, the lead moves it earlier by (step - lead). The own generator uses one OR the other (the lead on its D3D12 path,
+// where each pass is recorded just before its present; the lag on its CUDA path, where the passes are done ahead and a lag only gives
+// them time); the sink has both, because its frames are the library's work done ahead like the CUDA path's, but its first frame still
+// has the lead's cap. Both start from the same late measurement, so a late frame raises both (at 3x+ that is the point: the first frame
+// of a batch needs time); MaxLag=0 or PaceLead=off take either out for an A/B.
+//
 // Only what Intel's 1.3.4.95 uses is implemented with care (see the plan, Story 3 step 1); the rest is forwarded.
 #pragma once
 #include "scproxy.h"
@@ -41,6 +66,7 @@
 
 #include <d3d12.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -116,6 +142,8 @@ struct PaceCfg
     double leadFixedMs = 0;
     bool wideCap = false;               // test: the lead may reach a whole app frame minus one step (n steps), not one step
     double testLeadMs = 0;              // test: a fixed lead, not clamped to a step (at most two intervals)
+    double maxLag = 0.5;                // MaxLag=: the schedule's lag at most, in app frames (pacesched::Lag); 0 = none
+    bool gpuStamps = true;              // SinkGpuStamps=: stamp the application's frames when the GPU is done with them, not when the game calls Present
 };
 inline constexpr uint32_t kAutoMaxBurst = 2;    // Auto: the schedule only at 2x (A/B 2026-11-03: from 3x the first generated frame of a burst is late and gap sd/pm_sd are worse than the burst spacing)
 inline void (*g_log)(const char* fmt, ...) = nullptr;
@@ -125,7 +153,14 @@ inline std::atomic<double> g_lateJSum[8];     // schedule mode: late generated f
 
 // Schedule mode statistics (the harness reads them with the sink's gaps)
 inline std::atomic<uint64_t> g_schedBatches { 0 }, g_schedNoStamp { 0 }, g_schedFrames { 0 }, g_schedLate { 0 }, g_schedStamps { 0 };
+inline std::atomic<uint64_t> g_schedGpu { 0 }, g_schedCpu { 0 }, g_schedGpuMiss { 0 };  // batches based on a GPU stamp / on the CPU time of the Present / of those, a GPU stamp was asked for but did not come in time
 inline double g_leadMin = 1e9, g_leadMax = 0;       // under g_outMu: the frozen lead's range (ms)
+inline double g_lagSum = 0, g_lagMax = 0;           // under g_outMu: the lag the batches were scheduled with (ms)
+inline uint64_t g_lagN = 0;
+inline double g_ageSum = 0, g_ageMax = 0;           // under g_outMu: how far the GPU stamp trails the CPU time of the same Present (ms)
+inline uint64_t g_ageN = 0;
+inline double g_ivCpu[2] = {}, g_ivGpu[2] = {};     // under g_outMu: sum and sum of squares of the app frame intervals, by CPU time and by GPU stamp (same batches)
+inline uint64_t g_ivN = 0;
 
 inline size_t g_depthStat = 0;              // the last sink's deepest queue and how often the library had to wait for room (set when it is released)
 inline unsigned g_fullStat = 0;
@@ -138,6 +173,10 @@ inline void ResetGaps()
     g_copyGpuMs.clear();
     g_probe.clear();
     g_schedBatches = g_schedNoStamp = g_schedFrames = g_schedLate = g_schedStamps = 0;
+    g_schedGpu = g_schedCpu = g_schedGpuMiss = 0;
+    g_lagSum = g_lagMax = g_ageSum = g_ageMax = 0;
+    g_lagN = g_ageN = g_ivN = 0;
+    g_ivCpu[0] = g_ivCpu[1] = g_ivGpu[0] = g_ivGpu[1] = 0;
     for (int i = 0; i < 8; ++i)
     {
         g_arrSum[i] = 0;
@@ -175,6 +214,24 @@ inline std::vector<std::string> StatsLines()
                  static_cast<unsigned long long>(g_schedStamps.load()), static_cast<unsigned long long>(g_schedBatches.load()), static_cast<unsigned long long>(g_schedNoStamp.load()), g_leadMin, g_leadMax,
                  static_cast<unsigned long long>(g_schedLate.load()), static_cast<unsigned long long>(g_schedFrames.load()));
         lines.push_back(buf);
+        snprintf(buf, sizeof(buf), "sink: schedule bases: %llu on a GPU stamp, %llu on the CPU time of the Present (%llu of those asked for a GPU stamp that did not come in time); lag %.2f mean, %.2f max ms over %llu batches",
+                 static_cast<unsigned long long>(g_schedGpu.load()), static_cast<unsigned long long>(g_schedCpu.load()), static_cast<unsigned long long>(g_schedGpuMiss.load()),
+                 g_lagN ? g_lagSum / static_cast<double>(g_lagN) : 0.0, g_lagMax, static_cast<unsigned long long>(g_lagN));
+        lines.push_back(buf);
+        if (g_ageN)
+        {
+            snprintf(buf, sizeof(buf), "sink: GPU stamp trails the CPU time of its Present by %.2f ms mean (%.2f max) over %llu batches", g_ageSum / static_cast<double>(g_ageN), g_ageMax,
+                     static_cast<unsigned long long>(g_ageN));
+            lines.push_back(buf);
+        }
+        if (g_ivN > 2)
+        {
+            const double n = static_cast<double>(g_ivN);
+            const auto sd = [n](const double* s) { return std::sqrt((std::max)(0.0, s[1] / n - (s[0] / n) * (s[0] / n))); };
+            snprintf(buf, sizeof(buf), "sink: app frame interval over %llu batches: mean %.3f ms, sd %.3f ms by the CPU time of the Present, sd %.3f ms by the GPU stamp",
+                     static_cast<unsigned long long>(g_ivN), g_ivGpu[0] / n, sd(g_ivCpu), sd(g_ivGpu));
+            lines.push_back(buf);
+        }
     }
     if (g_schedLate)
     {
@@ -260,7 +317,8 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         UINT sync, flags, slot;     // slot: the staging texture holding the frame
         // Schedule mode: its planned release (QPC) and the batch it belongs to
         bool sched = false;
-        LONGLONG due = 0, step = 0;
+        LONGLONG step = 0;
+        uint64_t batch = 0;         // its Batch (seq): the base, set when the pacer reaches the batch's first frame (ResolveBatch)
         uint32_t j = 0, b = 1;      // frame j (0 = first generated) of a batch of b
         double leadMs = 0, stepMs = 0;
         bool direct = false;        // on arrival: SinkPace=off or a display-paced present (release_rule.h); no timer wait, no lead rule
@@ -325,14 +383,110 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     bool sched = false;                 // schedule pacing in effect now (cfg.mode, and for Auto the burst size)
     pacelead::Lead lead;
     pacesched::ReadyInterval ri;
-    std::deque<LONGLONG> stamps;        // application Presents not yet matched to a burst
+    pacesched::Lag lag;                 // the schedule's lag behind the GPU timeline (see the top)
+    std::deque<pacesched::AppStamp> stamps;     // application Presents not yet matched to a burst
     LONGLONG lastStamp = 0, schedBase = 0;
     uint64_t stampsSeen = 0;
-    bool batchValid = false;
-    LONGLONG bBase = 0, bStep = 0, bLead = 0, bCap = 0, bStamp = 0;
-    double bLeadMs = 0, bStepMs = 0, bCapMs = 0;
     bool leadOpen = false;              // a batch's lead is waiting for its EndFrame
     double openFrozen = 0, openStep = 0;
+
+    // GPU stamps (see the top). A fence of the sink's own on the chain's queue, signalled behind every stamped application Present; the
+    // watcher thread publishes the time each value completed into gpuRing (under mu) and wakes the pacer if it waits for one.
+    ID3D12Fence* stampFence = nullptr;
+    HANDLE watchEvent = nullptr;
+    std::mutex sigMu;                   // the fence values are signalled in order (one game thread presents at a time in practice); taken before mu, never inside it
+    uint64_t stampValue = 0;            // under sigMu: the last fence value handed out
+    pacesched::GpuStampRing gpuRing;    // under mu
+    std::condition_variable cvGpu;      // mu
+    std::atomic<bool> wQuit { false };
+    std::thread watcher;
+    LONGLONG lastCpuIv = 0, lastGpuIv = 0;      // the previous resolved batch's CPU time and GPU stamp (interval statistics), under mu
+
+    // One schedule batch: the frames of one application frame. Made by Plan when the batch's first frame arrives (everything but the base);
+    // the base is set by ResolveBatch when the pacer thread reaches its first frame, so the GPU stamp of the Present can be used.
+    struct Batch
+    {
+        uint64_t seq = 0, epoch = 0;
+        pacesched::AppStamp stamp;      // the Present it belongs to (cpu = the arrival when no Present was found)
+        LONGLONG iv = 0, step = 0, lead = 0, cap = 0, base = 0;
+        double leadMs = 0, capMs = 0, lagMs = 0;
+        bool resolved = false;
+    };
+    std::deque<Batch> batches;          // under mu; consecutive seq; the front ones are dropped as their frames go out
+    uint64_t batchSeq = 0, epoch = 0;   // epoch: bumped by ResetSchedule; a batch of an older epoch does not touch schedBase
+    bool batchValid = false;
+
+    Batch* FindBatch(uint64_t seq)
+    {
+        if (batches.empty() || seq < batches.front().seq || seq > batches.back().seq)
+            return nullptr;
+        return &batches[static_cast<size_t>(seq - batches.front().seq)];
+    }
+
+    // mu held (l owns it), on the pacer thread, as the batch's first frame is about to be released: the batch's base. The Present's GPU
+    // stamp if the fence has it, else (waiting for it for two app frame intervals at most, 4..50 ms) the CPU time of the Present. The
+    // base is then smoothed as the own generator's (NextBase), with the lag it has now.
+    void ResolveBatch(std::unique_lock<std::mutex>& l, Batch& b)
+    {
+        if (b.resolved)
+            return;
+        LONGLONG s = b.stamp.cpu, g = 0;
+        bool gpu = false;
+        if (b.stamp.fence)
+        {
+            if (!gpuRing.Get(b.stamp.fence, g) && !stop)
+            {
+                const double waitMs = (std::min)((std::max)(2.0 * ri.ms, 4.0), 50.0);
+                cvGpu.wait_for(l, std::chrono::microseconds(static_cast<long long>(waitMs * 1000.0)), [&] { return stop || gpuRing.Get(b.stamp.fence, g); });
+            }
+            gpu = gpuRing.Get(b.stamp.fence, g);
+            if (gpu)
+                s = g;
+        }
+        const LONGLONG lagTicks = static_cast<LONGLONG>(lag.ms * Freq() / 1000.0);
+        if (b.epoch == epoch)
+        {
+            schedBase = pacesched::NextBase(schedBase, s, lagTicks, b.iv);
+            b.base = schedBase;
+        }
+        else
+            b.base = s + lagTicks;              // a batch from before a reset: its own stamp, the new state is not touched
+        b.lagMs = lag.ms;
+        b.resolved = true;
+        if (gpu)
+            ++g_schedGpu;
+        else
+        {
+            ++g_schedCpu;
+            if (b.stamp.fence)
+                ++g_schedGpuMiss;
+        }
+        if (Collect())
+        {
+            std::lock_guard<std::mutex> gl(g_outMu);
+            g_lagSum += lag.ms;
+            g_lagMax = (std::max)(g_lagMax, lag.ms);
+            ++g_lagN;
+            if (gpu)
+            {
+                const double age = static_cast<double>(g - b.stamp.cpu) * 1000.0 / Freq();
+                g_ageSum += age;
+                g_ageMax = (std::max)(g_ageMax, age);
+                ++g_ageN;
+                if (lastCpuIv && lastGpuIv)
+                {
+                    const double dc = static_cast<double>(b.stamp.cpu - lastCpuIv) * 1000.0 / Freq(), dg = static_cast<double>(g - lastGpuIv) * 1000.0 / Freq();
+                    g_ivCpu[0] += dc;
+                    g_ivCpu[1] += dc * dc;
+                    g_ivGpu[0] += dg;
+                    g_ivGpu[1] += dg * dg;
+                    ++g_ivN;
+                }
+            }
+        }
+        lastCpuIv = gpu ? b.stamp.cpu : 0;
+        lastGpuIv = gpu ? g : 0;
+    }
 
     // Called with mu held, right after Observe: the first frame of a burst takes the oldest application stamp and opens a batch
     // (base smoothed as the own pacer's, step from the smoothed interval, lead frozen); every frame gets its planned time.
@@ -343,48 +497,52 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             batchValid = false;
             if (stampsSeen >= 6)
             {
-                // The newest application Present not later than this burst's first frame; older ones are dropped (an extra stamp must not
-                // shift the schedule by a frame for good). None: the arrival is the base.
-                LONGLONG s = arrived;
-                long long picked = 0;
-                if (pacesched::PickStamp(stamps, arrived, picked))
-                    s = picked;
+                // The newest application Present not later than this burst's first frame (by the CPU time of the Present, see PickStampBy);
+                // older ones are dropped (an extra stamp must not shift the schedule by a frame for good). None: the arrival is the base.
+                Batch b;
+                b.stamp.cpu = arrived;
+                pacesched::AppStamp picked;
+                if (pacesched::PickStampBy(stamps, arrived, picked, [](const pacesched::AppStamp& a) { return a.cpu; }))
+                    b.stamp = picked;
                 else
                     ++g_schedNoStamp;
-                const LONGLONG iv = static_cast<LONGLONG>(ri.ms * Freq() / 1000.0);
-                schedBase = pacesched::NextBase(schedBase, s, 0, iv);
-                bStamp = s;
-                bStepMs = ri.ms / static_cast<double>(burst);
-                bStep = static_cast<LONGLONG>(bStepMs * Freq() / 1000.0);
+                b.seq = ++batchSeq;
+                b.epoch = epoch;
+                b.iv = static_cast<LONGLONG>(ri.ms * Freq() / 1000.0);
+                const double stepMs = ri.ms / static_cast<double>(burst);
+                b.step = static_cast<LONGLONG>(stepMs * Freq() / 1000.0);
                 // the lead is at most a step (the own generator's rule); wideCap (test): n steps = an app frame minus one step
-                bCapMs = cfg.wideCap ? bStepMs * static_cast<double>(burst - 1) : bStepMs;
-                bCap = static_cast<LONGLONG>(bCapMs * Freq() / 1000.0);
-                bLeadMs = cfg.testLeadMs > 0 ? (std::min)(cfg.testLeadMs, 2.0 * ri.ms) : lead.Freeze(bCapMs);
-                bLead = static_cast<LONGLONG>(bLeadMs * Freq() / 1000.0);
-                bCap = pacesched::LeadCap(bCap, bLead, cfg.testLeadMs > 0);     // a fixed test lead is not cut to a step
-                bBase = schedBase;
+                b.capMs = cfg.wideCap ? stepMs * static_cast<double>(burst - 1) : stepMs;
+                b.cap = static_cast<LONGLONG>(b.capMs * Freq() / 1000.0);
+                b.leadMs = cfg.testLeadMs > 0 ? (std::min)(cfg.testLeadMs, 2.0 * ri.ms) : lead.Freeze(b.capMs);
+                b.lead = static_cast<LONGLONG>(b.leadMs * Freq() / 1000.0);
+                b.cap = pacesched::LeadCap(b.cap, b.lead, cfg.testLeadMs > 0);     // a fixed test lead is not cut to a step
+                batches.push_back(b);
+                while (batches.size() > 64)
+                    batches.pop_front();            // (frames of a dropped batch go out on the burst spacing)
                 batchValid = true;
                 ++g_schedBatches;
                 if (Collect())
                 {
                     std::lock_guard<std::mutex> l(g_outMu);
-                    g_leadMin = (std::min)(g_leadMin, bLeadMs);
-                    g_leadMax = (std::max)(g_leadMax, bLeadMs);
+                    g_leadMin = (std::min)(g_leadMin, b.leadMs);
+                    g_leadMax = (std::max)(g_leadMax, b.leadMs);
                 }
             }
         }
-        if (!batchValid)
+        if (!batchValid || batches.empty())
             return;
+        const Batch& cb = batches.back();
         it.sched = true;
         it.j = curCount - 1;
         it.b = burst;
-        it.step = bStep;
-        it.leadMs = bLeadMs;
-        it.stepMs = bCapMs;             // the lead's cap: EndFrame limits the lead to it
-        it.due = bBase + pacelead::Offset(bLead, bStep, it.j + 1, bCap);
+        it.batch = cb.seq;
+        it.step = cb.step;
+        it.leadMs = cb.leadMs;
+        it.stepMs = cb.capMs;           // the lead's cap: EndFrame limits the lead to it
         if (it.j < 8 && Collect())      // how long after the game's Present each frame of the burst arrives (is Intel's own spacing wider than our step?)
         {
-            const double off = static_cast<double>(arrived - bStamp) * 1000.0 / Freq();
+            const double off = static_cast<double>(arrived - cb.stamp.cpu) * 1000.0 / Freq();
             g_arrSum[it.j] = g_arrSum[it.j].load() + off;
             g_arrMax[it.j] = (std::max)(g_arrMax[it.j].load(), off);
             ++g_arrN[it.j];
@@ -473,6 +631,8 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         batchValid = false;
         schedBase = 0;
         leadOpen = false;
+        ++epoch;                        // batches already planned stay for their queued frames but do not touch the new state
+        lastCpuIv = lastGpuIv = 0;
     }
 
     IDXGISwapChain4* real() const { return r; }
@@ -597,6 +757,8 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         list->Close();
         if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
             return false;
+        if (SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stampFence))))
+            watchEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);      // (no fence: the schedule is based on the CPU times, as without SinkGpuStamps)
         fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         libEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         alwaysSignaled = CreateEventW(nullptr, TRUE, TRUE, nullptr);
@@ -721,6 +883,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             Item it {};
             long long target;
             uint64_t n;
+            double itemLagMs = 0;       // the lag its batch was scheduled with (the lag rule raises from it)
             {
                 std::unique_lock<std::mutex> l(mu);
                 cvItem.wait(l, [&] { return stop || !q.empty(); });
@@ -730,10 +893,17 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 n = presented;
                 const LONGLONG now = Now();
                 const double spacing = burst > 1 && lastFull ? sTicks : 0;
+                Batch* bp = it.sched && !it.direct ? FindBatch(it.batch) : nullptr;
+                if (bp)
+                    ResolveBatch(l, *bp);       // may wait for the GPU stamp (the lock is let go meanwhile; only this thread pops the queue)
                 if (it.direct)
                     target = now;               // SinkPace=off or display-paced: on arrival (its copy still comes first, below)
-                else if (it.sched)
-                    target = pacesched::Bound(it.due, it.step, lastRelease);   // a late frame: on arrival, never closer than half a step to the last
+                else if (bp)
+                {
+                    itemLagMs = bp->lagMs;
+                    // a late frame: on arrival, never closer than half a step to the last
+                    target = pacesched::Bound(bp->base + pacelead::Offset(bp->lead, bp->step, it.j + 1, bp->cap), it.step, lastRelease);
+                }
                 else if (spacing <= 0)
                     target = now;               // frame generation off or not running (short bursts), or the pace not known yet: as it comes
                 else
@@ -801,6 +971,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 if (it.j + 1 < it.b)
                 {
                     ++g_schedFrames;
+                    lag.Late(itemLagMs, lateMs, ri.ms, cfg.maxLag);
                     if (leadOpen && lateMs > pacelead::kLateMs)
                     {
                         ++g_schedLate;
@@ -812,11 +983,17 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                         lead.Late(lateMs);
                     }
                 }
-                else if (leadOpen)
+                else
                 {
-                    lead.EndFrame(openFrozen, openStep);
-                    leadOpen = false;
+                    lag.EndFrame();
+                    if (leadOpen)
+                    {
+                        lead.EndFrame(openFrozen, openStep);
+                        leadOpen = false;
+                    }
                 }
+                while (!batches.empty() && batches.front().seq < it.batch)
+                    batches.pop_front();        // the batches before this one are done
             }
             ++presented;
             if (FAILED(hr))
@@ -834,6 +1011,38 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         cvSpace.wait(l, [&] { return q.empty(); });
     }
 
+    // The GPU stamp watcher (see the top), as the own generator's (xefg_own.h, StartPresenter): a thread of its own, so a busy pacer does
+    // not stamp late. It takes the fence's values in order (1, 2, ...); each is stamped when its completion event fires (the value is
+    // re-read after every wake: a wake left over from an earlier registration must not stamp a frame that is not done yet) and published
+    // under mu. A value nobody signalled yet is just waited for (the 50 ms timeout re-registers, which also lets Release stop it).
+    void Watch()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        uint64_t f = 1;
+        while (!wQuit)
+        {
+            const UINT64 done = stampFence->GetCompletedValue();
+            if (done == UINT64_MAX)
+            {
+                Sleep(50);                  // device removed: no stamps (the pacer falls back to the CPU times)
+                continue;
+            }
+            if (done < f)
+            {
+                stampFence->SetEventOnCompletion(f, watchEvent);
+                WaitForSingleObject(watchEvent, 50);
+                continue;
+            }
+            const LONGLONG t = Now();
+            {
+                std::lock_guard<std::mutex> l(mu);
+                gpuRing.Publish(f, t);
+            }
+            cvGpu.notify_all();
+            ++f;
+        }
+    }
+
 public:
     // queueUnknown: what the library gave CreateSwapChainForHwnd (the chain's command queue). ok() false: not a D3D12 queue, use the real chain as it is.
     SinkSwapChain(IDXGISwapChain4* realChain, UINT appCount, IUnknown* queueUnknown, bool stableBuffers)
@@ -842,6 +1051,8 @@ public:
         ok = Init(queueUnknown);
         if (ok)
             worker = std::thread([this] { Run(); });
+        if (ok && stampFence && watchEvent)
+            watcher = std::thread([this] { Watch(); });
     }
     bool Ok() const { return ok; }
 
@@ -872,24 +1083,35 @@ public:
         ResetSchedule();
     }
     // The game side's Present call at `t` (QPC): the base of the next batch (see the top)
+    // With GPU stamps (SinkGpuStamps, default) the call also signals the stamp fence on the chain's queue, right behind the game's frame
+    // work submitted so far; the watcher stamps the time the GPU gets there. Signal is a queue call that does not wait for the GPU, so
+    // the game's thread is not held. The interval the schedule steps by (ri) stays on the CPU times: it is a mean, the jitter averages out.
     void AppPresent(LONGLONG t)
     {
-        std::lock_guard<std::mutex> l(mu);
-        if (cfg.mode == PaceMode::Burst || cfg.mode == PaceMode::Off)
-            return;                 // no schedule: no stamps (they would only pile up unused)
-        if (lastStamp)
-            ri.Observe(static_cast<double>(t - lastStamp) * 1000.0 / Freq());
-        lastStamp = t;
-        ++stampsSeen;
-        ++g_schedStamps;
-        if (sched)
+        std::lock_guard<std::mutex> sg(sigMu);
+        uint64_t v = 0;
         {
-            stamps.push_back(t);
-            if (stamps.size() > 8)
-                stamps.pop_front();
+            std::lock_guard<std::mutex> l(mu);
+            if (cfg.mode == PaceMode::Burst || cfg.mode == PaceMode::Off)
+                return;                 // no schedule: no stamps (they would only pile up unused)
+            if (lastStamp)
+                ri.Observe(static_cast<double>(t - lastStamp) * 1000.0 / Freq());
+            lastStamp = t;
+            ++stampsSeen;
+            ++g_schedStamps;
+            if (sched)
+            {
+                if (cfg.gpuStamps && stampFence && watcher.joinable())
+                    v = ++stampValue;
+                stamps.push_back({ t, v });
+                if (stamps.size() > 8)
+                    stamps.pop_front();
+            }
+            else
+                stamps.clear();
         }
-        else
-            stamps.clear();
+        if (v)
+            queue->Signal(stampFence, v);
     }
 
     size_t MaxDepth() const { return maxDepth; }
@@ -913,8 +1135,14 @@ public:
             }
             cvItem.notify_all();
             cvSpace.notify_all();
+            cvGpu.notify_all();
             if (worker.joinable())
                 worker.join();
+            wQuit = true;
+            if (watchEvent)
+                SetEvent(watchEvent);
+            if (watcher.joinable())
+                watcher.join();
             g_depthStat = maxDepth;
             g_fullStat = fullWaits;
             ReleaseSlots();
@@ -925,6 +1153,10 @@ public:
                 list->Release();
             if (fence)
                 fence->Release();
+            if (stampFence)
+                stampFence->Release();
+            if (watchEvent)
+                CloseHandle(watchEvent);
             if (qheap)
                 qheap->Release();
             if (qread)

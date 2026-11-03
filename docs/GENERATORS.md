@@ -190,8 +190,22 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     sooner than half a step after the last (`pacesched::Bound`; no bunching). First frames (fewer than 6 stamps), no wrapper (the game's own
     chain from `InitFromSwapChain`), FG off (burst 1) and a changed burst size or resized chain fall back to / restart from the burst
     spacing; a short burst (a menu) is released on its planned time for frame 0 and as it comes after. dlssg is unchanged (burst spacing).
-    The pieces shared with the own generator are in `src/pace_sched.h` (and `pace_lead.h`). Base: the Present call, not the app frame's GPU-ready
-    stamp as in Own; a late app GPU frame therefore shows up as late generated frames and raises the lead. Only our own GPU wait counts as
+    The pieces shared with the own generator are in `src/pace_sched.h` (and `pace_lead.h`). Base: the app frame's GPU-ready stamp as in Own (`SinkGpuStamps=1`,
+    default; `0` takes the CPU time of the Present for an A/B). `AppPresent` signals a fence of the sink's own on the chain's queue (the
+    queue the game presents on, so the signal lands behind its frame work; a queue `Signal`, nothing waits on the game's thread) and a
+    watcher thread (as Own's) takes the time the fence completed. The pairing of a burst with a Present stays by the CPU time of the Present
+    (`pacesched::PickStampBy`; a GPU time can be later than the burst's arrival, because the library hands over its first generated frame
+    before the GPU finished the game's frame), and the base is read when the pacer thread reaches the batch's first frame (`ResolveBatch`),
+    waiting at most two app frame intervals (4..50 ms) for a GPU time that is not there yet. No GPU time (no fence, device removed, the wait
+    ran out): that batch is based on the CPU time, counted ("schedule bases" line of the sink statistics, with the lag and how far the GPU
+    stamp trails the Present). Precision: the time is a thread's wake-up after the fence completed (tens of microseconds to ~1 ms late), and a
+    GPU more than a frame behind stamps several frames at one wake-up (those are late, never early). Lag (`pacesched::Lag`, `MaxLag=`,
+    default 0.5 app frames, 0 = none): the base runs behind the GPU stamp by as much as generated frames came out late lately, as Own's
+    `paceLag` (raised at once to the most a frame was late on top of the lag its batch was scheduled with, 0.98 per batch down, capped at
+    MaxLag app frames). Lead and lag: base = stamp + lag, frame j at base + Offset(lead, step, j + 1); the lag moves the batch later, the lead
+    earlier by (step - lead). Own uses the lead on its D3D12 path and the lag on its CUDA path, never both; the sink has both, fed by the
+    same late measurement (`MaxLag=0` or `PaceLead=off` take either out). `kAutoMaxBurst` is unchanged: `SinkPace=schedule` at 3x-6x uses
+    the GPU stamps and the lag, the A/B decides whether Auto may follow. Only our own GPU wait counts as
     late for the lead (a frame that arrived after its time is presented on arrival and does not raise it). After a late frame the lead
     stays raised for up to 128 application frames (`pacelead::kWindow`) and eases down by 1/16 per frame, so a menu (short bursts) that
     follows keeps the higher lead's latency for a few seconds. A Present with `DXGI_PRESENT_TEST` is neither stamped nor sampled.

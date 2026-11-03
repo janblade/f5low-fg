@@ -79,6 +79,75 @@ template <class Deque> inline bool PickStamp(Deque& stamps, long long arrived, l
     return true;
 }
 
+// The same pairing for stamps that are more than a time: `key(entry)` is the CPU time of the game's Present (the clock the burst's
+// arrival is on). The pairing is ALWAYS by that time, in Present order - never by the GPU stamp that came to belong to the entry: the
+// library may hand its first generated frame to the sink before the GPU has finished the application's frame (the Present is a CPU
+// call), so a GPU time can be later than the arrival and must not decide which Present a burst belongs to. The entry's GPU time, once
+// there, is only the VALUE the schedule is based on (GpuStampRing).
+template <class Deque, class Entry, class Key> inline bool PickStampBy(Deque& stamps, long long arrived, Entry& picked, Key key)
+{
+    while (stamps.size() > 1 && key(stamps[1]) <= arrived)
+        stamps.pop_front();
+    if (stamps.empty() || key(stamps.front()) > arrived)
+        return false;
+    picked = stamps.front();
+    stamps.pop_front();
+    return true;
+}
+
+// One application Present as the sink's schedule keeps it: the CPU time of the call, and the value of the fence signalled on the
+// application's queue right behind it (0: none was signalled - GPU stamps off, no fence, or an older Present).
+struct AppStamp
+{
+    long long cpu = 0;
+    uint64_t fence = 0;
+};
+
+// The times the GPU reached the fence values signalled behind the game's Presents (sink/sink.h: a watcher thread takes the time at
+// which the fence's completion event fired, as the own generator's watcher does for appFence, xefg_own.h StartPresenter). Values are
+// consecutive (1, 2, 3 ...); the last kN are kept. Not thread-safe: the sink guards it with its mutex.
+class GpuStampRing
+{
+    static constexpr size_t kN = 64;
+    long long at[kN] {};
+    uint64_t done = 0;                      // the values [1, done] have a time
+
+public:
+    // The time (QPC ticks) the GPU reached fence value `v`. Values must come in order; a skipped one just has no time.
+    void Publish(uint64_t v, long long t)
+    {
+        if (v <= done)
+            return;
+        at[v % kN] = t;
+        done = v;
+    }
+    // False: not reached yet (or forgotten, kN values back, or 0 = never signalled): the caller falls back to the CPU time.
+    bool Get(uint64_t v, long long& t) const
+    {
+        if (!v || v > done || done - v >= kN)
+            return false;
+        t = at[v % kN];
+        return true;
+    }
+};
+
+// The schedule's lag behind the GPU timeline, as the own generator keeps it (xefg_own.h, paceLag): raised at once to the most a
+// generated frame came out late on top of the lag its batch was scheduled with, never above maxLag app frames, falling by 2% per app
+// frame while nothing comes out late. Under a GPU the game keeps busy the first generated frame needs that time for the library's
+// work; with no lag the frames go out late and uneven. "Late" is only our own GPU wait (a frame that arrived after its time is not).
+constexpr double kLagLateMs = 0.5;          // the own generator raises the lag for a frame more than this far past its time
+struct Lag
+{
+    double ms = 0;
+    // A generated frame came out `late` ms past its time; `scheduled`: the lag its batch was scheduled with; `intervalMs`: the app frame interval.
+    void Late(double scheduled, double late, double intervalMs, double maxLagFrames)
+    {
+        if (late > kLagLateMs)
+            ms = std::min(std::max(ms, scheduled + late), intervalMs * maxLagFrames);
+    }
+    void EndFrame() { ms *= 0.98; }         // after each batch
+};
+
 // The cap of the lead (ticks) a batch is planned with: `cap` (a step, or n steps with the wide-cap test) for the lead rule; a fixed test
 // lead (F5LOW_TEST_SINK_LEAD_MS) is never cut by it - the experiment must run the lead it asks for.
 inline long long LeadCap(long long cap, long long lead, bool fixedTestLead) { return fixedTestLead ? std::max(cap, lead) : cap; }
