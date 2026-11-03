@@ -208,6 +208,23 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     each source: a changed source is copied again, a deleted or altered copy is made again, an unchanged one is not touched; files are
     written under a temporary name and moved into place. A folder that already has the renamed files is used as it is, but only if
     no plain-named `sl.*.dll` sits next to them (Streamline's plugin scan would load it). Plain-named files are never loaded.
+  - *Own nvngx_dlssg only.* DLSS-G must run on the private `nvngx_dlssg.dll` in `f5low_streamline\`, never on a game's own copy (a game
+    shipping Streamline 2.11.1 with nvngx_dlssg 310.6 had the GPU fault at level load when DLSS-G ran on it). On every GPU tier f5low
+    loads its copy by full path before `slInit` (a different nvngx_dlssg already in the process is logged with both paths and versions).
+    After DLSS-G is up it checks that no other `nvngx_dlssg*` module is loaded and that a bare-name lookup resolves to ours; otherwise
+    `dlssg` is refused like any other dlssg error (status 3, no fallback): `a different nvngx_dlssg.dll (<path>, <version>) is loaded in the
+    game: DLSS-G would run on it`. A driver-downloaded copy under `NGX\models\dlssg\` counts as foreign too. The check also runs when DLSS-G is first switched on and
+    a few presents later (NGX may load its module late); a foreign copy found then switches DLSS-G off, with the reason in the log and
+    `f5lowGetStatus`. A foreign copy already in the process before ours loads is refused before `slInit`. `F5LOW_DLSSG_ALLOW_FOREIGN=1`
+    (environment only; OptiScaler sets it when the player keeps the game's DLSS-G) turns the refusal into a log line. OptiScaler only
+    allows the private copy under `<plugins>\f5low_streamline`, so a Streamline folder used as-is through `F5LOW_STREAMLINE_DIR` or
+    `DlssgPath` outside it gets blocked when OptiScaler's F5Low DLSS-G block is on. Rule:
+    `src/generators/dlssg_own.h`, test `tests\dlssg_own_test.cpp`.
+  - *Early load.* OptiScaler calls `uint32_t f5lowPrepareDlssg()` (cdecl export) right after loading f5low.dll when the generator is DLSS-G:
+    it makes the private copy and loads our `nvngx_dlssg.dll` before the game's Streamline asks NGX (NGX marks DLSS-G unavailable
+    process-wide otherwise). File I/O and LoadLibrary only, safe under the loader lock; returns 1 when loaded, 0 (logged) otherwise. The
+    module is NOT unlock-patched there (the RTX 20-40 tier needs the CUDA device behind the game's D3D12 device, known only at context
+    time), so on RTX 20-40 the game's own DLSS-G must stay off while F5Low DLSS-G is on.
   - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G paces its own frames (it presents from a
     thread of its own, with the driver's flip metering) and the sink queues each present and shows it on the real chain, spacing a full
     burst by the smoothed burst interval (`SetBurst(n + 1)` from the multiplier). Logged once per context: `dlssg: DLSS-G paces its own
@@ -247,6 +264,24 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     refused (status 3) on a driver whose functions have a prologue it cannot copy. Tests: `tests/build_mfgunlock_tests.ps1`
     (`mfgunlock_core_smoke` on synthetic images, `mfgunlock_check`, `mfgunlock_fatbin_refs`, `mfgunlock_turing_probe` and `unlock_hook_probe` on
     the player's own `nvngx_dlssg.dll` / `sl.dlss_g.dll`, passed as arguments and never copied into the repo).
+  - *The NVAPI kernel path (RTX 20/30, `src/unlock/NvapiKernels.h`, `NvapiFatbin.h`).* DLSS-G makes no CUDA calls: it creates its ~80 kernels
+    through NVAPI (`nvapi_QueryInterface` id 0xAD1A677D, device + image + size) and launches them as D3D12 compute work. Every image is a CUDA
+    fatbin container with PTX for Ada/Blackwell, which an RTX 20/30 driver cannot use (the CUDA module-load hook above never fires). Nothing
+    global is hooked: our private nvngx_dlssg and sl.dlss_g import `GetProcAddress` from kernel32 (read from their import tables), and the
+    slot of THOSE TWO modules is pointed at a function that answers the name `nvapi_QueryInterface` with a filter; the filter returns the real
+    answer for every id except 0xAD1A677D, where it returns a wrapper. So nvapi_QueryInterface itself is never patched (OptiScaler Detours-hooks
+    it: a code patch of ours would clash), no other caller is touched, and no caller check is needed. The wrapper replaces the container by a
+    new one with a single, uncompressed PTX image for the card, built from the shipped one's own headers: RTX 30 the source PTX with
+    `.target sm_86`, RTX 20 the same through the sm_75 rewrite of `PtxTuring.h`. The source is the Blackwell PTX when the container has one,
+    else the Ada PTX, or the sm_86 PTX the Ampere family already retargeted in memory. A container that cannot be rewritten, or that the driver
+    refuses, goes to the real create as shipped (counted; the first reason is logged); the create is repeated only when the first call
+    returned an error without writing the output handle. The new containers stay alive for the process. The hook is placed before the patches
+    are applied and a failure to place it fails the unlock like the CUDA loaders do (status 3); f5low.dll is pinned. RTX 40 and newer: no hook
+    (`F5LOW_NVAPI_COUNT=1` installs it count-only, for tests; `F5LOW_NVAPI_DISABLE=1` leaves it out, `F5LOW_TEST_E9_QI=1` first puts a
+    Detours-style E9 hook on nvapi_QueryInterface). One log line at the end: `dlssg kernels: <tier> path, N of M retargeted|rewritten, K passed
+    through, F failed (<first reason>), ..., took X ms` (the driver's JIT happens inside the create, so X is mostly JIT: a second start is
+    faster through the driver's cache), or `hook installed, 0 kernel creations seen`. Test without a GPU: `tests/build_nvapi_fatbin_test.ps1`
+    (synthetic containers, the create flow with a fake driver call).
   - *Credits.* The sl.dlss_g frame-count clamp and software-pacing approach is adapted from KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT, from
     the RenoDX MFG Unlock addon by Dreamt and mavismmg): the notice is in `licenses/MFGUnlock_LICENSE.txt`.
   - *Later.* Story 2b: kernels tuned for RTX 20/30; story 3: tester proof on real RTX 40/30/20 cards; story 4: OptiScaler side (generator
