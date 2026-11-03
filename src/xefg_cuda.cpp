@@ -1836,8 +1836,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
         }
         FORWARDH(xefgSwapChainD3D12InitFromSwapChainDesc, h, wnd, d, fs, q, sf2, ip);
         sf2->Release();
-        Log("D3D12InitFromSwapChainDesc %ux%u fmt=%d buffers=%u effect=%d flags=0x%x queue=%p -> %d (intel, through the sink%s)", d->Width, d->Height,
-            static_cast<int>(d->Format), d->BufferCount, static_cast<int>(d->SwapEffect), d->Flags, static_cast<void*>(q), r, sf->HasSink() ? "" : ": NOT on the sink");
+        Log("D3D12InitFromSwapChainDesc %ux%u fmt=%d buffers=%u effect=%d flags=0x%x queue=%p -> %d (intel, through the sink factory%s)", d->Width, d->Height,
+            static_cast<int>(d->Format), d->BufferCount, static_cast<int>(d->SwapEffect), d->Flags, static_cast<void*>(q), r, sf->HasSink() ? ", sink made" : ", no sink yet");
         LogInitParams("params", ip);
         if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
