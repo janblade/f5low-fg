@@ -144,6 +144,13 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     each source: a changed source is copied again, a deleted or altered copy is made again, an unchanged one is not touched; files are
     written under a temporary name and moved into place. A folder that already has the renamed files is used as it is, but only if
     no plain-named `sl.*.dll` sits next to them (Streamline's plugin scan would load it). Plain-named files are never loaded.
+  - *Own nvngx_dlssg only.* DLSS-G must run on the private `nvngx_dlssg.dll` in `f5low_streamline\`, never on a game's own copy (a game
+    shipping Streamline 2.11.1 with nvngx_dlssg 310.6 had the GPU fault at level load when DLSS-G ran on it). On every GPU tier f5low
+    loads its copy by full path before `slInit` (a different nvngx_dlssg already in the process is logged with both paths and versions).
+    After DLSS-G is up it checks that no other `nvngx_dlssg*` module is loaded and that a bare-name lookup resolves to ours; otherwise
+    `dlssg` is refused like any other dlssg error (status 3, no fallback): `a different nvngx_dlssg.dll (<path>, <version>) is loaded in the
+    game: DLSS-G would run on it`. `F5LOW_DLSSG_ALLOW_FOREIGN=1` (environment only) turns the refusal into a log line. Rule:
+    `src/generators/dlssg_own.h`, test `tests\dlssg_own_test.cpp`.
   - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G paces its own frames (it presents from a
     thread of its own, with the driver's flip metering) and the sink queues each present and shows it on the real chain, spacing a full
     burst by the smoothed burst interval (`SetBurst(n + 1)` from the multiplier). Logged once per context: `dlssg: DLSS-G paces its own

@@ -31,8 +31,10 @@
 #include "../generator.h"
 #include "../sink/sink.h"
 #include "dlssg_files.h"
+#include "dlssg_own.h"
 #include "../unlock/Unlock.h"
 
+#include <psapi.h>
 #include <sl.h>
 #include <sl_dlss_g.h>
 #include <sl_pcl.h>
@@ -55,6 +57,7 @@ using LogFn = void (*)(const char* fmt, ...);
 struct Streamline
 {
     HMODULE m = nullptr;
+    std::wstring ownNgx;     // our private nvngx_dlssg.dll (full path)
     PFun_slInit* init = nullptr;
     PFun_slIsFeatureSupported* isSupported = nullptr;
     PFun_slSetTagForFrame* setTag = nullptr;
@@ -89,6 +92,100 @@ inline void SlLog(sl::LogType type, const char* msg)
 {
     if (g_log && type != sl::LogType::eInfo)
         g_log("dlssg: streamline %s: %s", type == sl::LogType::eWarn ? "warning" : "error", msg);
+}
+
+// Which nvngx_dlssg is in use (dlssg_own.h has the rule). Generator=dlssg runs DLSS-G on OUR copy: it is loaded by full path before slInit
+// on every tier, and after DLSS-G is up no other nvngx_dlssg* may be in the process (a game's own 310.6 under Streamline 2.11.1 got the
+// driver to run DLSS-G on it: GPU fault at level load in A Plague Tale: Resonance). F5LOW_DLSSG_ALLOW_FOREIGN=1 only logs.
+#pragma comment(lib, "version.lib")
+inline std::wstring ModulePathOf(HMODULE m)
+{
+    std::wstring p(1024, L'\0');
+    const DWORD n = GetModuleFileNameW(m, p.data(), static_cast<DWORD>(p.size()));
+    p.resize(n < p.size() ? n : 0);
+    return p;
+}
+inline std::vector<std::wstring> LoadedNgxModules()
+{
+    std::vector<std::wstring> out;
+    std::vector<HMODULE> mods(1024);
+    DWORD need = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &need))
+        return out;
+    if (need > mods.size() * sizeof(HMODULE))
+    {
+        mods.resize(need / sizeof(HMODULE));
+        if (!K32EnumProcessModules(GetCurrentProcess(), mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &need))
+            return out;
+    }
+    for (size_t i = 0; i < need / sizeof(HMODULE) && i < mods.size(); ++i)
+    {
+        const std::wstring p = ModulePathOf(mods[i]);
+        if (IsNgxDlssgName(p))
+            out.push_back(p);
+    }
+    return out;
+}
+inline std::string FileVersionOf(const std::wstring& path)
+{
+    DWORD dummy = 0;
+    const DWORD sz = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    std::vector<char> buf(sz);
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!sz || !GetFileVersionInfoW(path.c_str(), 0, sz, buf.data()) || !VerQueryValueW(buf.data(), L"\\", reinterpret_cast<LPVOID*>(&fi), &len) || !fi)
+        return "version unknown";
+    char v[64];
+    snprintf(v, sizeof v, "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS), HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    return v;
+}
+inline std::string DescribeNgx(const std::wstring& path) { return Narrow(path) + ", " + FileVersionOf(path); }
+
+inline bool g_allowForeignNgx = false;
+// Our nvngx_dlssg.dll, by full path, before slInit (every tier; the unlock's own load of the same path then returns this handle). The
+// reference is kept for the life of the process. A different nvngx_dlssg already in the process is logged with both paths and versions.
+inline bool PreloadOwnNgx(const std::wstring& dir, std::wstring& ownPath, std::string& why)
+{
+    ownPath = longpath::Plain(dir + L"\\nvngx_dlssg.dll");
+    const NgxVerdict before = JudgeNgx(ownPath, LoadedNgxModules());
+    if (g_log)
+        for (const std::wstring& f : before.foreign)
+            g_log("dlssg: a different nvngx_dlssg.dll is already in the process before ours is loaded: %s (ours: %s)", DescribeNgx(f).c_str(),
+                  DescribeNgx(ownPath).c_str());
+    static HMODULE keep = nullptr;
+    if (!keep)
+        keep = LoadLibraryW(ownPath.c_str());
+    if (!keep)
+    {
+        why = "cannot load " + Narrow(ownPath) + " (error " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    if (g_log)
+        g_log("dlssg: our nvngx_dlssg %p loaded by full path (%s)", static_cast<void*>(keep), DescribeNgx(ownPath).c_str());
+    return true;
+}
+// After DLSS-G is up: only our nvngx_dlssg may be in the process. On false, `why` has the reason.
+inline bool CheckOwnNgxInUse(const std::wstring& ownPath, std::string& why)
+{
+    std::vector<std::wstring> loaded = LoadedNgxModules();
+    if (const HMODULE bare = GetModuleHandleW(L"nvngx_dlssg.dll"))
+        loaded.push_back(ModulePathOf(bare));       // what a bare-name load resolves to
+    const NgxVerdict v = JudgeNgx(ownPath, loaded);
+    if (v.Ok())
+        return true;
+    for (const std::wstring& f : v.foreign)
+    {
+        const std::string msg = "a different nvngx_dlssg.dll (" + DescribeNgx(f) + ") is loaded in the game: DLSS-G would run on it" +
+                                (v.ownLoaded ? " (ours is loaded too: " : " (ours is not loaded: ") + DescribeNgx(ownPath) + ")";
+        if (g_allowForeignNgx)
+        {
+            if (g_log)
+                g_log("dlssg: %s - F5LOW_DLSSG_ALLOW_FOREIGN=1, continuing", msg.c_str());
+        }
+        else if (why.empty())
+            why = msg;
+    }
+    return g_allowForeignNgx;
 }
 
 // Loads and initialises Streamline from `dir` (the renamed folder, dlssg_files.h) on the first call and hands it `dev`. Null with the
@@ -129,6 +226,9 @@ inline Streamline* GetLocked(const std::wstring& dir, int gpuSm, ID3D12Device* d
                 s.error = "DLSS-G needs an RTX 20 or newer GeForce (this GPU is sm_" + std::to_string(gpuSm) + ")";
                 return nullptr;
             }
+            g_allowForeignNgx = unlock::EnvIsOne("F5LOW_DLSSG_ALLOW_FOREIGN");
+            if (!PreloadOwnNgx(dir, s.ownNgx, s.error))
+                return nullptr;
             const unlock::Result u = unlock::Apply(dir, tier);
             if (!u.ok)
             {
@@ -200,6 +300,9 @@ inline Streamline* GetLocked(const std::wstring& dir, int gpuSm, ID3D12Device* d
             s.error = "DLSS-G, Reflex or PCL did not load (an old driver, a plugin Streamline refused to load, or nvngx_dlssg.dll missing)";
             return nullptr;
         }
+        // Only our nvngx_dlssg may be in the process now (no silent fallback: refuse, with the reason)
+        if (!CheckOwnNgxInUse(s.ownNgx, s.error))
+            return nullptr;
         // DLSS-G refuses to run without Reflex (eDLSSGStatusFailReflexNotDetectedAtRuntime)
         sl::ReflexOptions ro {};
         ro.mode = sl::ReflexMode::eLowLatency;
