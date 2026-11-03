@@ -1276,7 +1276,6 @@ extern "C" __declspec(dllexport) uint32_t __cdecl f5lowPrepareDlssg()
         return result;
     done = true;
     xdlssg::g_log = XLog;
-    xdlssg::g_paceCfg = SinkPaceCfg;
     xdlssg::g_allowForeignNgx = unlock::EnvIsOne("F5LOW_DLSSG_ALLOW_FOREIGN");
     const xdlssg::Source src = xdlssg::Prepare(g_dir, StreamlineDirEnv(), DlssgPathSetting());
     if (!src.ok)
@@ -1296,6 +1295,8 @@ extern "C" __declspec(dllexport) uint32_t __cdecl f5lowPrepareDlssg()
 }
 
 // A foreign nvngx_dlssg found after the context exists (dlssg.h Ctx::NgxCheck): frame generation is off, f5lowGetStatus says 3 with the reason
+// The sink's pace config for the dlssg generator, set at load (f5lowPrepareDlssg may never run: older OptiScaler, a harness)
+static const bool g_paceCfgHook = (xdlssg::g_paceCfg = SinkPaceCfg, true);
 static const bool g_ngxRefusedHook = (xdlssg::g_onRefused = [](const std::string& why) { SetStatus(3, "dlssg unavailable: " + why); }, true);
 
 // Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask once, when they load the library).
@@ -1503,7 +1504,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             }
             SetStatus(1, "dlssg generator (DLSS-G through a private Streamline copy, up to " + std::to_string(dg.Caps().maxGenerated) + " generated), D3D12");
             Log("f5low: generator dlssg (%s)", dg.Caps().name);
-            Log("D3D12CreateContext device=%p -> Generator=dlssg: DLSS-G h=%p, Streamline from %S, DLSS-G paces its own frames", static_cast<void*>(d),
+            Log("D3D12CreateContext device=%p -> Generator=dlssg: DLSS-G h=%p, Streamline from %S, DLSS-G makes the frames, our sink paces them (SinkPace)", static_cast<void*>(d),
                 static_cast<void*>(*ph), c->sl->dir.c_str());
             return XEFG_SWAPCHAIN_RESULT_SUCCESS;
         }

@@ -225,10 +225,11 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     process-wide otherwise). File I/O and LoadLibrary only, safe under the loader lock; returns 1 when loaded, 0 (logged) otherwise. The
     module is NOT unlock-patched there (the RTX 20-40 tier needs the CUDA device behind the game's D3D12 device, known only at context
     time), so on RTX 20-40 the game's own DLSS-G must stay off while F5Low DLSS-G is on.
-  - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G paces its own frames (it presents from a
-    thread of its own, with the driver's flip metering) and the sink queues each present and shows it on the real chain, spacing a full
-    burst by the smoothed burst interval (`SetBurst(n + 1)` from the multiplier). Logged once per context: `dlssg: DLSS-G paces its own
-    frames (host pacer handed over)`.
+  - *Pacing.* The host's own pacer (`Own`: clock, gate, flip metering) is not involved. DLSS-G makes the frames (it presents from a
+    thread of its own, with the driver's flip metering) and our sink paces them per `SinkPace` (as for `intel`): the game's Presents
+    are stamped (the thin wrapper chain), and with `auto` the frames go out on the schedule at 2x (`kAutoMaxBurst`) and by the smoothed
+    burst interval above; `schedule` / `burst` force one. `SetBurst(n + 1)` follows what DLSS-G really runs: a frame without inputs is
+    burst 1 (out on arrival). Logged once per context: `dlssg: DLSS-G makes the frames, our sink paces them (SinkPace auto|schedule|burst)`.
   - *Latency.* Reflex is required and PCL present markers around the game's `Present` (a thin wrapper chain sets them). The driver
     multiplies a Reflex interval by DLSS-G's multiplier, so a shown-frame cap through Reflex must not be divided again: OptiScaler
     asks `xefgCudaDriverMultipliesReflexCap()` (below). XeLL is not used by this generator.
