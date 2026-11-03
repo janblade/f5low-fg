@@ -776,14 +776,16 @@ double MaxDelaySetting()
 // F5LOW_SINK_PACE (else SinkPace= in f5low.ini): how the intel generator's sink releases a burst. "auto" (default): the schedule for the
 // burst sizes where it is not worse than the burst spacing (sink/sink.h kAutoMaxBurst), else the burst spacing, the choice logged;
 // "schedule": always on the own generator's D3D12 schedule from the game's stamped Presents, with PaceLead; "burst": always by the burst
-// interval it measured. Tests only: F5LOW_TEST_SINK_LEADCAP=wide (the lead may reach n steps, not one), F5LOW_TEST_SINK_LEAD_MS=<ms> (a
+// interval it measured; "off": pass-through, every frame goes out on arrival (after its copy), no burst spacing, no schedule, no stamps (an A/B
+// switch: on RTX 40/50 DLSS-G meters its own flips through the driver, so `off` lets that pace them). In every mode a present with V-Sync (sync
+// interval > 0) or flags other than tearing is display-paced and goes out on arrival (sink/release_rule.h). Tests only: F5LOW_TEST_SINK_LEADCAP=wide (the lead may reach n steps, not one), F5LOW_TEST_SINK_LEAD_MS=<ms> (a
 // fixed lead, not clamped to a step).
 double PaceLeadSetting(bool* autoLead);
 xsink::PaceCfg SinkPaceCfg()
 {
     xsink::PaceCfg c;
     const std::string m = Setting("F5LOW_SINK_PACE", "SinkPace", "auto");
-    c.mode = m == "burst" ? xsink::PaceMode::Burst : m == "schedule" ? xsink::PaceMode::Schedule : xsink::PaceMode::Auto;
+    c.mode = m == "burst" ? xsink::PaceMode::Burst : m == "schedule" ? xsink::PaceMode::Schedule : m == "off" ? xsink::PaceMode::Off : xsink::PaceMode::Auto;
     c.leadFixedMs = PaceLeadSetting(&c.leadAuto);
     // Test switches: environment only, never the ini (a stray ini line must not change a player's pacing)
     char tv[32] = {};
@@ -1827,7 +1829,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
         f4->Release();
         {
             const xsink::PaceCfg pc = SinkPaceCfg();
-            ic->schedule = pc.mode != xsink::PaceMode::Burst;       // the game's Presents are stamped unless the burst spacing is forced
+            ic->schedule = pc.mode != xsink::PaceMode::Burst && pc.mode != xsink::PaceMode::Off;       // the game's Presents are stamped unless the burst spacing is forced or the pacing is off
             sf->SetPace(pc);
         }
         IDXGIFactory2* sf2 = nullptr;

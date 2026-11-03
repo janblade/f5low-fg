@@ -571,7 +571,7 @@ public:
         // The same pacing config the intel generator's sink gets: the game's Presents are stamped unless the burst spacing is forced.
         // Not on our sink: nothing to pace, nothing to stamp.
         const xsink::PaceCfg pc = g_paceCfg ? g_paceCfg() : xsink::PaceCfg {};
-        schedule = pc.mode != xsink::PaceMode::Burst;       // AppPresent is a no-op without a sink; a chain made later through our factory is stamped too
+        schedule = pc.mode != xsink::PaceMode::Burst && pc.mode != xsink::PaceMode::Off;       // AppPresent is a no-op without a sink; a chain made later through our factory is stamped too
         sf->SetPace(pc);
         if (chain)
             chain->Release();
@@ -593,7 +593,7 @@ public:
             g_log("dlssg: swap chain %ux%u fmt=%d buffers=%u flags=0x%x, DLSS-G makes up to %u, frames go through our sink", d->Width, d->Height,
                   static_cast<int>(d->Format), d->BufferCount, dd.Flags, maxGen);
             g_log("dlssg: DLSS-G makes the frames, our sink paces them (SinkPace %s%s)",
-                  !g_paceCfg ? "not set: burst spacing" : pc.mode == xsink::PaceMode::Schedule ? "schedule" : pc.mode == xsink::PaceMode::Burst ? "burst" : "auto",
+                  !g_paceCfg ? "not set: burst spacing" : pc.mode == xsink::PaceMode::Schedule ? "schedule" : pc.mode == xsink::PaceMode::Burst ? "burst" : pc.mode == xsink::PaceMode::Off ? "off: frames go out on arrival, DLSS-G's own flip metering paces" : "auto",
                   !onSink ? ", but Streamline's chain is not on our sink: DLSS-G paces its own" : "");
         }
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;

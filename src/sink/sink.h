@@ -37,6 +37,7 @@
 #include "scproxy.h"
 #include "../pace_lead.h"
 #include "../pace_sched.h"
+#include "release_rule.h"
 
 #include <d3d12.h>
 
@@ -107,9 +108,7 @@ inline std::vector<std::pair<uint64_t, int>> g_probe;    // SINK_PROBE (harness)
 inline constexpr size_t kProbeRows = 1500;
 inline std::vector<std::pair<uint64_t, std::vector<uint8_t>>> g_probeRows;
 
-// How a sink releases a burst (docs/GENERATORS.md, "intel"): by the burst interval it measured, on the own generator's schedule, or the
-// schedule where it is not worse than the burst spacing (per burst size, kAutoMaxBurst; the choice is logged).
-enum class PaceMode { Burst, Schedule, Auto };
+// PaceMode and the per-frame release decision (paced or on arrival) live in release_rule.h (host-tested).
 struct PaceCfg
 {
     PaceMode mode = PaceMode::Burst;
@@ -264,6 +263,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         LONGLONG due = 0, step = 0;
         uint32_t j = 0, b = 1;      // frame j (0 = first generated) of a batch of b
         double leadMs = 0, stepMs = 0;
+        bool direct = false;        // on arrival: SinkPace=off or a display-paced present (release_rule.h); no timer wait, no lead rule
     };
 
     static constexpr UINT kSlots = 12;      // staging textures: a 6x burst + the one being shown + the one being filled + slack
@@ -395,8 +395,8 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     void UpdateSched()
     {
         const bool was = sched;
-        sched = burst > 1 && (cfg.mode == PaceMode::Schedule || (cfg.mode == PaceMode::Auto && burst <= kAutoMaxBurst));
-        if (cfg.mode != PaceMode::Burst && burst > 1 && (sched != was || !logged) && g_log)
+        sched = burst > 1 && cfg.mode != PaceMode::Off && (cfg.mode == PaceMode::Schedule || (cfg.mode == PaceMode::Auto && burst <= kAutoMaxBurst));
+        if ((cfg.mode == PaceMode::Schedule || cfg.mode == PaceMode::Auto) && burst > 1 && (sched != was || !logged) && g_log)
         {
             logged = true;
             g_log("sink: %u frames per application frame: pacing by %s (%s)", burst, sched ? "the schedule" : "the burst interval",
@@ -404,6 +404,54 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         }
     }
     bool logged = false;
+
+    // Display-paced frames (release_rule.h): the state the last queued frame was in, for the one log line per change. mu held.
+    bool displayPaced = false;
+    LONGLONG lastDpLog = 0;
+    unsigned dpLogSkipped = 0;
+
+    // mu held: the frame about to be queued has sync/flags. Returns true when it goes out on arrival (Off, or paced by the display).
+    // Such a frame is taken out of ALL the pacing state: Observe (burst interval, spacing) and Plan (schedule, stamps, lead) never see
+    // it, and Run gives it no lateness for the lead rule. When the state changes, the burst/schedule state is reset, because it was
+    // measured on a different stream (frames missing from the bursts) and must be learned again.
+    bool NoteRelease(UINT sync, UINT flags)
+    {
+        const Release rel = ReleaseRule(sync, flags, cfg.mode);
+        const bool dp = rel == Release::OnArrivalDisplay;
+        if (dp != displayPaced)
+        {
+            displayPaced = dp;
+            ResetBurstState();
+            ResetSchedule();
+            if (g_log)
+            {
+                const LONGLONG now = Now();
+                // one line per change, and not more than one per second (a game that alternates flags every frame must not flood the log)
+                if (!lastDpLog || now - lastDpLog >= Freq())
+                {
+                    lastDpLog = now;
+                    g_log(dp ? "sink: display-paced (V-Sync): frames go out as they come%s" : "sink: paced again (tearing, no V-Sync)%s",
+                          dpLogSkipped ? " (state changes since the last line were not logged)" : "");
+                    dpLogSkipped = 0;
+                }
+                else
+                    ++dpLogSkipped;
+            }
+        }
+        return rel != Release::Paced;
+    }
+
+    void ResetBurstState()      // mu held: forget the measured burst interval and spacing (a new burst size, or the stream changed)
+    {
+        curCount = 0;
+        lastFull = false;
+        lastBurstStart = 0;
+        interval = 0;
+        hitchRun = offRun = 0;
+        sTicks = 0;
+        cleanSamples = 0;
+        emptyAt = 0;
+    }
 
     void ResetSchedule()        // mu held: a new burst size, a new chain size
     {
@@ -668,7 +716,9 @@ class SinkSwapChain final : public scproxy::LogSwapChain
                 n = presented;
                 const LONGLONG now = Now();
                 const double spacing = burst > 1 && lastFull ? sTicks : 0;
-                if (it.sched)
+                if (it.direct)
+                    target = now;               // SinkPace=off or display-paced: on arrival (its copy still comes first, below)
+                else if (it.sched)
                     target = pacesched::Bound(it.due, it.step, lastRelease);   // a late frame: on arrival, never closer than half a step to the last
                 else if (spacing <= 0)
                     target = now;               // frame generation off or not running (short bursts), or the pace not known yet: as it comes
@@ -791,14 +841,7 @@ public:
         burst = nb;
         UpdateSched();
         ResetSchedule();
-        curCount = 0;
-        lastFull = false;
-        lastBurstStart = 0;
-        interval = 0;
-        hitchRun = offRun = 0;
-        sTicks = 0;
-        cleanSamples = 0;
-        emptyAt = 0;
+        ResetBurstState();
     }
 
     // The pacing mode and the lead rule's setting (PaceLead: automatic, else fixedMs, 0 = off)
@@ -815,8 +858,8 @@ public:
     void AppPresent(LONGLONG t)
     {
         std::lock_guard<std::mutex> l(mu);
-        if (cfg.mode == PaceMode::Burst)
-            return;
+        if (cfg.mode == PaceMode::Burst || cfg.mode == PaceMode::Off)
+            return;                 // no schedule: no stamps (they would only pile up unused)
         if (lastStamp)
             ri.Observe(static_cast<double>(t - lastStamp) * 1000.0 / Freq());
         lastStamp = t;
@@ -897,11 +940,14 @@ public:
             blockedInBurst = true;
         }
         cvSpace.wait(l, [&] { return stop || q.size() < kMaxQueue; });
-        Observe(arrived);
+        const bool direct = NoteRelease(sync, flags);
+        if (!direct)
+            Observe(arrived);
         if (static const bool trace3 = Collect() && EnvSet("SINK_TRACE3"); trace3)    // tests: when each frame of a burst arrives
             fprintf(stdout, "sink: arrive %.3f\n", static_cast<double>(arrived) * 1000.0 / Freq());
         Item item { sync, flags, stable ? static_cast<UINT>(in % appBuffers) : static_cast<UINT>(in % kSlots) };
-        if (sched && burst > 1)
+        item.direct = direct;
+        if (!direct && sched && burst > 1)
             Plan(arrived, item);
         q.push_back(item);
         ++in;

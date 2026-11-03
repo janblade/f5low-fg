@@ -156,7 +156,7 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     `xefgCudaXellCountsRenderedOnly` stays 0.
   - *Sink.* `InitFromSwapChainDesc` hands Intel a `SinkFactory` (spaced mode); `SetEnabled` / `SetNumInterpolatedFrames` set the sink's burst
     (generated + 1; the factory remembers it, so a re-created chain starts with it). `InitFromSwapChain` (a chain the game made) cannot be sunk: the library presents on it itself (logged).
-  - *Pacing policy.* `F5LOW_SINK_PACE=auto` (default; `SinkPace=` in f5low.ini), `schedule` or `burst`. Auto picks per burst size (logged:
+  - *Pacing policy.* `F5LOW_SINK_PACE=auto` (default; `SinkPace=` in f5low.ini), `schedule`, `burst` or `off`. Auto picks per burst size (logged:
     "N frames per application frame: pacing by ..."): the schedule at 2x, the burst spacing from 3x. Why (harness A/B, 1.3.4.95, RTX 5070 Ti,
     20 s): at 2x the schedule removes the burst-start jitter (2x/30 gap sd 0.69 -> 0.24, pm_sd 2.0 -> 0.5, late <= 1 %). From 3x the first
     generated frame of every burst is late (~3 ms, about one late frame per batch, 12-20 % of generated frames at 4x/6x at 60 fps) and gap sd /
@@ -167,6 +167,14 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     the same picture (6x late 11 % / 23 %, gap sd 1.5 against 0.70). Only lead 6 at 4x/60 reaches late ~1 %, with a gap sd still six times
     the burst spacing's. A bigger lead costs latency and, past about one frame time, raises the late share (the frames wait behind the burst). Tests: `F5LOW_TEST_SINK_LEADCAP=wide`, `F5LOW_TEST_SINK_LEAD_MS=<ms>`, `SINK_TRACE3`; the sink log lists
     arrival offsets and late frames per burst frame j.
+  - *Display-paced presents and `off`.* A present with V-Sync (sync interval > 0) or flags other than tearing is paced by the display, and the
+    sink stands aside as the own generator does (`DisplayPaced` in xefg_own.h; `sink/release_rule.h` mirrors it): such a frame goes out as soon
+    as its staging copy is queued, with no wait for a time, and it does not feed the lead rule (never "late"), the burst interval, the spacing
+    or the schedule (no stamps are used while it lasts, and the stamp queue is capped at 8). When the state changes (V-Sync on or off) the
+    burst and schedule state is reset and learned again; one log line per change (`sink: display-paced (V-Sync): frames go out as they come`,
+    at most one per second). `SinkPace=off` does the same for every frame, V-Sync or not: pass-through, no burst spacing, no schedule, no
+    stamps. It is the A/B switch for DLSS-G: on RTX 40/50 DLSS-G sets the driver's flip metering itself, so with `off` the display
+    hardware spaces the flips and our timer is not a second pacer on the same chain. Default stays `auto` until a game A/B decides.
   - *Schedule mode.* **schedule**: the sink releases a burst on the own
     generator's D3D12 schedule instead of its measured burst interval. The game side's Present is stamped: `GetSwapChainPtr` returns Intel's
     proxy chain behind a thin wrapper (`xintel::StampChain`; the call is forwarded untouched, every other method passes through; it holds its
@@ -229,7 +237,7 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     thread of its own, with the driver's flip metering) and our sink paces them per `SinkPace` (as for `intel`): the game's Presents
     are stamped (the thin wrapper chain), and with `auto` the frames go out on the schedule at 2x (`kAutoMaxBurst`) and by the smoothed
     burst interval above; `schedule` / `burst` force one. `SetBurst(n + 1)` follows what DLSS-G really runs: a frame without inputs is
-    burst 1 (out on arrival). Logged once per context: `dlssg: DLSS-G makes the frames, our sink paces them (SinkPace auto|schedule|burst)`.
+    burst 1 (out on arrival). Logged once per context: `dlssg: DLSS-G makes the frames, our sink paces them (SinkPace auto|schedule|burst|off)`.
   - *Latency.* Reflex is required and PCL present markers around the game's `Present` (a thin wrapper chain sets them). The driver
     multiplies a Reflex interval by DLSS-G's multiplier, so a shown-frame cap through Reflex must not be divided again: OptiScaler
     asks `xefgCudaDriverMultipliesReflexCap()` (below). XeLL is not used by this generator.

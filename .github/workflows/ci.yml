@@ -71,6 +71,13 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_pace_sched_test.ps1 -VsPath $vs
 
+      # The sink's per-frame release rule, display-paced and SinkPace=off (src/sink/release_rule.h): no GPU
+      - name: Sink release rule test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_release_rule_test.ps1 -VsPath $vs
+
       # The sink's DXGI wrappers refuse Streamline's real-object IID (src/sink/scproxy.h): no GPU
       - name: Sink IID test
         shell: pwsh
