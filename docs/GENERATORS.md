@@ -183,6 +183,24 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
     refused (status 3) on a driver whose functions have a prologue it cannot copy. Tests: `tests/build_mfgunlock_tests.ps1`
     (`mfgunlock_core_smoke` on synthetic images, `mfgunlock_check`, `mfgunlock_fatbin_refs`, `mfgunlock_turing_probe` and `unlock_hook_probe` on
     the player's own `nvngx_dlssg.dll` / `sl.dlss_g.dll`, passed as arguments and never copied into the repo).
+  - *The NVAPI kernel path (RTX 20/30, `src/unlock/NvapiKernels.h`, `NvapiFatbin.h`).* DLSS-G makes no CUDA calls: it creates its ~80 kernels
+    through NVAPI (`nvapi_QueryInterface` id 0xAD1A677D, device + image + size) and launches them as D3D12 compute work. Every image is a CUDA
+    fatbin container with PTX for Ada/Blackwell, which an RTX 20/30 driver cannot use (the CUDA module-load hook above never fires). Nothing
+    global is hooked: our private nvngx_dlssg and sl.dlss_g import `GetProcAddress` from kernel32 (read from their import tables), and the
+    slot of THOSE TWO modules is pointed at a function that answers the name `nvapi_QueryInterface` with a filter; the filter returns the real
+    answer for every id except 0xAD1A677D, where it returns a wrapper. So nvapi_QueryInterface itself is never patched (OptiScaler Detours-hooks
+    it: a code patch of ours would clash), no other caller is touched, and no caller check is needed. The wrapper replaces the container by a
+    new one with a single, uncompressed PTX image for the card, built from the shipped one's own headers: RTX 30 the source PTX with
+    `.target sm_86`, RTX 20 the same through the sm_75 rewrite of `PtxTuring.h`. The source is the Blackwell PTX when the container has one,
+    else the Ada PTX, or the sm_86 PTX the Ampere family already retargeted in memory. A container that cannot be rewritten, or that the driver
+    refuses, goes to the real create as shipped (counted; the first reason is logged); the create is repeated only when the first call
+    returned an error without writing the output handle. The new containers stay alive for the process. The hook is placed before the patches
+    are applied and a failure to place it fails the unlock like the CUDA loaders do (status 3); f5low.dll is pinned. RTX 40 and newer: no hook
+    (`F5LOW_NVAPI_COUNT=1` installs it count-only, for tests; `F5LOW_NVAPI_DISABLE=1` leaves it out, `F5LOW_TEST_E9_QI=1` first puts a
+    Detours-style E9 hook on nvapi_QueryInterface). One log line at the end: `dlssg kernels: <tier> path, N of M retargeted|rewritten, K passed
+    through, F failed (<first reason>), ..., took X ms` (the driver's JIT happens inside the create, so X is mostly JIT: a second start is
+    faster through the driver's cache), or `hook installed, 0 kernel creations seen`. Test without a GPU: `tests/build_nvapi_fatbin_test.ps1`
+    (synthetic containers, the create flow with a fake driver call).
   - *Credits.* The sl.dlss_g frame-count clamp and software-pacing approach is adapted from KleberMotta/OptiScaler-DLSS5-MFG-RTX40 (MIT, from
     the RenoDX MFG Unlock addon by Dreamt and mavismmg): the notice is in `licenses/MFGUnlock_LICENSE.txt`.
   - *Later.* Story 2b: kernels tuned for RTX 20/30; story 3: tester proof on real RTX 40/30/20 cards; story 4: OptiScaler side (generator
