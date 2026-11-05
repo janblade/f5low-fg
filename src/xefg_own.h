@@ -1873,7 +1873,6 @@ private:
                 Hitch(k, n, before, t0, target, tg, gpuWaitMs, tw0, tw1, t, stepMs);
         }
         lastAnyPresent = t;
-        boundLast = burst ? std::max(t, target) : t;       // a burst release counts as its slot for Bound, not as the moment it went out
         if (k == n + 1)
             lastReal = t;
         if (paceLog)
@@ -2142,7 +2141,7 @@ private:
     // after a stutter has its schedule set from that late frame, and it waited lag + a step more with its picture ready.
     long long Bound(long long target, long long step) const
     {
-        return pacesched::Bound(target, step, boundLast);
+        return pacesched::Bound(target, step, lastAnyPresent);
     }
 
     // ---- display pacing and flip metering --------------------------------------------------------------
@@ -2883,7 +2882,7 @@ private:
         }
         if (FAILED(hr))
             PresentFailed(hr, f.j, k, f.nGen);
-        lastAnyPresent = boundLast = Now();
+        lastAnyPresent = Now();
         if (k == f.nGen + 1)
             lastReal = lastAnyPresent;
     }
@@ -4532,7 +4531,6 @@ private:
     // Pacing and stats. interval is written by the application's thread, read by the presenter.
     int slowCalls = 0;
     long long lastReturn = 0, lastReal = 0, lastAnyPresent = 0, lastRelease = 0, jobBase = 0, schedBase = 0;
-    long long boundLast = 0;            // the last present's time for Bound: its slot when the burst let it out early (lastAnyPresent stays the real time, for the stats)
     std::atomic<double> interval { 16.7 };
     double statGap = 0, statGap2 = 0, statGapMax = 0, statAppCall = 0, statAppWait = 0;
     unsigned statGaps = 0, statFrames = 0, statLate = 0, statEarly = 0, traced = 0;
