@@ -548,7 +548,7 @@ public:
     ~Own()
     {
         XLog("context freed");  // Destroy plus the app's last Release of its swap chain: nothing of it is left
-        DriverFgStop();
+        DriverFgStop(false);
         if (driverFgQueue)
             driverFgQueue->Release();
         StopDeferred();
@@ -924,6 +924,8 @@ public:
                 latencySem = CreateSemaphoreW(nullptr, static_cast<LONG>(latency), 16, nullptr);
             realLatency = pq ? kGateLatency : 2;
             latHr = real->SetMaximumFrameLatency(realLatency);
+            if (realWait)
+                CloseHandle(realWait);          // (ReleaseSwapChain already did; a Wrap on a chain still held)
             realWait = real->GetFrameLatencyWaitableObject();
         }
         XLog("swap chain: the real swap chain has %u buffers, flags 0x%x (frame latency waitable object: %s), maximum frame latency %u set -> 0x%08x, "
@@ -1809,8 +1811,10 @@ private:
         if (n > 0 && !target)
             target = PaceTarget(k, n);
         const bool paced = n > 0 && !DisplayPaced(j);
-        // The burst (DriverPacing / FlipBurst): a metered batch's presents after the first are not waited for; lastRelease below keeps
-        // their slots for the clock. Without it they go FlipLead early.
+        // The burst (DriverPacing / FlipBurst): a metered batch's presents after the first are not waited for (lastRelease below keeps
+        // their slots for the clock pacer). Without it they go FlipLead early. Bound (the schedule path) measures from the end of the last
+        // burst (lastAnyPresent), so the batch's first present goes out when it is ready, not on the smoothed schedule; holding it to the
+        // schedule was measured worse in one game.
         const bool metered = Metered(j);
         const bool burst = oobdriver::BurstNow(Burst(), k, metered);
         const long long lead = !burst && k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
@@ -2407,7 +2411,13 @@ private:
         if (driverFgStopped.load(std::memory_order_acquire))
             return;
         if (!driverFgTried)
+        {
+            // SystemNvapi reads the generator's GPU (io.Init, in Build on the deferred thread): not before it is built, or a Present
+            // before that finds "not an NVIDIA GPU" and the signals stay off for good.
+            if (!built.load(std::memory_order_acquire))
+                return;
             DriverFgInit();
+        }
         if (!driverFgReady.load(std::memory_order_acquire))
             return;
         if (driverFgParts & 2)
@@ -2441,13 +2451,14 @@ private:
         }
     }
 
-    // At Retire and ~Own, once: back to multiplier 1 for the driver if we sent one, and the cap export stops counting this context.
-    void DriverFgStop()
+    // Once: the cap export stops counting this context. With sendReset (Retire, the device is alive) also back to multiplier 1 for the
+    // driver if we sent one; ~Own never calls NVAPI (the device may be gone).
+    void DriverFgStop(bool sendReset)
     {
         driverFgStopped.store(true, std::memory_order_release);
         if (!driverFgCounted.exchange(false))
             return;
-        if (driverFgSynced && reflexSyncFn && dev && driverFgSyncMult != 1)
+        if (sendReset && driverFgSynced && reflexSyncFn && dev && driverFgSyncMult != 1)
         {
             oobdriver::ReflexSync s {};
             s.version = oobdriver::kReflexSyncVer;
@@ -2464,7 +2475,11 @@ private:
         if (!flipMetering)
             return;
         if (!flipTried)
+        {
+            if (!built.load(std::memory_order_acquire))     // as DriverFgFrame: SystemNvapi needs the built generator
+                return;
             InitFlip();
+        }
         if (!flipFn)
             return;
         MeterBatch(j, n);
@@ -3893,7 +3908,11 @@ private:
         real = nullptr;
         // latencySem stays until ~Own (or the next Wrap): an app may still wait on its duplicate of our handle, and
         // OnPresent keeps releasing it once there is no real swap chain.
-        realWait = nullptr;         // not closed here: whether the caller owns it could not be confirmed from the headers
+        // The handle GetFrameLatencyWaitableObject gave us is ours to close (the presenter has stopped, nothing waits on it any more);
+        // a ResizeBuffers keeps the chain and the handle, the next Wrap asks the new chain for a fresh one.
+        if (realWait)
+            CloseHandle(realWait);
+        realWait = nullptr;
     }
 
     // Waits until our queue has finished everything (and the CUDA worker everything posted).
@@ -4686,7 +4705,7 @@ inline void Own::Retire()
             }
     }
     Detach();
-    DriverFgStop();
+    DriverFgStop(true);
     IDXGISwapChain4* p = nullptr;
     {
         std::lock_guard<std::mutex> l(proxyMu);
