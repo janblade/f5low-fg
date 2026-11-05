@@ -88,6 +88,12 @@ int main()
         CHECK(pacesched::Bound(101, 10, 100) == 105);            // too soon: last + step / 2
         CHECK(pacesched::Bound(110, 10, 100) == 110);            // in range
         CHECK(pacesched::Bound(500, 10, 100) == 120);            // too late: last + 2 steps
+        // A burst release (DriverPacing): the presents after a batch's first go out at once, so measured from the time they went out the
+        // next batch's first present (slot 100 + 4 * 10 = 140 after four presents) would be bounded from a last present at ~100; from the slot of
+        // the last release (140) it keeps the interval: target 150 stays, and a late target is limited from the slot.
+        CHECK(pacesched::Bound(150, 10, 140) == 150);
+        CHECK(pacesched::Bound(150, 10, 100) == 120);            // bounded from the real time of the early release: pulled in by 30
+        CHECK(pacesched::Bound(300, 10, 140) == 160);
     }
     // Offset with and without a cap
     {
