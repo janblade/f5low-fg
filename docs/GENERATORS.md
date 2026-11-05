@@ -32,9 +32,9 @@ made. Switching to XeFG Tensor is the player's choice, never automatic. The gene
 | Makes frames from | our recipe/pack | its own network | NVIDIA driver/model | its own optical flow + interpolation |
 | Gets inputs by | host hands colour/motion/depth | `xefgSwapChainTagFrameResource` | `slSetTagForFrame` | prepare + dispatch descs |
 | Can return frames without presenting | yes | no: presents on its swap chain | no: presents on its swap chain proxy | **yes**: `ffxDispatchDescFrameGeneration` writes `outputs[]` on a command list we give it |
-| Paces itself | no (host) | yes, on the chain's latency waitable | yes (driver flip metering, Reflex) | yes when its swap chain is used; no when we dispatch |
+| Paces itself | no (host; with `DriverPacing=1` the NVIDIA driver spaces the flips) | yes, on the chain's latency waitable | yes (driver flip metering, Reflex) | yes when its swap chain is used; no when we dispatch |
 | Max generated frames | pack/recipe (5) | `xefgSwapChainGetProperties` (3 native on 1.3.4.95) | `DLSSGState::numFramesToGenerateMax` (1-5 by GPU) | `numGeneratedFrames` into `outputs[4]` (version dependent) |
-| Latency partner | XeLL calls by host | XeLL (its own) | Reflex (required) | Anti-Lag 2 optional |
+| Latency partner | XeLL calls by host (`DriverPacing=1`: Reflex Sync with the frame generation multiplier as well) | XeLL (its own) | Reflex (required) | Anti-Lag 2 optional |
 | Frame id rule | host | host passes ids | `FrameToken` | `frameID` must step by exactly 1 or it resets |
 | GPU | NVIDIA (CUDA / NVAPI cubins) | any D3D12 GPU | NVIDIA RTX 40+ (multi-frame 50+) | any |
 
@@ -122,6 +122,15 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 ## Per backend, when it is built (stories A2-A4)
 
+- **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=1` in f5low.ini (`XEFG_CUDA_DRIVERPACING`), **default 0**, ignored with `Gate=1`, NVIDIA GPUs
+  only, needs OptiScaler 0.1.37 or newer (it reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
+  turns on the driver signals (NvAPI_D3D_SetReflexSync with the frame generation multiplier, in-band present markers on a second queue, out of
+  band markers and queue notices) and the burst: while the driver flip-meters a batch, the presents after the batch's first are released
+  at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 16 while
+  metered, 2 otherwise; the game still sees the buffer count it asked for). Measured in one game so far (NBA 2K27). The low-level keys
+  still work with `DriverPacing=0`: `DriverFg=1`, `DriverFgParts=` (1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue
+  notices), `FlipBurst=1`, `OobQueue=`, `OobMarkers=1`, `AppJobs=`, `RetireWait=`, `FlipMetering=`, `FlipLeadUs=` (not used while the burst
+  is on).
 - **intel** (built, `src/generators/intel.h`, `src/unlock/FamilyXeFG.h` + `UnlockXeFg.h`): Intel's libxess_fg makes the frames, our sink
   paces them. Present-sink shape, spaced mode. Any D3D12 GPU Intel's library runs on.
   - *Routing.* `Generator=intel` in `D3D12CreateContext` builds an `xintel::Ctx` (not `Own`). The handle is the library's own handle; every XeFG
@@ -405,6 +414,7 @@ Present, a refused state ends after two usable frames, and the warning is logged
   `own generator unavailable: <what is missing> - forwarding to Intel XeFG`. Thread-safe, callable before any context;
   the state stays after the last context is destroyed.
 - `uint32_t xefgCudaXellCountsRenderedOnly()` - XeLL cap accounting (see `src/xefg_cuda.cpp`); 1 also while a dlssg context runs.
-- `uint32_t xefgCudaDriverMultipliesReflexCap()` - OptiScaler's Reflex frame-cap fix asks once when it loads the library: 1 while a
-  dlssg context runs (the NVIDIA driver multiplies a Reflex interval by DLSS-G's multiplier itself, so the caller gives Reflex the
-  shown-frame cap undivided), else 0. A dlssg run whose OptiScaler never asked logs a warning after 600 presents.
+- `uint32_t xefgCudaDriverMultipliesReflexCap()` - OptiScaler's Reflex frame-cap fix asks at each cap decision: 1 while a
+  dlssg context runs, or an own context has sent the frame generation multiplier to the driver (`DriverPacing=1`, Reflex Sync accepted)
+  - the NVIDIA driver then multiplies a Reflex interval by that multiplier itself (seen in one game), so the caller gives Reflex the
+  shown-frame cap undivided - else 0. A dlssg run whose OptiScaler never asked logs a warning after 600 presents.

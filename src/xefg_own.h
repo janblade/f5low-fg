@@ -31,6 +31,10 @@
 //     Gate=1 (clock): the clock paces on the GPU instead (ShowGated, PresentGenGated on the D3D12 path): the real swap
 //     chain lives on a present lane of its own, each Present goes out at once behind a fence the release thread signals
 //     at the frame's time.
+//     DriverPacing=1 (own swap chain, NVIDIA driver 570+, Gate=0): the driver signals (Reflex Sync with the frame generation multiplier,
+//     in-band present markers on a second queue, out of band markers, queue notices) and the burst: a batch the driver flip-meters
+//     (Meter) has its presents after the first released at once, on their virtual slots, while the driver spaces the flips. The real
+//     swap chain then has 8 buffers and a frame latency of 16 while metered (2 otherwise); the game sees the buffer count it asked for.
 // UI as Intel handles it (tools/XEFG_SETTINGS.md): with UI composition off everything is interpolated, UI
 // included, and HUD-less colour / UI texture are ignored. With it on, the mode (initParams.uiMode; AUTO picks
 // by what was tagged) decides: HUD-less colour is what gets interpolated (modes 3-5) and the output layer puts
@@ -38,6 +42,7 @@
 // Letterboxing: the back buffer tag's region is the interpolation area (the pack's AX AY AW AH, tools/pack_letterbox.py);
 // a generated frame shows the application's frame around it, as Intel copies the borders in.
 #pragma once
+#include <climits>
 
 #include "generator.h"
 #include "generators/own.h"
@@ -175,7 +180,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT b, REFIID r, void** p) override;
     HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL f, IDXGIOutput* o) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->SetFullscreenState(f, o); }); }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* f, IDXGIOutput** o) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetFullscreenState(f, o); }); }
-    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* d) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetDesc(d); }); }
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* d) override;
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT c, UINT w, UINT h, DXGI_FORMAT f, UINT fl) override;
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* d) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->ResizeTarget(d); }); }
     HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput** o) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetContainingOutput(o); }); }
@@ -183,7 +188,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* c) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetLastPresentCount(c); }); }
 
     // IDXGISwapChain1
-    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* d) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetDesc1(d); }); }
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* d) override;
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* d) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetFullscreenDesc(d); }); }
     HRESULT STDMETHODCALLTYPE GetHwnd(HWND* h) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetHwnd(h); }); }
     HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID r, void** p) override { return Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetCoreWindow(r, p); }); }
@@ -467,14 +472,14 @@ public:
     bool flipMetering = true;                   // FlipMetering=0 in f5low.ini: no NVIDIA driver flip metering (Meter)
     bool oobQueue = false;                      // OobQueue=1 in f5low.ini: tell NVIDIA's driver our queues run out of band (OobNotify)
     bool oobSwitch = false;                     // OobQueue=switch: present type for the app's frame, render type for a generated one (RealPresent)
-    bool flipBurst = false;                     // FlipBurst=1 in f5low.ini (prototype, Gate=0): metered frames after a batch's first go out at once (PresentReal)
-    bool driverFg = false;                      // DriverFg=1 in f5low.ini (prototype): the whole set of driver signals (DriverFgFrame, RealPresent)
-    uint32_t driverFgParts = 15;                // DriverFgParts= (prototype, sum): 1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices
-    uint32_t appJobs = 2;                       // AppJobs= in f5low.ini (prototype): frames that may wait for the presenter before the game's Present blocks
-    bool retireWait = true;                     // RetireWait=0 in f5low.ini (prototype): the game's Present does not wait for the frame before last on the GPU
+    bool flipBurst = false;                     // FlipBurst=1 (or DriverPacing=1) in f5low.ini, Gate=0: a metered batch's presents after the first are released at once (PresentReal)
+    bool driverFg = false;                      // DriverFg=1 (or DriverPacing=1) in f5low.ini: the whole set of driver signals (DriverFgFrame, RealPresent)
+    uint32_t driverFgParts = 15;                // DriverFgParts= (low-level, sum): 1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices
+    uint32_t appJobs = 2;                       // AppJobs= in f5low.ini (low-level): frames that may wait for the presenter before the game's Present blocks
+    bool retireWait = true;                     // RetireWait=0 in f5low.ini (low-level): the game's Present does not wait for the frame before last on the GPU
     bool oobMarkers = false;                    // OobMarkers=1 in f5low.ini: out of band present markers around our Presents (RealPresent)
     std::atomic<uint32_t> presentId { 0 };      // xefgSwapChainSetPresentId: the frame id of the game's markers, taken at its Present
-    uint32_t flipLeadUs = 2500;                 // FlipLeadUs= in f5low.ini (0-8000): metered frames after the first go this early
+    uint32_t flipLeadUs = 2500;                 // FlipLeadUs= in f5low.ini (0-8000): metered frames after the first go this early (not used while the burst is on)
     bool flipLeadAuto = true;                   // FlipLeadUs=auto (default): flipLeadUs, but at most kFlipLeadShare of the frame spacing
     // PaceLead in f5low.ini (Target, D3D12 path only; xefg_cuda.cpp PaceLeadSetting): generated frame k goes out at base + lead + (k - 1)
     // steps instead of base + k steps. Generating takes a millisecond or two, so the first one need not wait a whole step. auto
@@ -484,7 +489,7 @@ public:
     double paceLeadFixedMs = 0;
     // PaceLog=1: one record per present, written to the log when the presenter stops (PaceDump; tests/pacer_ab.ps1).
     bool paceLog = false;
-    // The gated swap chain: room for two app frames' presents at 6x. At 7 queued the presenter blocked on the waitable object
+    // The gated swap chain, and the real one with the burst: room for two app frames' presents at 6x. At 7 queued the presenter blocked on the waitable object
     // until the gate let old frames out, took the next app frame late (ready stamp 37 vs 14 ms old) and CUDA started late:
     // the generated frames came 22 ms later and the clock's delay followed (harness 6x at 30 fps).
     static constexpr UINT kGateBuffers = 8, kGateLatency = 16;
@@ -543,8 +548,7 @@ public:
     ~Own()
     {
         XLog("context freed");  // Destroy plus the app's last Release of its swap chain: nothing of it is left
-        if (driverFgCounted)
-            g_driverSignals.fetch_sub(1);
+        DriverFgStop();
         if (driverFgQueue)
             driverFgQueue->Release();
         StopDeferred();
@@ -782,8 +786,8 @@ public:
         return pq;
     }
 
-    // The gated swap chain's description: more buffers and the frame-latency waitable object (kGateLatency queued presents;
-    // without it a D3D12 swap chain blocks at 3).
+    // The description of the swap chain we create, with Gate=1 or the burst: more buffers and the frame-latency waitable object
+    // (kGateLatency queued presents; without it a D3D12 swap chain blocks at 3). NoteRequested keeps what the game asked for.
     void GateDesc(DXGI_SWAP_CHAIN_DESC1& d) const
     {
         if (!pq && !flipBurst)
@@ -907,17 +911,25 @@ public:
         if (latencySem)
             CloseHandle(latencySem); // a swap chain before this one on the context (ReleaseSwapChain leaves it)
         latencySem = nullptr;
-        if (d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+        const bool realFlag = (d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+        // The game's own request when the chain is ours (it may not have asked for the object the burst needs), else the chain's.
+        const bool gameWaits = ourChain ? appAskedWaitable.load() : realFlag;
+        HRESULT latHr = S_OK;
+        if (realFlag)
         {
-            // The application waits on ours (released as the presenter takes each frame); we wait on the
-            // real one before each present so the real swap chain's queue stays short.
-            latencySem = CreateSemaphoreW(nullptr, static_cast<LONG>(latency), 16, nullptr);
-            real->SetMaximumFrameLatency(pq || flipBurst ? kGateLatency : 2);
+            // The application waits on ours (released as the presenter takes each frame, when it asked for the object); we wait on the
+            // real one before each present so the real swap chain's queue stays short. Two queued presents (Gate=1: kGateLatency); with
+            // the burst Meter raises it to kGateLatency while a batch is metered.
+            if (gameWaits)
+                latencySem = CreateSemaphoreW(nullptr, static_cast<LONG>(latency), 16, nullptr);
+            realLatency = pq ? kGateLatency : 2;
+            latHr = real->SetMaximumFrameLatency(realLatency);
             realWait = real->GetFrameLatencyWaitableObject();
         }
-        XLog("swap chain: the real swap chain has %u buffers, flags 0x%x (frame latency waitable object: %s), maximum frame latency set: %s, wait handle: %s",
-             d.BufferCount, d.Flags, d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT ? "yes" : "no",
-             realWait ? (pq || flipBurst ? "16" : "2") : "no", realWait ? "yes" : "no");
+        XLog("swap chain: the real swap chain has %u buffers, flags 0x%x (frame latency waitable object: %s), maximum frame latency %u set -> 0x%08x, "
+             "wait handle: %s; the game sees %u buffers",
+             d.BufferCount, d.Flags, realFlag ? "yes" : "no", realFlag ? realLatency : 0, static_cast<unsigned>(latHr), realWait ? "yes" : "no",
+             ourChain ? appBufferCount.load() : d.BufferCount);
         if (!CreateAppBuffers())
             XLog("swap chain: could not create our backbuffers - the application will fail to render");
         StartPresenter();
@@ -1223,7 +1235,7 @@ public:
             j.passes = j.usable && pg->HasPassPatches();
             j.sync = sync;
             j.flags = flags;
-            j.presentId = presentId.load(std::memory_order_relaxed);
+            j.presentId = presentId.exchange(0, std::memory_order_relaxed);     // one id per Present: a stale id is never reused
             j.arrive = t0.QuadPart;
             j.dbgTag = dbgTag;
             j.dbgOnly = dbgOnly;
@@ -1306,7 +1318,7 @@ public:
         }
         QueryPerformanceCounter(&tr);
         {
-            // Bounded latency: at most two frames wait for the presenter.
+            // Bounded latency: at most appJobs frames wait for the presenter.
             std::unique_lock<std::mutex> l(pm);
             pcv.wait(l, [this] { return pjobs.size() < appJobs || pQuit; });
             pjobs.push_back(j);
@@ -1346,7 +1358,13 @@ public:
         for (ID3D12Resource* b : appBufs)
             b->Release();
         appBufs.clear();
-        if (pq || (flipBurst && realWait))
+        if (ourChain)
+        {
+            if (c)
+                appBufferCount = c;             // 0 keeps the current count, as it does on the real chain
+            appAskedWaitable = (fl & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+        }
+        if (pq || (flipBurst && ourChain && realWait))
         {
             c = c ? std::max(c, kGateBuffers) : c;
             fl |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;   // created with it (GateDesc): may not change
@@ -1394,6 +1412,23 @@ public:
             return DXGI_ERROR_INVALID_CALL;
         *m = latency;
         return S_OK;
+    }
+
+    // The swap chain we create (xefgSwapChainD3D12InitFromSwapChainDesc) may be bigger than the game asked for (GateDesc) and may carry the
+    // waitable object it did not ask for: the game is shown, and given, what it asked for.
+    void NoteRequested(UINT bufferCount, UINT flags)
+    {
+        appBufferCount = bufferCount;
+        appAskedWaitable = (flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+        ourChain = true;
+    }
+    void AsAsked(UINT& bufferCount, UINT& flags) const
+    {
+        if (!ourChain)
+            return;
+        bufferCount = appBufferCount;
+        if (!appAskedWaitable)
+            flags &= ~static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
     }
 
     void Retire();  // xefgSwapChainDestroy: let go of the real swap chain now (after Proxy, below)
@@ -1750,7 +1785,8 @@ private:
     // taken from our own presents would let each late present push the next app frame later, and the app's
     // frame rate crept down under load. Each goes out only once its own GPU work is done: a Present never waits
     // in the swap chain's queue to flip together with the next, which is what bunched frames when the game kept
-    // the GPU busy. With vblank sync the display paces them.
+    // the GPU busy. With vblank sync the display paces them. With the burst (DriverPacing) and a batch the driver flip-meters, the
+    // presents after the batch's first are not waited for at all (only for their own GPU work): the driver spaces their flips.
     // The schedule runs paceLag behind the GPU timeline: as much as our GPU work came out late lately (Show raises it
     // at once to the most a frame was late, on top of the lag it was scheduled with, and lets it fall slowly), at most
     // maxLag app frames (half; at a whole one NBA 2K27 sat at the cap). Under a GPU the game keeps busy the first
@@ -1773,12 +1809,13 @@ private:
         if (n > 0 && !target)
             target = PaceTarget(k, n);
         const bool paced = n > 0 && !DisplayPaced(j);
-        // FlipBurst: the whole target as the lead, so WaitUntil(target - lead) = WaitUntil(0) returns at once; lastRelease below keeps the slot.
+        // The burst (DriverPacing / FlipBurst): a metered batch's presents after the first are not waited for; lastRelease below keeps
+        // their slots for the clock. Without it they go FlipLead early.
         const bool metered = Metered(j);
-        const bool burst = oobdriver::BurstNow(flipBurst, k, metered);
-        const long long lead = burst ? target : k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
+        const bool burst = oobdriver::BurstNow(Burst(), k, metered);
+        const long long lead = !burst && k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
         const long long t0 = Now(), before = lastAnyPresent;
-        if (paced)
+        if (paced && !burst)
             WaitUntil(target - lead);
         const long long tg = Now();
         WaitGpu(hostFence, hostValue);
@@ -1796,7 +1833,7 @@ private:
             statFirstLate += static_cast<double>(tw1 - target) * 1000.0 / freq();
             ++statFirstN;
         }
-        lastRelease = lead ? std::max(Now(), target) : Now();   // the clock's release time (ClockTarget): its slot, if let out early
+        lastRelease = burst || lead ? std::max(Now(), target) : Now();   // the clock's release time (ClockTarget): its slot, if let out early
         if (k == 1)
             Meter(j, n);
         Removed("our last submission, before our Present");
@@ -1824,12 +1861,11 @@ private:
             ++statGaps;
         }
         // Diagnostics: a gap of more than three steps between presents, with what it was made of (Hitch).
-        // A metered burst batch: its presents after the first follow at once (not a gap), and its first comes one app interval after
-        // the last batch's, so that gap is judged against the app interval.
+        // A metered burst batch: its first present comes one app interval after the last batch's last, so that gap is judged against the
+        // app interval (the presents after it follow at once: a gap there is a real one).
         const double stepMs = ri.ms / static_cast<double>(n + 1);
-        const bool burstBatch = flipBurst && Metered(j);    // read again: Meter (k == 1) has just decided this batch
-        if (sync == 0 && n > 0 && before && !(burstBatch && k > 1) &&
-            static_cast<double>(t - before) * 1000.0 / freq() > 3 * (burstBatch ? ri.ms : stepMs))
+        const bool burstBatch = Burst() && Metered(j);      // read again: Meter (k == 1) has just decided this batch
+        if (sync == 0 && n > 0 && before && static_cast<double>(t - before) * 1000.0 / freq() > 3 * (burstBatch && k == 1 ? ri.ms : stepMs))
         {
             if (t - hitchSecond > static_cast<long long>(freq()))
                 hitchSecond = t, hitches = 0;
@@ -2116,8 +2152,8 @@ private:
 
     // NVIDIA driver flip metering (nvapi.h, NvAPI_D3D12_SetFlipConfig, driver 570+), as DLSS-G paces on RTX 40/50: right
     // before the first Present of each app frame's batch the swap chain's queue gets the batch's frame count and time, and
-    // the display hardware spaces the flips within it. Our releases after the first then go FlipLead early, so the flip is
-    // placed by the hardware, not by when a thread woke. Off while display-paced, not generating, or refused 8 times in a
+    // the display hardware spaces the flips within it. Our releases after the first then go FlipLead early (with the burst:
+    // at once), so the flip is placed by the hardware, not by when a thread woke. Off while display-paced, not generating, or refused 8 times in a
     // row; the driver's NO_IFLIP feedback (no independent flip, e.g. composed) leaves our pacing alone.
     struct FlipConfig                       // NV_FLIP_CONFIG_V2
     {
@@ -2132,6 +2168,9 @@ private:
     using NvQueryFn = void*(__cdecl*)(unsigned);
 
     bool Metered(const Job& j) const { return meteredFrame.load(std::memory_order_acquire) == j.frame + 1; }
+    // The burst needs the swap chain we made for it (8 buffers, the waitable object) and our own present queue; a swap chain the game made
+    // and presents on its own queue (InitFromSwapChain) keeps its pacing.
+    bool Burst() const { return flipBurst && ourChain && !pq && queue != appQueue; }
     // How early a metered frame after a batch's first is released. Auto: 2500 us at 180 out (5.56 ms spacing, 0.45 of it), less
     // as the spacing shrinks - a lead longer than the spacing queued the frames at 540+ out (harness fast6x). A set value wins.
     static constexpr double kFlipLeadShare = 0.45;
@@ -2190,11 +2229,18 @@ private:
         flipTried = true;
         const char* why = nullptr;
         if (const NvQueryFn qi = SystemNvapi(why))
-            if (!(flipFn = reinterpret_cast<SetFlipConfigFn>(qi(0xF3148C42u))))                                    // NvAPI_D3D12_SetFlipConfig
+            if (!(flipFn = reinterpret_cast<SetFlipConfigFn>(qi(oobdriver::kIdSetFlipConfig))))
                 why = "no NvAPI_D3D12_SetFlipConfig: driver before 570, or OptiScaler's [NvApi] DisableFlipMetering=true";
         if (flipFn)
-            XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released %s%u us early",
-                 flipLeadAuto ? "up to " : "", flipLeadUs);
+        {
+            if (Burst())
+                XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released at once (burst)");
+            else
+                XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released %s%u us early",
+                     flipLeadAuto ? "up to " : "", flipLeadUs);
+            if (flipBurst && !Burst())
+                XLog("burst: off for this swap chain (it is not the one we made, or presents on the game's queue)");
+        }
         else
             XLog("flip metering: off - %s", why);
     }
@@ -2231,7 +2277,7 @@ private:
         }
         if (oobQueue || oobSwitch)
         {
-            if (const auto fn = reinterpret_cast<NotifyOobFn>(qi(0x03D6E8CBu)))                                    // NvAPI_D3D12_NotifyOutOfBandCommandQueue
+            if (const auto fn = reinterpret_cast<NotifyOobFn>(qi(oobdriver::kIdNotifyOutOfBandCommandQueue)))
             {
                 if (oobSwitch)
                 {
@@ -2250,7 +2296,7 @@ private:
 
     void OobNotifyMarkers(NvQueryFn qi)
     {
-        if (oobMarkers && !(asyncMarkerFn = reinterpret_cast<AsyncMarkerFn>(qi(0x13C98F73u))))                     // NvAPI_D3D12_SetAsyncFrameMarker
+        if (oobMarkers && !(asyncMarkerFn = reinterpret_cast<AsyncMarkerFn>(qi(oobdriver::kIdSetAsyncFrameMarker))))
             XLog("out of band: the driver has no NvAPI_D3D12_SetAsyncFrameMarker");
     }
 
@@ -2276,50 +2322,48 @@ private:
         m.frameId = frameId;
         m.markerType = type;
         const int st = asyncMarkerFn(q, &m);
-        if (st != 0 && st != oobMarkerFailed)
-        {
-            oobMarkerFailed = st;
+        if (st != 0 && st != oobMarkerFailed.exchange(st))
             XLog("out of band: marker %d for frame %u -> nvapi status %d", type, frameId, st);
-        }
-        else if (st == 0 && !oobMarked)
-        {
-            oobMarked = true;
+        else if (st == 0 && !oobMarked.exchange(true))
             XLog("out of band: first marker %d for frame %u taken", type, frameId);
-        }
     }
 
-    // Every Present of ours that goes to the real swap chain, between its out of band markers when OobMarkers=1.
+    // Every Present of ours that goes to the real swap chain, between its out of band markers (DriverFg with part 4, or OobMarkers=1),
+    // never on the game's own queue.
     HRESULT RealPresent(const Job& j, UINT sync, UINT flags, bool generated, bool first)
     {
         ID3D12CommandQueue* const q = pq ? pq : queue;
-        if (driverFg)
+        if (!driverFg)
         {
-            const bool fgReady = (driverFgParts & 4) && driverFgReady.load(std::memory_order_acquire) && oobdriver::MarkFrame(j.presentId);
-            if (fgReady && first)
-                OobMark(q, j.presentId, oobdriver::kOobRenderStart);
-            if (fgReady)
-                OobMark(q, j.presentId, oobdriver::kOobPresentStart);
-            const HRESULT fgHr = real->Present(sync, flags);
-            if (fgReady)
-                OobMark(q, j.presentId, oobdriver::kOobPresentEnd);
-            if (fgReady && !generated)
-                OobMark(q, j.presentId, oobdriver::kOobRenderEnd);
-            return fgHr;
+            if ((oobQueue || oobSwitch || oobMarkers) && !oobTried)
+                OobNotify();
+            OobSwitchType(q, generated);
         }
-        if ((oobQueue || oobSwitch || oobMarkers) && !oobTried)
-            OobNotify();
-        OobSwitchType(q, generated);
-        const bool mark = asyncMarkerFn && q != appQueue && oobdriver::MarkFrame(j.presentId);
+        const bool wantMark = (driverFg ? (driverFgParts & 4) && driverFgReady.load(std::memory_order_acquire) : asyncMarkerFn != nullptr) &&
+                              q != appQueue;
+        const bool mark = wantMark && oobdriver::MarkFrame(j.presentId);
+        if (wantMark && !mark)
+            NoFrameId();
+        if (mark && driverFg && first)
+            OobMark(q, j.presentId, oobdriver::kOobRenderStart);
         if (mark)
             OobMark(q, j.presentId, oobdriver::kOobPresentStart);
         const HRESULT hr = real->Present(sync, flags);
         if (mark)
             OobMark(q, j.presentId, oobdriver::kOobPresentEnd);
+        if (mark && driverFg && !generated)
+            OobMark(q, j.presentId, oobdriver::kOobRenderEnd);
         return hr;
     }
+    // One line, once: the markers are skipped because the caller sent no frame id (xefgSwapChainSetPresentId) for this Present.
+    void NoFrameId()
+    {
+        if (!noFrameIdLogged.exchange(true))
+            XLog("out of band: no frame id from the caller for a Present - its markers are skipped (Reflex Sync is still sent)");
+    }
 
-    // DriverFg=1, once, on the application's thread at its first Present: a second queue of ours, the two out of band notices,
-    // the marker and Reflex Sync entry points.
+    // DriverFg=1, once, on the application's thread at its first Present: a second queue of ours, the queue notices, the marker and
+    // Reflex Sync entry points.
     void DriverFgInit()
     {
         driverFgTried = true;
@@ -2330,50 +2374,51 @@ private:
             XLog("driver signals: off - %s", why);
             return;
         }
-        const auto notify = reinterpret_cast<NotifyOobFn>(qi(0x03D6E8CBu));                                        // NvAPI_D3D12_NotifyOutOfBandCommandQueue
-        asyncMarkerFn = reinterpret_cast<AsyncMarkerFn>(qi(0x13C98F73u));                                          // NvAPI_D3D12_SetAsyncFrameMarker
-        reflexSyncFn = reinterpret_cast<ReflexSyncFn>(qi(0xB9F6FAFFu));                                              // NvAPI_D3D_SetReflexSync
+        const auto notify = reinterpret_cast<NotifyOobFn>(qi(oobdriver::kIdNotifyOutOfBandCommandQueue));
+        asyncMarkerFn = reinterpret_cast<AsyncMarkerFn>(qi(oobdriver::kIdSetAsyncFrameMarker));
+        reflexSyncFn = reinterpret_cast<ReflexSyncFn>(qi(oobdriver::kIdSetReflexSync));
         D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_DIRECT };
         ID3D12CommandQueue* q2 = nullptr;
         if (!notify || !asyncMarkerFn || !reflexSyncFn || FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q2))))
         {
             XLog("driver signals: off - notice %d, marker %d, sync %d, second queue %d", notify != nullptr, asyncMarkerFn != nullptr, reflexSyncFn != nullptr, q2 != nullptr);
+            if (q2)
+                q2->Release();
             return;
         }
         q2->SetName(L"f5low driver signals");
         driverFgQueue = q2;
         if (driverFgParts & 8)
         {
-            NotifyQueue(notify, q2, "second", false, true);
-            NotifyQueue(notify, genQueue, "generation", false, true);
-            if (pq)
-                NotifyQueue(notify, queue, "own", false, true);
-            ID3D12CommandQueue* const pres = pq ? pq : queue;
-            if (pres != appQueue)
-                XLog("driver signals: present queue type %d -> nvapi status %d", static_cast<int>(oobdriver::kRender), notify(pres, oobdriver::kRender));
-            else
-                XLog("driver signals: the swap chain presents on the application's queue, no notice for it");
+            // All of them run work and none presents as far as the notice goes: type render (the application's queue is left alone).
+            ID3D12CommandQueue* const qs[] = { q2, genQueue, queue, pq };
+            const char* const names[] = { "second", "generation", "own", "present lane" };
+            for (size_t i = 0; i < 4; ++i)
+                NotifyQueue(notify, qs[i], names[i], false, true);
         }
         driverFgReady.store(true, std::memory_order_release);
-        if (!driverFgCounted)
-        {
-            driverFgCounted = true;
-            g_driverSignals.fetch_add(1);
-        }
         XLog("driver signals: on, parts %u (1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices)", driverFgParts);
     }
 
-    // At the application's Present, in the order DLSS-G uses: the in-band present markers on the second queue, Reflex Sync.
+    // At the application's Present: the in-band present markers on the second queue, then Reflex Sync. Reflex Sync is sent whatever the
+    // frame id is; the count the cap export reads is raised only once the driver took one (status 0), and lowered by DriverFgStop.
     void DriverFgFrame(const Job& j)
     {
+        if (driverFgStopped.load(std::memory_order_acquire))
+            return;
         if (!driverFgTried)
             DriverFgInit();
-        if (!driverFgReady.load(std::memory_order_acquire) || !oobdriver::MarkFrame(j.presentId))
+        if (!driverFgReady.load(std::memory_order_acquire))
             return;
         if (driverFgParts & 2)
         {
-            OobMark(driverFgQueue, j.presentId, oobdriver::kPresentStart);
-            OobMark(driverFgQueue, j.presentId, oobdriver::kPresentEnd);
+            if (oobdriver::MarkFrame(j.presentId))
+            {
+                OobMark(driverFgQueue, j.presentId, oobdriver::kPresentStart);
+                OobMark(driverFgQueue, j.presentId, oobdriver::kPresentEnd);
+            }
+            else
+                NoFrameId();
         }
         if (!(driverFgParts & 1))
             return;
@@ -2381,11 +2426,36 @@ private:
         s.version = oobdriver::kReflexSyncVer;
         s.fgMultiplier = static_cast<uint8_t>(driverFgFrames);
         const int st = reflexSyncFn(dev, &s);
-        if (st != driverFgSyncStatus)
+        if ((st != driverFgSyncStatus || driverFgFrames != driverFgSyncMult) && driverFgSyncLogs < 100)
         {
+            ++driverFgSyncLogs;
             driverFgSyncStatus = st;
+            driverFgSyncMult = driverFgFrames;
             XLog("driver signals: Reflex Sync multiplier %u -> nvapi status %d", driverFgFrames, st);
         }
+        if (st == 0)
+        {
+            driverFgSynced = true;
+            if (!driverFgCounted.exchange(true))
+                g_driverSignals.fetch_add(1);
+        }
+    }
+
+    // At Retire and ~Own, once: back to multiplier 1 for the driver if we sent one, and the cap export stops counting this context.
+    void DriverFgStop()
+    {
+        driverFgStopped.store(true, std::memory_order_release);
+        if (!driverFgCounted.exchange(false))
+            return;
+        if (driverFgSynced && reflexSyncFn && dev && driverFgSyncMult != 1)
+        {
+            oobdriver::ReflexSync s {};
+            s.version = oobdriver::kReflexSyncVer;
+            s.fgMultiplier = 1;
+            const int st = reflexSyncFn(dev, &s);
+            XLog("driver signals: Reflex Sync multiplier back to 1 -> nvapi status %d", st);
+        }
+        g_driverSignals.fetch_sub(1);
     }
 
     // Before the first Present of an app frame's batch (n generated + its own), on the presenter thread.
@@ -2397,6 +2467,24 @@ private:
             InitFlip();
         if (!flipFn)
             return;
+        MeterBatch(j, n);
+        // The burst queues a batch's presents; the real swap chain takes that many only while the driver meters them.
+        if (Burst())
+            RealLatency(flipMeteredNow ? kGateLatency : 2);
+    }
+    // Real swap chain's maximum frame latency, logged on each change (the first 100).
+    void RealLatency(UINT want)
+    {
+        if (!realWait || !real || want == realLatency)
+            return;
+        const HRESULT hr = real->SetMaximumFrameLatency(want);
+        if (latLogs++ < 100)
+            XLog("swap chain: the real swap chain's maximum frame latency %u -> %u (0x%08x)", realLatency, want, static_cast<unsigned>(hr));
+        if (SUCCEEDED(hr))
+            realLatency = want;
+    }
+    void MeterBatch(const Job& j, uint32_t n)
+    {
         double batch;
         {
             std::lock_guard<std::mutex> l(clkMu);
@@ -3591,7 +3679,7 @@ private:
         const double sd = statGaps ? std::sqrt(std::max(0.0, statGap2 / statGaps - (statGap / statGaps) * (statGap / statGaps))) : 0;
         const double iv = interval;
         XLog("stats: app interval %.2f ms (%.1f fps), on the GPU %.2f ms, sync %u, %u generated per frame; app's Present %.3f ms (of it "
-             "waiting for the presenter %.3f); presents every %.2f ms (sd %.2f, max %.2f; target %.2f), waited for our GPU work %.2f ms "
+             "waiting for the presenter %.3f); presents every %.2f ms (sd %.2f, max %.2f; target %.2f; with the burst these are releases, not flips), waited for our GPU work %.2f ms "
              "per present, %u frames started behind, %u taken early, schedule lag %.1f ms, %u CUDA handoff failures (avg of 120)",
              iv, 1000.0 / iv, ri.ms, j.sync, nGen, statAppCall / 120, statAppWait / 120, statGaps ? statGap / statGaps : 0.0, sd,
              statGapMax, ri.ms / (nGen + 1), statGaps ? statGpuWait / statGaps : 0.0, statLate, statEarly, paceLag, pg->TakeHandoffFails());
@@ -3742,7 +3830,7 @@ private:
         pendConv[0] = pendConv[1] = {};
     }
 
-    // Our backbuffers, as many as the real swap chain has, in its format and size. A swap chain lets an
+    // Our backbuffers, as many as the game asked for (as many as the real swap chain has when it made the chain itself), in its format and size. A swap chain lets an
     // R8G8B8A8/B8G8R8A8 buffer be viewed as UNORM or SRGB; ours allow both through relaxed format casting
     // where the runtime has it.
     bool CreateAppBuffers()
@@ -3766,7 +3854,9 @@ private:
                           SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &o12, sizeof(o12))) &&
                           o12.RelaxedFormatCastingSupported;
         bool ok = true;
-        for (UINT i = 0; i < std::max(1u, scDesc.BufferCount) && ok; ++i)
+        // As many as the game asked for when the chain is ours (the real one may be bigger), else as many as the real one has.
+        const UINT want = ourChain && appBufferCount ? appBufferCount.load() : scDesc.BufferCount;
+        for (UINT i = 0; i < std::max(1u, want) && ok; ++i)
         {
             ID3D12Resource* b = nullptr;
             if (cast)
@@ -3803,7 +3893,7 @@ private:
         real = nullptr;
         // latencySem stays until ~Own (or the next Wrap): an app may still wait on its duplicate of our handle, and
         // OnPresent keeps releasing it once there is no real swap chain.
-        realWait = nullptr;         // owned by the swap chain
+        realWait = nullptr;         // not closed here: whether the caller owns it could not be confirmed from the headers
     }
 
     // Waits until our queue has finished everything (and the CUDA worker everything posted).
@@ -4475,27 +4565,39 @@ private:
     // release thread too.
     SetFlipConfigFn flipFn = nullptr;
     bool flipTried = false, flipRefused = false, flipMeteredNow = false;
+    UINT realLatency = 2, latLogs = 0;      // the real swap chain's maximum frame latency (presenter thread), and log lines about it
     uint32_t flipOutputs = 0, flipSamples = 0, flipFails = 0, flipFeedback = 0, flipLogs = 0;
     int flipStatus = 0;
     double flipBatchMs = 0;
     unsigned flipCalls = 0, statFlipMetered = 0;
     std::atomic<UINT64> meteredFrame { 0 };
-    // Gate=1 (ShowGated): the present lane, its lists and fence; the gate's fence, the presents waiting for their time.
-    ID3D12CommandQueue* pq = nullptr;
+    // NVIDIA driver signals (DriverPacing / DriverFg / OobQueue / OobMarkers) and the burst: their state, and the swap chain we made
+    // for the burst. Not part of the Gate block below.
+    // The swap chain we created (xefgSwapChainD3D12InitFromSwapChainDesc), as the game asked for it (NoteRequested): the real one may be
+    // bigger and carry the waitable object (GateDesc). appBufs and the game's view of the chain follow the request.
+    std::atomic<bool> ourChain { false };
+    std::atomic<UINT> appBufferCount { 0 };
+    std::atomic<bool> appAskedWaitable { false };
+    std::atomic<bool> noFrameIdLogged { false };
     bool oobTried = false;                  // the presenting thread's, as flipTried
-    bool oobMarked = false;
-    int oobMarkerFailed = 0;
+    std::atomic<bool> oobMarked { false };  // the app's thread (DriverFgFrame) and the presenter both mark
+    std::atomic<int> oobMarkerFailed { 0 };
     AsyncMarkerFn asyncMarkerFn = nullptr;
     NotifyOobFn notifyOobFn = nullptr;      // OobQueue=switch
     ReflexSyncFn reflexSyncFn = nullptr;    // DriverFg=1, set before driverFgReady
     ID3D12CommandQueue* driverFgQueue = nullptr;
     std::atomic<bool> driverFgReady { false };
-    bool driverFgCounted = false;           // raised g_driverSignals (lowered in ~Own)
+    std::atomic<bool> driverFgCounted { false };    // raised g_driverSignals (a Reflex Sync returned 0); lowered by DriverFgStop
+    std::atomic<bool> driverFgStopped { false };
+    bool driverFgSynced = false;
+    int driverFgSyncStatus = INT_MIN;       // sentinels: the first outcome is logged
+    uint32_t driverFgSyncMult = 0, driverFgSyncLogs = 0;
     bool driverFgTried = false;             // the application's Present thread
     uint32_t driverFgFrames = 1;            // under mu, read after it on the same thread
-    int driverFgSyncStatus = 0;
     int oobSwitchType = -1;
     int oobSwitchFailed = 0;
+    // Gate=1 (ShowGated): the present lane, its lists and fence; the gate's fence, the presents waiting for their time.
+    ID3D12CommandQueue* pq = nullptr;
     ID3D12GraphicsCommandList* pqList = nullptr;
     ID3D12CommandAllocator* pqAlloc[kAllocs] {};
     UINT64 pqAllocFence[kAllocs] {};
@@ -4584,6 +4686,7 @@ inline void Own::Retire()
             }
     }
     Detach();
+    DriverFgStop();
     IDXGISwapChain4* p = nullptr;
     {
         std::lock_guard<std::mutex> l(proxyMu);
@@ -4596,6 +4699,20 @@ inline void Own::Retire()
     // the proxy and this context go with it.
     if (p && p->Release() > 0)
         XLog("Destroy: the application still holds its swap chain - the real one is released now, its calls fail from here");
+}
+inline HRESULT Proxy::GetDesc(DXGI_SWAP_CHAIN_DESC* d)
+{
+    const HRESULT hr = Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetDesc(d); });
+    if (SUCCEEDED(hr) && d)
+        own->AsAsked(d->BufferCount, d->Flags);
+    return hr;
+}
+inline HRESULT Proxy::GetDesc1(DXGI_SWAP_CHAIN_DESC1* d)
+{
+    const HRESULT hr = Fwd([&](IDXGISwapChain4* rsc) { return rsc->GetDesc1(d); });
+    if (SUCCEEDED(hr) && d)
+        own->AsAsked(d->BufferCount, d->Flags);
+    return hr;
 }
 inline HRESULT Proxy::Present(UINT sync, UINT flags) { return own->OnPresent(sync, flags); }
 inline HRESULT Proxy::Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*) { return own->OnPresent(sync, flags); }
