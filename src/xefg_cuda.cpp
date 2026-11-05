@@ -1138,8 +1138,11 @@ xefg_swapchain_result_t xefgSwapChainSetPresentId(xefg_swapchain_handle_t h, uin
         c->frameId = id;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    if (FindOwn(h))
+    if (auto o = FindOwn(h))
+    {
+        o->presentId.store(id, std::memory_order_relaxed);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     FORWARDH(xefgSwapChainSetPresentId, h, id);
     Log("SetPresentId %u -> %d", id, r);
     return r;
@@ -1311,13 +1314,14 @@ static const bool g_paceCfgHook = (xdlssg::g_paceCfg = SinkPaceCfg, true);
 static const bool g_ngxRefusedHook = (xdlssg::g_onRefused = [](const std::string& why) { SetStatus(3, "dlssg unavailable: " + why); }, true);
 
 // Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask once, when they load the library).
-// 1 while a Generator=dlssg context runs: the NVIDIA driver multiplies a Reflex interval on the device by DLSS-G's multiplier
-// itself (NBA 2K27: 33333 us read back as 99999 us at 3x), so the caller gives real Reflex the shown-frame cap undivided.
+// 1 while a Generator=dlssg context runs, or an own-generator context has its driver signals on (DriverPacing / DriverFg: the
+// frame generation multiplier is sent with NvAPI_D3D_SetReflexSync): the NVIDIA driver multiplies a Reflex interval on the device
+// by that multiplier itself (NBA 2K27: 33333 us read back as 99999 us at 3x), so the caller gives real Reflex the shown-frame cap undivided.
 __declspec(dllexport) uint32_t xefgCudaDriverMultipliesReflexCap()
 {
     xdlssg::g_capAsked.store(true);
     std::lock_guard<std::mutex> lk(g_dlssgLock);
-    return g_dlssg.empty() ? 0u : 1u;
+    return g_dlssg.empty() && xefgown::g_driverSignals.load() == 0 ? 0u : 1u;
 }
 
 // Not Intel's API: for OptiScaler. What f5low decided for the most recent context: 0 not decided yet, 1 own generator,
@@ -1668,6 +1672,40 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->paceLeadFixedMs = PaceLeadSetting(&o->paceLeadAuto);
         // FlipMetering=0 (XEFG_CUDA_FLIPMETERING=0): no NVIDIA driver flip metering (xefg_own.h, Meter).
         o->flipMetering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "1") != "0";
+        // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): prototype, off by default (oob_driver.h).
+        const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
+        o->oobQueue = oobQueue == "1";
+        o->oobSwitch = oobQueue == "switch";
+        // DriverFg=1 (XEFG_CUDA_DRIVERFG): prototype, off by default. DriverPacing=1 below sets the whole set.
+        o->driverFg = Setting("XEFG_CUDA_DRIVERFG", "DriverFg", "0") == "1";
+        o->driverFgParts = static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_DRIVERFGPARTS", "DriverFgParts", "15").c_str()));
+        o->flipBurst = Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1";
+        if (o->flipBurst && o->gate)
+        {
+            o->flipBurst = false;
+            XLog("FlipBurst=1 ignored: Gate=1 is on");
+        }
+        if (o->flipBurst)
+            XLog("FlipBurst=1: metered frames after a batch's first are released at once (prototype)");
+        // DriverPacing=1 (XEFG_CUDA_DRIVERPACING): the driver signals (DriverFg, all parts) and the burst (FlipBurst). Not with Gate=1.
+        if (Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "0") == "1")
+        {
+            if (o->gate)
+                XLog("DriverPacing=1 ignored: Gate=1 is on");
+            else
+            {
+                o->driverFg = true;
+                o->driverFgParts = 15;
+                o->flipBurst = true;
+                XLog("DriverPacing=1: driver signals (all parts) and burst release of the flips on");
+            }
+        }
+        // FlipStats=1 (XEFG_CUDA_FLIPSTATS): the swap chain's flip spacing in the log; needs Log=1.
+        o->flipStats = Setting("XEFG_CUDA_FLIPSTATS", "FlipStats", "0") == "1" && OpenLog();
+        // AppJobs= / RetireWait=0 (XEFG_CUDA_APPJOBS, XEFG_CUDA_RETIREWAIT): prototype, where the game's Present blocks (xefg_own.h, OnPresent).
+        o->appJobs = std::clamp(static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_APPJOBS", "AppJobs", "2").c_str())), 1u, 6u);
+        o->retireWait = Setting("XEFG_CUDA_RETIREWAIT", "RetireWait", "1") != "0";
+        o->oobMarkers = Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):
         // 2500 us, less at a high rate - never more than 0.45 of the frame spacing (xefg_own.h, FlipLead).
         std::string lead = Setting("XEFG_CUDA_FLIPLEADUS", "FlipLeadUs", "auto");

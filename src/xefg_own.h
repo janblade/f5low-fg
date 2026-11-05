@@ -43,6 +43,7 @@
 #include "generators/own.h"
 #include "generators/stubs.h"
 #include "pace_lead.h"
+#include "oob_driver.h"
 #include "pace_sched.h"
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
@@ -70,6 +71,9 @@ void XLog(const char* fmt, ...);
 
 namespace xefgown
 {
+// Contexts whose driver signals (DriverFg) are on: xefgCudaDriverMultipliesReflexCap answers 1 while there is one.
+inline std::atomic<int> g_driverSignals { 0 };
+
 using namespace xefgio;
 
 // The back buffers XeFG takes: R8G8B8A8 (the pack's own), B8G8R8A8 (the same graph, red and blue swapped on
@@ -461,6 +465,16 @@ public:
     GenSettings gs;                             // Prof=1/2 (or XEFG_CUDA_PROF), Native=0 in f5low.ini: shared with the generator
     bool gate = false;                          // Gate= in f5low.ini: pace on the GPU (ShowGated / PresentGenGated), with the clock
     bool flipMetering = true;                   // FlipMetering=0 in f5low.ini: no NVIDIA driver flip metering (Meter)
+    bool oobQueue = false;                      // OobQueue=1 in f5low.ini: tell NVIDIA's driver our queues run out of band (OobNotify)
+    bool oobSwitch = false;                     // OobQueue=switch: present type for the app's frame, render type for a generated one (RealPresent)
+    bool flipStats = false;                     // FlipStats=1 in f5low.ini (needs Log=1): the swap chain's own flip spacing, logged every 120 app frames
+    bool flipBurst = false;                     // FlipBurst=1 in f5low.ini (prototype, Gate=0): metered frames after a batch's first go out at once (PresentReal)
+    bool driverFg = false;                      // DriverFg=1 in f5low.ini (prototype): the whole set of driver signals (DriverFgFrame, RealPresent)
+    uint32_t driverFgParts = 15;                // DriverFgParts= (prototype, sum): 1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices
+    uint32_t appJobs = 2;                       // AppJobs= in f5low.ini (prototype): frames that may wait for the presenter before the game's Present blocks
+    bool retireWait = true;                     // RetireWait=0 in f5low.ini (prototype): the game's Present does not wait for the frame before last on the GPU
+    bool oobMarkers = false;                    // OobMarkers=1 in f5low.ini: out of band present markers around our Presents (RealPresent)
+    std::atomic<uint32_t> presentId { 0 };      // xefgSwapChainSetPresentId: the frame id of the game's markers, taken at its Present
     uint32_t flipLeadUs = 2500;                 // FlipLeadUs= in f5low.ini (0-8000): metered frames after the first go this early
     bool flipLeadAuto = true;                   // FlipLeadUs=auto (default): flipLeadUs, but at most kFlipLeadShare of the frame spacing
     // PaceLead in f5low.ini (Target, D3D12 path only; xefg_cuda.cpp PaceLeadSetting): generated frame k goes out at base + lead + (k - 1)
@@ -530,6 +544,10 @@ public:
     ~Own()
     {
         XLog("context freed");  // Destroy plus the app's last Release of its swap chain: nothing of it is left
+        if (driverFgCounted)
+            g_driverSignals.fetch_sub(1);
+        if (driverFgQueue)
+            driverFgQueue->Release();
         StopDeferred();
         StopPresenter();
         generator->Stop();
@@ -769,7 +787,7 @@ public:
     // without it a D3D12 swap chain blocks at 3).
     void GateDesc(DXGI_SWAP_CHAIN_DESC1& d) const
     {
-        if (!pq)
+        if (!pq && !flipBurst)
             return;
         d.BufferCount = std::max(d.BufferCount, kGateBuffers);
         d.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -895,9 +913,12 @@ public:
             // The application waits on ours (released as the presenter takes each frame); we wait on the
             // real one before each present so the real swap chain's queue stays short.
             latencySem = CreateSemaphoreW(nullptr, static_cast<LONG>(latency), 16, nullptr);
-            real->SetMaximumFrameLatency(pq ? kGateLatency : 2);
+            real->SetMaximumFrameLatency(pq || flipBurst ? kGateLatency : 2);
             realWait = real->GetFrameLatencyWaitableObject();
         }
+        XLog("swap chain: the real swap chain has %u buffers, flags 0x%x (frame latency waitable object: %s), maximum frame latency set: %s, wait handle: %s",
+             d.BufferCount, d.Flags, d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT ? "yes" : "no",
+             realWait ? (pq || flipBurst ? "16" : "2") : "no", realWait ? "yes" : "no");
         if (!CreateAppBuffers())
             XLog("swap chain: could not create our backbuffers - the application will fail to render");
         StartPresenter();
@@ -1203,6 +1224,7 @@ public:
             j.passes = j.usable && pg->HasPassPatches();
             j.sync = sync;
             j.flags = flags;
+            j.presentId = presentId.load(std::memory_order_relaxed);
             j.arrive = t0.QuadPart;
             j.dbgTag = dbgTag;
             j.dbgOnly = dbgOnly;
@@ -1218,6 +1240,7 @@ public:
             const uint32_t n = willGen ? (j.passes ? j.nInterp : 1) : 0;
             lastGenerated = willGen;
             lastCallPresented = 1 + n;
+            driverFgFrames = 1 + n;
             if (xellFgOn)
             {
                 xr = xell;
@@ -1270,12 +1293,14 @@ public:
             else if (!xellIdFailed.exchange(true))
                 XLog("xell: GetLastPresentStartFrameId failed (%d) - generated frames not reported this present", idRc);
         }
+        if (driverFg)
+            DriverFgFrame(j);
         LARGE_INTEGER t1, t2, tr;
         QueryPerformanceCounter(&t1);
         // GPU backpressure, as DXGI's own frame queue limit: the frame before last must have gone out on the GPU
         // (generated frames and all). When the game and generation together are more than the GPU can do, the
         // game slows a little instead of our frames queueing behind its work and going out in bunches.
-        if (j.frame >= 2 && retireFence->GetCompletedValue() < j.frame - 1)
+        if (retireWait && j.frame >= 2 && retireFence->GetCompletedValue() < j.frame - 1)
         {
             retireFence->SetEventOnCompletion(j.frame - 1, retireEvent);
             WaitForSingleObject(retireEvent, 200);
@@ -1284,7 +1309,7 @@ public:
         {
             // Bounded latency: at most two frames wait for the presenter.
             std::unique_lock<std::mutex> l(pm);
-            pcv.wait(l, [this] { return pjobs.size() < 2 || pQuit; });
+            pcv.wait(l, [this] { return pjobs.size() < appJobs || pQuit; });
             pjobs.push_back(j);
         }
         pcv.notify_all();
@@ -1322,7 +1347,7 @@ public:
         for (ID3D12Resource* b : appBufs)
             b->Release();
         appBufs.clear();
-        if (pq)
+        if (pq || (flipBurst && realWait))
         {
             c = c ? std::max(c, kGateBuffers) : c;
             fl |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;   // created with it (GateDesc): may not change
@@ -1399,6 +1424,7 @@ private:
         float jitter[2] {}, mvs[2] {};
         uint32_t nInterp = 1;
         UINT sync = 0, flags = 0;
+        uint32_t presentId = 0;             // the game's frame id (xefgSwapChainSetPresentId), for RealPresent's markers
         long long arrive = 0;               // QPC of the application's Present
         Conversion conv[2];                 // motion, depth: converted from their raw copy (ConvertIn)
     };
@@ -1748,7 +1774,10 @@ private:
         if (n > 0 && !target)
             target = PaceTarget(k, n);
         const bool paced = n > 0 && !DisplayPaced(j);
-        const long long lead = k > 1 && Metered(j) ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
+        // FlipBurst: the whole target as the lead, so WaitUntil(target - lead) = WaitUntil(0) returns at once; lastRelease below keeps the slot.
+        const bool metered = Metered(j);
+        const bool burst = oobdriver::BurstNow(flipBurst, k, metered);
+        const long long lead = burst ? target : k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
         const long long t0 = Now(), before = lastAnyPresent;
         if (paced)
             WaitUntil(target - lead);
@@ -1772,7 +1801,7 @@ private:
         if (k == 1)
             Meter(j, n);
         Removed("our last submission, before our Present");
-        const HRESULT hr = real->Present(sync, flags);
+        const HRESULT hr = RealPresent(j, sync, flags, k <= n, k == 1);
         if (genCount > 600 && traced < 40)
         {
             ++traced;
@@ -1784,6 +1813,8 @@ private:
                  (tw0 - lastAnyPresent) * 1000.0 / freq(),
                  n ? (tw0 - target) * 1000.0 / freq() : 0.0);
         }
+        if (flipStats && SUCCEEDED(hr))
+            FlipStatsSample();
         if (FAILED(hr))
             PresentFailed(hr, j, k, n);
         const long long t = Now();
@@ -1796,8 +1827,12 @@ private:
             ++statGaps;
         }
         // Diagnostics: a gap of more than three steps between presents, with what it was made of (Hitch).
+        // A metered burst batch: its presents after the first follow at once (not a gap), and its first comes one app interval after
+        // the last batch's, so that gap is judged against the app interval.
         const double stepMs = ri.ms / static_cast<double>(n + 1);
-        if (sync == 0 && n > 0 && before && static_cast<double>(t - before) * 1000.0 / freq() > 3 * stepMs)
+        const bool burstBatch = flipBurst && Metered(j);    // read again: Meter (k == 1) has just decided this batch
+        if (sync == 0 && n > 0 && before && !(burstBatch && k > 1) &&
+            static_cast<double>(t - before) * 1000.0 / freq() > 3 * (burstBatch ? ri.ms : stepMs))
         {
             if (t - hitchSecond > static_cast<long long>(freq()))
                 hitchSecond = t, hitches = 0;
@@ -2123,12 +2158,10 @@ private:
     }
 
     // NVIDIA's own nvapi64.dll, from the system folder and pinned (OptiScaler's nvapi_QueryInterface hook lives on it:
-    // [NvApi] DisableFlipMetering=true hides SetFlipConfig from us too). Off, with the reason in the log, when the adapter
-    // has no CUDA device behind it (not NVIDIA), the nvapi is a fake one, or the driver lacks SetFlipConfig (before 570).
-    void InitFlip()
+    // [NvApi] DisableFlipMetering=true hides SetFlipConfig from us too). Null, with the reason, when the adapter has no CUDA
+    // device behind it (not NVIDIA) or the nvapi is a fake one.
+    NvQueryFn SystemNvapi(const char*& why)
     {
-        flipTried = true;
-        const char* why = nullptr;
         wchar_t sys[MAX_PATH] {}, path[MAX_PATH] {};
         const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
         HMODULE m = nullptr, owner = nullptr;
@@ -2149,15 +2182,213 @@ private:
             why = "nvapi64.dll answers fakenvapi's query (a fake nvapi)";
         else if (const auto init = reinterpret_cast<int(__cdecl*)()>(qi(0x0150E828u)); !init || init() != 0)      // NvAPI_Initialize
             why = "NvAPI_Initialize failed";
-        else if (!(flipFn = reinterpret_cast<SetFlipConfigFn>(qi(0xF3148C42u))))                                   // NvAPI_D3D12_SetFlipConfig
-            why = "no NvAPI_D3D12_SetFlipConfig: driver before 570, or OptiScaler's [NvApi] DisableFlipMetering=true";
         if (m)
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(m), &owner);
+        return why ? nullptr : qi;
+    }
+
+    // Off, with the reason in the log, when there is no usable nvapi or the driver lacks SetFlipConfig (before 570).
+    void InitFlip()
+    {
+        flipTried = true;
+        const char* why = nullptr;
+        if (const NvQueryFn qi = SystemNvapi(why))
+            if (!(flipFn = reinterpret_cast<SetFlipConfigFn>(qi(0xF3148C42u))))                                    // NvAPI_D3D12_SetFlipConfig
+                why = "no NvAPI_D3D12_SetFlipConfig: driver before 570, or OptiScaler's [NvApi] DisableFlipMetering=true";
         if (flipFn)
             XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released %s%u us early",
                  flipLeadAuto ? "up to " : "", flipLeadUs);
         else
             XLog("flip metering: off - %s", why);
+    }
+
+    // ---- out of band notices (oob_driver.h) -------------------------------------------------------------
+    using NotifyOobFn = int(__cdecl*)(ID3D12CommandQueue* queue, int type);
+    using AsyncMarkerFn = int(__cdecl*)(ID3D12CommandQueue* queue, oobdriver::AsyncMarker* marker);
+    using ReflexSyncFn = int(__cdecl*)(IUnknown* device, oobdriver::ReflexSync* sync);
+
+    void NotifyQueue(NotifyOobFn fn, ID3D12CommandQueue* q, const char* what, bool hasPresents, bool hasWork)
+    {
+        if (!q)
+            return;
+        const oobdriver::QueueType t = oobdriver::TypeFor(q == appQueue, hasPresents, hasWork);
+        if (t == oobdriver::kLeaveAlone)
+        {
+            XLog("out of band: %s queue left alone%s", what, q == appQueue ? " (it is the application's)" : "");
+            return;
+        }
+        const int st = fn(q, t);
+        XLog("out of band: %s queue is type %d -> nvapi status %d", what, static_cast<int>(t), st);
+    }
+
+    // Once, before our first Present, on the presenting thread.
+    void OobNotify()
+    {
+        oobTried = true;
+        const char* why = nullptr;
+        const NvQueryFn qi = SystemNvapi(why);
+        if (!qi)
+        {
+            XLog("out of band: off - %s", why);
+            return;
+        }
+        if (oobQueue || oobSwitch)
+        {
+            if (const auto fn = reinterpret_cast<NotifyOobFn>(qi(0x03D6E8CBu)))                                    // NvAPI_D3D12_NotifyOutOfBandCommandQueue
+            {
+                if (oobSwitch)
+                {
+                    notifyOobFn = fn;
+                    return OobNotifyMarkers(qi);
+                }
+                NotifyQueue(fn, pq, "present lane", true, true);
+                NotifyQueue(fn, queue, "own", !pq, true);
+                NotifyQueue(fn, genQueue, "generation", false, true);
+            }
+            else
+                XLog("out of band: the driver has no NvAPI_D3D12_NotifyOutOfBandCommandQueue");
+        }
+        OobNotifyMarkers(qi);
+    }
+
+    void OobNotifyMarkers(NvQueryFn qi)
+    {
+        if (oobMarkers && !(asyncMarkerFn = reinterpret_cast<AsyncMarkerFn>(qi(0x13C98F73u))))                     // NvAPI_D3D12_SetAsyncFrameMarker
+            XLog("out of band: the driver has no NvAPI_D3D12_SetAsyncFrameMarker");
+    }
+
+    // OobQueue=switch: the queue's type follows the Present about to go out, the notice only when it changes.
+    void OobSwitchType(ID3D12CommandQueue* q, bool generated)
+    {
+        const int want = generated ? oobdriver::kRender : oobdriver::kPresent;
+        if (!notifyOobFn || q == appQueue || want == oobSwitchType)
+            return;
+        const int st = notifyOobFn(q, want);
+        if (st != 0 && st != oobSwitchFailed)
+        {
+            oobSwitchFailed = st;
+            XLog("out of band: switching the queue to type %d -> nvapi status %d", want, st);
+        }
+        oobSwitchType = want;
+    }
+
+    void OobMark(ID3D12CommandQueue* q, uint32_t frameId, int type)
+    {
+        oobdriver::AsyncMarker m {};
+        m.version = oobdriver::kAsyncMarkerVer;
+        m.frameId = frameId;
+        m.markerType = type;
+        const int st = asyncMarkerFn(q, &m);
+        if (st != 0 && st != oobMarkerFailed)
+        {
+            oobMarkerFailed = st;
+            XLog("out of band: marker %d for frame %u -> nvapi status %d", type, frameId, st);
+        }
+        else if (st == 0 && !oobMarked)
+        {
+            oobMarked = true;
+            XLog("out of band: first marker %d for frame %u taken", type, frameId);
+        }
+    }
+
+    // Every Present of ours that goes to the real swap chain, between its out of band markers when OobMarkers=1.
+    HRESULT RealPresent(const Job& j, UINT sync, UINT flags, bool generated, bool first)
+    {
+        ID3D12CommandQueue* const q = pq ? pq : queue;
+        if (driverFg)
+        {
+            const bool fgReady = (driverFgParts & 4) && driverFgReady.load(std::memory_order_acquire) && oobdriver::MarkFrame(j.presentId);
+            if (fgReady && first)
+                OobMark(q, j.presentId, oobdriver::kOobRenderStart);
+            if (fgReady)
+                OobMark(q, j.presentId, oobdriver::kOobPresentStart);
+            const HRESULT fgHr = real->Present(sync, flags);
+            if (fgReady)
+                OobMark(q, j.presentId, oobdriver::kOobPresentEnd);
+            if (fgReady && !generated)
+                OobMark(q, j.presentId, oobdriver::kOobRenderEnd);
+            return fgHr;
+        }
+        if ((oobQueue || oobSwitch || oobMarkers) && !oobTried)
+            OobNotify();
+        OobSwitchType(q, generated);
+        const bool mark = asyncMarkerFn && q != appQueue && oobdriver::MarkFrame(j.presentId);
+        if (mark)
+            OobMark(q, j.presentId, oobdriver::kOobPresentStart);
+        const HRESULT hr = real->Present(sync, flags);
+        if (mark)
+            OobMark(q, j.presentId, oobdriver::kOobPresentEnd);
+        return hr;
+    }
+
+    // DriverFg=1, once, on the application's thread at its first Present: a second queue of ours, the two out of band notices,
+    // the marker and Reflex Sync entry points.
+    void DriverFgInit()
+    {
+        driverFgTried = true;
+        const char* why = nullptr;
+        const NvQueryFn qi = SystemNvapi(why);
+        if (!qi)
+        {
+            XLog("driver signals: off - %s", why);
+            return;
+        }
+        const auto notify = reinterpret_cast<NotifyOobFn>(qi(0x03D6E8CBu));                                        // NvAPI_D3D12_NotifyOutOfBandCommandQueue
+        asyncMarkerFn = reinterpret_cast<AsyncMarkerFn>(qi(0x13C98F73u));                                          // NvAPI_D3D12_SetAsyncFrameMarker
+        reflexSyncFn = reinterpret_cast<ReflexSyncFn>(qi(0xB9F6FAFFu));                                              // NvAPI_D3D_SetReflexSync
+        D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_DIRECT };
+        ID3D12CommandQueue* q2 = nullptr;
+        if (!notify || !asyncMarkerFn || !reflexSyncFn || FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q2))))
+        {
+            XLog("driver signals: off - notice %d, marker %d, sync %d, second queue %d", notify != nullptr, asyncMarkerFn != nullptr, reflexSyncFn != nullptr, q2 != nullptr);
+            return;
+        }
+        q2->SetName(L"f5low driver signals");
+        driverFgQueue = q2;
+        if (driverFgParts & 8)
+        {
+            NotifyQueue(notify, q2, "second", false, true);
+            NotifyQueue(notify, genQueue, "generation", false, true);
+            if (pq)
+                NotifyQueue(notify, queue, "own", false, true);
+            ID3D12CommandQueue* const pres = pq ? pq : queue;
+            if (pres != appQueue)
+                XLog("driver signals: present queue type %d -> nvapi status %d", static_cast<int>(oobdriver::kRender), notify(pres, oobdriver::kRender));
+            else
+                XLog("driver signals: the swap chain presents on the application's queue, no notice for it");
+        }
+        driverFgReady.store(true, std::memory_order_release);
+        if (!driverFgCounted)
+        {
+            driverFgCounted = true;
+            g_driverSignals.fetch_add(1);
+        }
+        XLog("driver signals: on, parts %u (1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices)", driverFgParts);
+    }
+
+    // At the application's Present, in the order DLSS-G uses: the in-band present markers on the second queue, Reflex Sync.
+    void DriverFgFrame(const Job& j)
+    {
+        if (!driverFgTried)
+            DriverFgInit();
+        if (!driverFgReady.load(std::memory_order_acquire) || !oobdriver::MarkFrame(j.presentId))
+            return;
+        if (driverFgParts & 2)
+        {
+            OobMark(driverFgQueue, j.presentId, oobdriver::kPresentStart);
+            OobMark(driverFgQueue, j.presentId, oobdriver::kPresentEnd);
+        }
+        if (!(driverFgParts & 1))
+            return;
+        oobdriver::ReflexSync s {};
+        s.version = oobdriver::kReflexSyncVer;
+        s.fgMultiplier = static_cast<uint8_t>(driverFgFrames);
+        const int st = reflexSyncFn(dev, &s);
+        if (st != driverFgSyncStatus)
+        {
+            driverFgSyncStatus = st;
+            XLog("driver signals: Reflex Sync multiplier %u -> nvapi status %d", driverFgFrames, st);
+        }
     }
 
     // Before the first Present of an app frame's batch (n generated + its own), on the presenter thread.
@@ -2551,7 +2782,7 @@ private:
             Meter(f.j, f.nGen);
         Removed("our last submission, before our Present (lane)");
         const long long p0 = Now();
-        const HRESULT hr = real->Present(sync, flags);
+        const HRESULT hr = RealPresent(f.j, sync, flags, k <= f.nGen, k == 1);
         // diagnostics (the test PC's ~1.1 s gate stalls with V-Sync): a Present call that blocked
         const double pms = static_cast<double>(Now() - p0) * 1000.0 / freq();
         const double wms = static_cast<double>(p0 - b0) * 1000.0 / freq();
@@ -3355,6 +3586,58 @@ private:
         back->Release();
     }
 
+    // FlipStats=1: after each real Present, the swap chain's own frame statistics. A step of exactly one present gives the spacing of
+    // two flips (SyncQPCTime delta); a larger step or a failed call (DXGI_ERROR_FRAME_STATISTICS_DISJOINT among them) only counts.
+    // No GPU work, presenter thread only.
+    void FlipStatsSample()
+    {
+        DXGI_FRAME_STATISTICS s {};
+        if (!real || FAILED(real->GetFrameStatistics(&s)))
+        {
+            ++fsFailed;
+            fsHave = false;
+            return;
+        }
+        if (fsHave && s.PresentCount != fsLast.PresentCount)
+        {
+            if (s.PresentCount - fsLast.PresentCount == 1)
+            {
+                if (fsSteps.size() < 4096)
+                    fsSteps.push_back(static_cast<double>(s.SyncQPCTime.QuadPart - fsLast.SyncQPCTime.QuadPart) * 1000.0 / freq());
+            }
+            else
+                ++fsLarger;
+        }
+        fsLast = s;
+        fsHave = true;
+    }
+    void FlipStatsLog()
+    {
+        std::vector<double> v;
+        v.swap(fsSteps);
+        std::sort(v.begin(), v.end());
+        double avg = 0, sd = 0, p50 = 0, p95 = 0, p99 = 0, over = 0;
+        if (!v.empty())
+        {
+            for (double x : v)
+                avg += x;
+            avg /= static_cast<double>(v.size());
+            for (double x : v)
+                sd += (x - avg) * (x - avg);
+            sd = std::sqrt(sd / static_cast<double>(v.size()));
+            const auto at = [&](double q) { return v[std::min(v.size() - 1, static_cast<size_t>(q * static_cast<double>(v.size())))]; };
+            p50 = at(0.5);
+            p95 = at(0.95);
+            p99 = at(0.99);
+            for (double x : v)
+                over += x > 1.5 * p50;
+            over = 100.0 * over / static_cast<double>(v.size());
+        }
+        XLog("stats: flip spacing %.2f ms avg, sd %.2f, p50 %.2f, p95 %.2f, p99 %.2f, %.1f%% over 1.5x p50, %u steps of 1, %u larger steps, %u calls failed",
+             avg, sd, p50, p95, p99, over, static_cast<unsigned>(v.size()), fsLarger, fsFailed);
+        fsLarger = fsFailed = 0;
+    }
+
     // Every 120 app frames: how the application and the presenter are doing.
     void Stats(const Job& j, uint32_t nGen)
     {
@@ -3371,6 +3654,8 @@ private:
              "frame %.1f ms after its target; from the app's Present call: taken %.1f ms, ready stamp %.1f ms (avg of 120)",
              statJobs ? statStampAge / statJobs : 0.0, statJobs ? statBehind / statJobs : 0.0, statFirstN ? statFirstLate / statFirstN : 0.0,
              statJobs ? statArriveToPick / statJobs : 0.0, statJobs ? statArriveToReady / statJobs : 0.0);
+        if (flipStats)
+            FlipStatsLog();
         std::lock_guard<std::mutex> clk(clkMu);
         if (statRels)
         {
@@ -4254,6 +4539,24 @@ private:
     std::atomic<UINT64> meteredFrame { 0 };
     // Gate=1 (ShowGated): the present lane, its lists and fence; the gate's fence, the presents waiting for their time.
     ID3D12CommandQueue* pq = nullptr;
+    bool oobTried = false;                  // the presenting thread's, as flipTried
+    bool oobMarked = false;
+    int oobMarkerFailed = 0;
+    AsyncMarkerFn asyncMarkerFn = nullptr;
+    NotifyOobFn notifyOobFn = nullptr;      // OobQueue=switch
+    ReflexSyncFn reflexSyncFn = nullptr;    // DriverFg=1, set before driverFgReady
+    ID3D12CommandQueue* driverFgQueue = nullptr;
+    std::atomic<bool> driverFgReady { false };
+    bool driverFgCounted = false;           // raised g_driverSignals (lowered in ~Own)
+    std::vector<double> fsSteps;            // FlipStats: spacings of the last window, ms
+    DXGI_FRAME_STATISTICS fsLast {};
+    bool fsHave = false;
+    unsigned fsLarger = 0, fsFailed = 0;
+    bool driverFgTried = false;             // the application's Present thread
+    uint32_t driverFgFrames = 1;            // under mu, read after it on the same thread
+    int driverFgSyncStatus = 0;
+    int oobSwitchType = -1;
+    int oobSwitchFailed = 0;
     ID3D12GraphicsCommandList* pqList = nullptr;
     ID3D12CommandAllocator* pqAlloc[kAllocs] {};
     UINT64 pqAllocFence[kAllocs] {};
