@@ -1360,19 +1360,21 @@ public:
         for (ID3D12Resource* b : appBufs)
             b->Release();
         appBufs.clear();
-        if (ourChain)
-        {
-            if (c)
-                appBufferCount = c;             // 0 keeps the current count, as it does on the real chain
-            appAskedWaitable = (fl & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
-        }
+        const UINT asked = c;                   // what the game asked for; kept only if the real chain took the resize
+        const bool askedWaitable = (fl & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
         if (pq || (flipBurst && ourChain && realWait))
         {
             c = c ? std::max(c, kGateBuffers) : c;
             fl |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;   // created with it (GateDesc): may not change
         }
         const HRESULT hr = real->ResizeBuffers(c, w, h, f, fl);
-        CreateAppBuffers();
+        if (SUCCEEDED(hr) && ourChain)
+        {
+            if (asked)
+                appBufferCount = asked;         // 0 keeps the current count, as it does on the real chain
+            appAskedWaitable = askedWaitable;
+        }
+        CreateAppBuffers();                     // (after a failure from the unchanged values)
         appIndex = 0;
         hasPrev = lastUsable = false;
         for (uint32_t& a : area)
@@ -1381,6 +1383,10 @@ public:
         return hr;
     }
 
+    // The real chain carries the waitable object only because we added it (GateDesc) and the game did not ask for it: the game's latency
+    // calls then answer as a chain made without it does (no handle, DXGI_ERROR_INVALID_CALL) and never reach the real one's.
+    bool HidesRealWait() const { return ourChain && !appAskedWaitable && realWait; }
+
     // The latency calls take mu: Retire (Destroy, on another thread) may let go of real meanwhile.
     HANDLE LatencyHandle()
     {
@@ -1388,7 +1394,11 @@ public:
         if (!latencyAsked.exchange(true))
             XLog("swap chain: the application asked for the frame-latency waitable object (%s)", latencySem ? "ours" : "the real one's");
         if (!latencySem)
+        {
+            if (HidesRealWait())
+                return nullptr;             // the game did not ask for the object: the one we added is ours alone
             return real ? real->GetFrameLatencyWaitableObject() : nullptr;
+        }
         HANDLE h = nullptr;
         DuplicateHandle(GetCurrentProcess(), latencySem, GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
         return h;
@@ -1397,7 +1407,11 @@ public:
     {
         std::lock_guard<std::mutex> lk(mu);
         if (!latencySem)
+        {
+            if (HidesRealWait())
+                return DXGI_ERROR_INVALID_CALL;
             return real ? real->SetMaximumFrameLatency(m) : DXGI_ERROR_INVALID_CALL;
+        }
         if (m < 1 || m > 16)
             return DXGI_ERROR_INVALID_CALL;
         if (m > latency)
@@ -1409,7 +1423,11 @@ public:
     {
         std::lock_guard<std::mutex> lk(mu);
         if (!latencySem)
+        {
+            if (HidesRealWait())
+                return DXGI_ERROR_INVALID_CALL;
             return real ? real->GetMaximumFrameLatency(m) : DXGI_ERROR_INVALID_CALL;
+        }
         if (!m)
             return DXGI_ERROR_INVALID_CALL;
         *m = latency;
@@ -1813,8 +1831,9 @@ private:
         const bool paced = n > 0 && !DisplayPaced(j);
         // The burst (DriverPacing / FlipBurst): a metered batch's presents after the first are not waited for (lastRelease below keeps
         // their slots for the clock pacer). Without it they go FlipLead early. Bound (the schedule path) measures from the end of the last
-        // burst (lastAnyPresent), so the batch's first present goes out when it is ready, not on the smoothed schedule; holding it to the
-        // schedule was measured worse in one game.
+        // burst (lastAnyPresent) and clamps the batch's first present to between half a step and two steps after it: at 3x or more it
+        // normally goes about two steps after the burst's end, or when it is ready if that is later - not on the smoothed schedule. Holding
+        // it to the schedule was measured worse in one game.
         const bool metered = Metered(j);
         const bool burst = oobdriver::BurstNow(Burst(), k, metered);
         const long long lead = !burst && k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
@@ -1865,8 +1884,9 @@ private:
             ++statGaps;
         }
         // Diagnostics: a gap of more than three steps between presents, with what it was made of (Hitch).
-        // A metered burst batch: its first present comes one app interval after the last batch's last, so that gap is judged against the
-        // app interval (the presents after it follow at once: a gap there is a real one).
+        // A metered burst batch: its first present comes about one app interval after the last batch's last (Bound: at most two steps after
+        // the burst's end, or when it is ready), so that gap is judged against the app interval (the presents after it follow at once: a gap
+        // there is a real one).
         const double stepMs = ri.ms / static_cast<double>(n + 1);
         const bool burstBatch = Burst() && Metered(j);      // read again: Meter (k == 1) has just decided this batch
         if (sync == 0 && n > 0 && before && static_cast<double>(t - before) * 1000.0 / freq() > 3 * (burstBatch && k == 1 ? ri.ms : stepMs))
@@ -2200,7 +2220,24 @@ private:
     // NVIDIA's own nvapi64.dll, from the system folder and pinned (OptiScaler's nvapi_QueryInterface hook lives on it:
     // [NvApi] DisableFlipMetering=true hides SetFlipConfig from us too). Null, with the reason, when the adapter has no CUDA
     // device behind it (not NVIDIA) or the nvapi is a fake one.
+    // Resolved once per context, after the generator is built (it reads the GPU the build sets), then cached with its reason: the
+    // application's thread (DriverFgInit) and the presenter (InitFlip, OobNotify) can both get here.
     NvQueryFn SystemNvapi(const char*& why)
+    {
+        if (!built.load(std::memory_order_acquire))
+        {
+            why = "the generator is not built yet";
+            return nullptr;
+        }
+        std::call_once(nvapiOnce, [this] {
+            const char* w = nullptr;
+            nvapiQi = SystemNvapiResolve(w);
+            nvapiWhy = w;
+        });
+        why = nvapiWhy;
+        return nvapiQi;
+    }
+    NvQueryFn SystemNvapiResolve(const char*& why)
     {
         wchar_t sys[MAX_PATH] {}, path[MAX_PATH] {};
         const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
@@ -2339,7 +2376,7 @@ private:
         ID3D12CommandQueue* const q = pq ? pq : queue;
         if (!driverFg)
         {
-            if ((oobQueue || oobSwitch || oobMarkers) && !oobTried)
+            if ((oobQueue || oobSwitch || oobMarkers) && !oobTried && built.load(std::memory_order_acquire))
                 OobNotify();
             OobSwitchType(q, generated);
         }
@@ -2432,10 +2469,14 @@ private:
         }
         if (!(driverFgParts & 1))
             return;
+        std::lock_guard<std::mutex> sendLock(driverFgMu);
+        if (driverFgStopped.load(std::memory_order_acquire))
+            return;                         // Retire has reset the multiplier: nothing follows it
         oobdriver::ReflexSync s {};
         s.version = oobdriver::kReflexSyncVer;
         s.fgMultiplier = static_cast<uint8_t>(driverFgFrames);
         const int st = reflexSyncFn(dev, &s);
+        driverFgLastMult = driverFgFrames;
         if ((st != driverFgSyncStatus || driverFgFrames != driverFgSyncMult) && driverFgSyncLogs < 100)
         {
             ++driverFgSyncLogs;
@@ -2451,14 +2492,15 @@ private:
         }
     }
 
-    // Once: the cap export stops counting this context. With sendReset (Retire, the device is alive) also back to multiplier 1 for the
+    // Once (under driverFgMu, with the sends): the cap export stops counting this context. With sendReset (Retire, the device is alive) also back to multiplier 1 for the
     // driver if we sent one; ~Own never calls NVAPI (the device may be gone).
     void DriverFgStop(bool sendReset)
     {
+        std::lock_guard<std::mutex> sendLock(driverFgMu);
         driverFgStopped.store(true, std::memory_order_release);
         if (!driverFgCounted.exchange(false))
             return;
-        if (sendReset && driverFgSynced && reflexSyncFn && dev && driverFgSyncMult != 1)
+        if (sendReset && driverFgSynced && reflexSyncFn && dev && driverFgLastMult != 1)
         {
             oobdriver::ReflexSync s {};
             s.version = oobdriver::kReflexSyncVer;
@@ -4598,6 +4640,11 @@ private:
     std::atomic<UINT> appBufferCount { 0 };
     std::atomic<bool> appAskedWaitable { false };
     std::atomic<bool> noFrameIdLogged { false };
+    std::once_flag nvapiOnce;               // SystemNvapi: resolved once
+    NvQueryFn nvapiQi = nullptr;
+    const char* nvapiWhy = nullptr;
+    std::mutex driverFgMu;                  // Reflex Sync sends and DriverFgStop: no send follows the reset
+    uint32_t driverFgLastMult = 0;          // the multiplier of the last Reflex Sync sent, whatever the log cap
     bool oobTried = false;                  // the presenting thread's, as flipTried
     std::atomic<bool> oobMarked { false };  // the app's thread (DriverFgFrame) and the presenter both mark
     std::atomic<int> oobMarkerFailed { 0 };

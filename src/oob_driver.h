@@ -71,8 +71,9 @@ inline bool MarkFrame(uint32_t frameId) { return frameId != 0; }
 
 // DriverPacing (xefg_own.h, PresentReal): a present after a batch's first goes out at once (it is not waited for, only for its own GPU
 // work) when the burst is on and the NVIDIA driver meters the batch's flips. The batch's first present (k == 1) keeps its time. The
-// schedule's Bound measures from the end of the last burst, so the next batch's first present goes out when it is ready, not on the
-// smoothed schedule: holding it to the schedule was measured worse in one game.
+// schedule's Bound measures from the end of the last burst and clamps the next batch's first present to between half a step and two
+// steps after it: at 3x or more it normally goes about two steps after the burst's end, or when it is ready if that is later, not on the
+// smoothed schedule. Holding it to the schedule was measured worse in one game.
 inline bool BurstNow(bool burstOn, uint32_t k, bool metered) { return burstOn && k > 1 && metered; }
 
 // The settings after Gate, DriverPacing and the low-level keys are resolved (xefg_cuda.cpp). Gate=1 paces on the GPU through a present

@@ -123,7 +123,7 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 ## Per backend, when it is built (stories A2-A4)
 
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=1` in f5low.ini (`XEFG_CUDA_DRIVERPACING`), **default 0**, ignored with `Gate=1`, NVIDIA GPUs
-  only, needs OptiScaler 0.1.37 or newer (it reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
+  only, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
   turns on the driver signals (NvAPI_D3D_SetReflexSync with the frame generation multiplier, in-band present markers on a second queue, out of
   band markers and queue notices) and the burst: while the driver flip-meters a batch, the presents after the batch's first are released
   at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 16 while
