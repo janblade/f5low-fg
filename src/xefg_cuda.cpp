@@ -1700,8 +1700,6 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 XLog("DriverPacing=1: driver signals (all parts) and burst release of the flips on");
             }
         }
-        // FlipStats=1 (XEFG_CUDA_FLIPSTATS): the swap chain's flip spacing in the log; needs Log=1.
-        o->flipStats = Setting("XEFG_CUDA_FLIPSTATS", "FlipStats", "0") == "1" && OpenLog();
         // AppJobs= / RetireWait=0 (XEFG_CUDA_APPJOBS, XEFG_CUDA_RETIREWAIT): prototype, where the game's Present blocks (xefg_own.h, OnPresent).
         o->appJobs = std::clamp(static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_APPJOBS", "AppJobs", "2").c_str())), 1u, 6u);
         o->retireWait = Setting("XEFG_CUDA_RETIREWAIT", "RetireWait", "1") != "0";

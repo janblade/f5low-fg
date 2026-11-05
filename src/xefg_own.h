@@ -467,7 +467,6 @@ public:
     bool flipMetering = true;                   // FlipMetering=0 in f5low.ini: no NVIDIA driver flip metering (Meter)
     bool oobQueue = false;                      // OobQueue=1 in f5low.ini: tell NVIDIA's driver our queues run out of band (OobNotify)
     bool oobSwitch = false;                     // OobQueue=switch: present type for the app's frame, render type for a generated one (RealPresent)
-    bool flipStats = false;                     // FlipStats=1 in f5low.ini (needs Log=1): the swap chain's own flip spacing, logged every 120 app frames
     bool flipBurst = false;                     // FlipBurst=1 in f5low.ini (prototype, Gate=0): metered frames after a batch's first go out at once (PresentReal)
     bool driverFg = false;                      // DriverFg=1 in f5low.ini (prototype): the whole set of driver signals (DriverFgFrame, RealPresent)
     uint32_t driverFgParts = 15;                // DriverFgParts= (prototype, sum): 1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices
@@ -1813,8 +1812,6 @@ private:
                  (tw0 - lastAnyPresent) * 1000.0 / freq(),
                  n ? (tw0 - target) * 1000.0 / freq() : 0.0);
         }
-        if (flipStats && SUCCEEDED(hr))
-            FlipStatsSample();
         if (FAILED(hr))
             PresentFailed(hr, j, k, n);
         const long long t = Now();
@@ -3586,58 +3583,6 @@ private:
         back->Release();
     }
 
-    // FlipStats=1: after each real Present, the swap chain's own frame statistics. A step of exactly one present gives the spacing of
-    // two flips (SyncQPCTime delta); a larger step or a failed call (DXGI_ERROR_FRAME_STATISTICS_DISJOINT among them) only counts.
-    // No GPU work, presenter thread only.
-    void FlipStatsSample()
-    {
-        DXGI_FRAME_STATISTICS s {};
-        if (!real || FAILED(real->GetFrameStatistics(&s)))
-        {
-            ++fsFailed;
-            fsHave = false;
-            return;
-        }
-        if (fsHave && s.PresentCount != fsLast.PresentCount)
-        {
-            if (s.PresentCount - fsLast.PresentCount == 1)
-            {
-                if (fsSteps.size() < 4096)
-                    fsSteps.push_back(static_cast<double>(s.SyncQPCTime.QuadPart - fsLast.SyncQPCTime.QuadPart) * 1000.0 / freq());
-            }
-            else
-                ++fsLarger;
-        }
-        fsLast = s;
-        fsHave = true;
-    }
-    void FlipStatsLog()
-    {
-        std::vector<double> v;
-        v.swap(fsSteps);
-        std::sort(v.begin(), v.end());
-        double avg = 0, sd = 0, p50 = 0, p95 = 0, p99 = 0, over = 0;
-        if (!v.empty())
-        {
-            for (double x : v)
-                avg += x;
-            avg /= static_cast<double>(v.size());
-            for (double x : v)
-                sd += (x - avg) * (x - avg);
-            sd = std::sqrt(sd / static_cast<double>(v.size()));
-            const auto at = [&](double q) { return v[std::min(v.size() - 1, static_cast<size_t>(q * static_cast<double>(v.size())))]; };
-            p50 = at(0.5);
-            p95 = at(0.95);
-            p99 = at(0.99);
-            for (double x : v)
-                over += x > 1.5 * p50;
-            over = 100.0 * over / static_cast<double>(v.size());
-        }
-        XLog("stats: flip spacing %.2f ms avg, sd %.2f, p50 %.2f, p95 %.2f, p99 %.2f, %.1f%% over 1.5x p50, %u steps of 1, %u larger steps, %u calls failed",
-             avg, sd, p50, p95, p99, over, static_cast<unsigned>(v.size()), fsLarger, fsFailed);
-        fsLarger = fsFailed = 0;
-    }
-
     // Every 120 app frames: how the application and the presenter are doing.
     void Stats(const Job& j, uint32_t nGen)
     {
@@ -3654,8 +3599,6 @@ private:
              "frame %.1f ms after its target; from the app's Present call: taken %.1f ms, ready stamp %.1f ms (avg of 120)",
              statJobs ? statStampAge / statJobs : 0.0, statJobs ? statBehind / statJobs : 0.0, statFirstN ? statFirstLate / statFirstN : 0.0,
              statJobs ? statArriveToPick / statJobs : 0.0, statJobs ? statArriveToReady / statJobs : 0.0);
-        if (flipStats)
-            FlipStatsLog();
         std::lock_guard<std::mutex> clk(clkMu);
         if (statRels)
         {
@@ -4548,10 +4491,6 @@ private:
     ID3D12CommandQueue* driverFgQueue = nullptr;
     std::atomic<bool> driverFgReady { false };
     bool driverFgCounted = false;           // raised g_driverSignals (lowered in ~Own)
-    std::vector<double> fsSteps;            // FlipStats: spacings of the last window, ms
-    DXGI_FRAME_STATISTICS fsLast {};
-    bool fsHave = false;
-    unsigned fsLarger = 0, fsFailed = 0;
     bool driverFgTried = false;             // the application's Present thread
     uint32_t driverFgFrames = 1;            // under mu, read after it on the same thread
     int driverFgSyncStatus = 0;
