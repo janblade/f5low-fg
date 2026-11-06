@@ -84,18 +84,55 @@ inline bool BurstNow(bool burstOn, uint32_t k, bool metered) { return burstOn &&
 // so the leave threshold sits well below the enter one. The rule holds each side for a while and each state for a dwell time.
 inline constexpr double kPacingEnterLoad = 0.75, kPacingLeaveLoad = 0.55;
 inline constexpr double kPacingHoldMs = 2000.0, kPacingDwellMs = 10000.0;
+inline constexpr double kPacingTransientMs = 1000.0;    // a transient cause must last this long, without a break, to count
+inline constexpr double kPacingGapMs = 500.0;           // no update for this long: the holds start over
+inline constexpr double kPacingMaxShare = 3.0;          // one frame's load share is clamped to this (a stall must not move the average far)
+
+// The GPU's share of the app interval for one frame: its GPU work's arrival-to-ready time over the interval, between 0 and 3. -1: no
+// usable interval yet.
+inline double LoadShare(double arriveToReadyMs, double intervalMs)
+{
+    if (!(intervalMs > 0.5))
+        return -1.0;
+    const double s = (arriveToReadyMs > 0.0 ? arriveToReadyMs : 0.0) / intervalMs;
+    return s < kPacingMaxShare ? s : kPacingMaxShare;
+}
+
+// Why the set may not run now. kHard: V-Sync or a display paced game, frame generation off, a swap chain the game made, no flip metering to
+// be had - it goes off at once. kTransient: a history reset, the metering refilling, a one-batch dropout - it only counts once it has
+// lasted kPacingTransientMs without a break (a few frames of it must not drop the set and then hold it off for the dwell time).
+enum class Eligibility : int { kEligible, kTransient, kHard };
 struct PacingRule
 {
     bool on = false;
     double aboveMs = -1;                // when load rose to the enter threshold (and stayed there); -1: not above
     double belowMs = -1;                // when load fell to the leave threshold; -1: not below
     double lastChangeMs = -1e9;
+    double transientMs = -1;            // when the current run of transient causes began; -1: none
+    double lastUpdateMs = -1e9;
 
-    // Returns the new state. eligible false (V-Sync or a display paced game, no frames generated, no flip metering for the batch or
-    // none to be had, a swap chain the game made) turns it off at once, and that counts as a change; while off nothing is held.
-    bool Update(double load, double nowMs, bool eligible)
+    // Returns the new state. A hard cause turns it off at once, and that counts as a change; while off nothing is held. An update more than
+    // kPacingGapMs after the last one starts the holds over (the frames in between were not seen).
+    bool Update(double load, double nowMs, Eligibility e)
     {
-        if (!eligible)
+        if (nowMs - lastUpdateMs > kPacingGapMs)
+            aboveMs = belowMs = transientMs = -1;
+        lastUpdateMs = nowMs;
+        if (e == Eligibility::kTransient)
+        {
+            if (transientMs < 0)
+                transientMs = nowMs;
+            if (nowMs - transientMs >= kPacingTransientMs)
+                e = Eligibility::kHard;
+            else
+            {
+                aboveMs = belowMs = -1;     // nothing is held while it lasts; the state stays
+                return on;
+            }
+        }
+        else
+            transientMs = -1;
+        if (e == Eligibility::kHard)
         {
             if (on)
             {
@@ -134,13 +171,108 @@ struct PacingRule
         }
         return on;
     }
+    bool Update(double load, double nowMs, bool eligible) { return Update(load, nowMs, eligible ? Eligibility::kEligible : Eligibility::kHard); }
+};
+
+// The order of a switch of the driver signals (xefg_own.h, PacingStep carries out the actions), once per app frame:
+//   off -> arming: the cap export goes up first (OptiScaler then gives Reflex the shown-frame cap undivided; nothing is sent to the driver
+//     yet, so the game runs faster than its cap, never slower); arming -> on after kPacingSettleFrames app frames: the markers, the burst and
+//     Reflex Sync with the frame multiplier start. Arming -> off (the want went away): the export comes down again.
+//   on -> disarming: the signals stop and Reflex Sync gets multiplier 1 at once; the export comes down only after kPacingSettleFrames app
+//     frames and after the driver took the 1. A refused 1 is sent again each frame; after kPacingGiveUpRefusals refusals the export comes
+//     down anyway (gaveUp: the state cannot be repaired by waiting). Disarming -> on (the want came back): the export is still up.
+// The caller reports each send's outcome with SendResult.
+enum class PacingState : int { kOff, kArming, kOn, kDisarming };
+inline constexpr uint64_t kPacingSettleFrames = 30, kPacingGiveUpRefusals = 120;
+inline constexpr uint32_t kPacingRefusalsMax = 8;       // consecutive refused Reflex Syncs after which automatic pacing gives up
+struct PacingActions
+{
+    bool raiseExport = false, signalsOn = false, signalsOff = false, sendOne = false, lowerExport = false, gaveUp = false;
+};
+struct PacingMachine
+{
+    PacingState state = PacingState::kOff;
+    uint64_t at = 0, refused = 0;
+    bool sendPending = false;
+    PacingActions Step(bool want, uint64_t frames)
+    {
+        PacingActions a;
+        switch (state)
+        {
+        case PacingState::kOff:
+            if (want)
+            {
+                state = PacingState::kArming;
+                at = frames;
+                a.raiseExport = true;
+            }
+            break;
+        case PacingState::kArming:
+            if (!want)
+            {
+                state = PacingState::kOff;
+                a.lowerExport = true;
+            }
+            else if (frames - at >= kPacingSettleFrames)
+            {
+                state = PacingState::kOn;
+                a.signalsOn = true;
+            }
+            break;
+        case PacingState::kOn:
+            if (!want)
+            {
+                state = PacingState::kDisarming;
+                at = frames;
+                refused = 0;
+                sendPending = true;
+                a.signalsOff = true;
+                a.sendOne = true;
+            }
+            break;
+        case PacingState::kDisarming:
+            if (want)
+            {
+                state = PacingState::kOn;
+                sendPending = false;
+                a.signalsOn = true;
+            }
+            else if (sendPending)
+            {
+                if (refused >= kPacingGiveUpRefusals)
+                {
+                    state = PacingState::kOff;
+                    sendPending = false;
+                    a.lowerExport = true;
+                    a.gaveUp = true;
+                }
+                else
+                    a.sendOne = true;
+            }
+            else if (frames - at >= kPacingSettleFrames)
+            {
+                state = PacingState::kOff;
+                a.lowerExport = true;
+            }
+            break;
+        }
+        return a;
+    }
+    void SendResult(bool ok)
+    {
+        if (ok)
+            sendPending = false;
+        else
+            ++refused;
+    }
 };
 
 // The real swap chain's frame latency tokens (the waitable object, limit 2 at all times) under the burst. A burst present takes its token
 // without blocking; when none is there it goes out anyway and its retirement still releases one, a token the chain would hand out on top
 // of the limit. TokenDebt counts those presents and pays them back: a burst present takes a spare token without blocking while it owes,
-// a present outside a burst waits for one (one extra blocking wait, the caller gives up and Forgive()s on a timeout: nothing is in flight
-// to wait for). Probed on a host swap chain (flag, limit 2): without it the surplus grew to 21 tokens over three bursts, with it 2.
+// a present outside a burst waits for one (one extra blocking wait; on a timeout nothing is in flight to wait for, so the debt is
+// forgiven and the present's own wait is skipped too: a chain whose presents never retire costs 100 ms a present, not 200). Probed on a
+// host swap chain (flag, limit 2): without it the surplus grew to 21 tokens over three bursts, with it 2.
 // Presenter thread only. Not negative, ever.
 struct TokenDebt
 {
@@ -156,6 +288,18 @@ struct TokenDebt
         return true;
     }
     void Forgive() { owed = 0; }                    // a timeout while paying back, or the chain's handle is new or gone
+    // The extra blocking wait of a present outside a burst, while owing: success repays one; a timeout forgives it all. Returns whether the
+    // present's own blocking wait follows (not after a timeout: it would only wait the 100 ms again, and add a debt of its own).
+    bool PaidBack(bool tookToken)
+    {
+        if (tookToken)
+        {
+            Repay(true);
+            return true;
+        }
+        Forgive();
+        return false;
+    }
 };
 
 // The settings after Gate, DriverPacing and the low-level keys are resolved (xefg_cuda.cpp). Gate=1 paces on the GPU through a present

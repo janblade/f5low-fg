@@ -46,57 +46,183 @@ int main()
         const DriverSettings e = ResolveDriver(false, 0, true, 6, true);
         Check(e.driverFg && e.parts == 6 && e.flipBurst && !e.pacingAuto, "the low-level keys still work with DriverPacing=0");
     }
-    // PacingRule: enter at 0.75 held 2 s, leave at 0.55 held 2 s, 10 s between changes, ineligible = off at once.
+    // PacingRule: enter at 0.75 held 2 s, leave at 0.55 held 2 s, 10 s between changes, a hard cause = off at once, a transient cause only
+    // after 1 s without a break, a gap over 0.5 s between updates restarts the holds. Hold() updates every 100 ms from a to b.
     {
+        auto Hold = [](PacingRule& r, double load, double a, double b, Eligibility e = Eligibility::kEligible) {
+            bool s = r.on;
+            for (double t = a; t <= b + 1e-9; t += 100)
+                s = r.Update(load, t, e);
+            return s;
+        };
         PacingRule r;
-        Check(!r.Update(1.8, 0, true), "high load: not on at once");
-        Check(!r.Update(1.8, 1900, true), "high load held 1.9 s: not yet");
+        Check(!Hold(r, 1.8, 0, 1900), "high load held 1.9 s: not yet");
         Check(r.Update(1.8, 2000, true), "high load held 2 s: on");
-        Check(r.Update(0.3, 2100, true) && r.Update(0.3, 5000, true), "low load while the state is young: stays on (dwell and hold)");
-        Check(r.Update(0.3, 11999, true), "10 s dwell not over yet at 12 s after the change: stays on");
-        Check(!r.Update(0.3, 12100, true), "low load held 2 s past the dwell: off");
+        Check(Hold(r, 0.3, 2100, 11900), "low load while the state is young: stays on (dwell 10 s)");
+        Check(!r.Update(0.3, 12000, true), "low load held 2 s past the dwell: off");
         // hysteresis: between the thresholds nothing is held, and it resets a hold in progress
         PacingRule h;
-        h.Update(0.9, 0, true);
-        h.Update(0.6, 1500, true);          // between: the hold starts over
-        Check(!h.Update(0.9, 2500, true), "a load between the thresholds resets the enter hold");
-        Check(h.Update(0.9, 4500, true), "enter hold counted again from 2.5 s: on at 4.5 s");
+        Hold(h, 0.9, 0, 1500);
+        h.Update(0.6, 1600, true);          // between: the hold starts over
+        Check(!Hold(h, 0.9, 1700, 3600), "a load between the thresholds resets the enter hold");
+        Check(h.Update(0.9, 3700, true), "enter hold counted again from 1.7 s: on at 3.7 s");
         PacingRule g;
-        g.Update(0.9, 0, true);
-        g.Update(0.9, 2000, true);          // on at 2 s
-        g.Update(0.4, 14000, true);
-        g.Update(0.6, 15000, true);         // between: leave hold reset
-        Check(g.Update(0.4, 16000, true), "leave hold reset by a load between the thresholds");
-        Check(!g.Update(0.4, 18100, true), "leave hold of 2 s from 16 s: off");
+        Hold(g, 0.9, 0, 2000);              // on at 2 s
+        Hold(g, 0.6, 2100, 13900);          // between the thresholds: nothing is held, it stays on
+        Hold(g, 0.4, 14000, 14500);
+        g.Update(0.6, 14600, true);         // between: the leave hold starts over
+        Check(Hold(g, 0.4, 14700, 16500), "leave hold reset by a load between the thresholds");
+        Check(!g.Update(0.4, 16700, true), "leave hold of 2 s from 14.7 s: off at 16.7 s");
         // a load at exactly the enter threshold counts
         PacingRule t;
-        t.Update(0.75, 0, true);
-        Check(t.Update(0.75, 2000, true), "load == 0.75 enters");
+        Check(Hold(t, 0.75, 0, 2000), "load == 0.75 enters");
         // a dip between the thresholds before the hold ends cancels it
         PacingRule c;
-        c.Update(0.9, 0, true);
+        Hold(c, 0.9, 0, 900);
         c.Update(0.7, 1000, true);
-        Check(!c.Update(0.9, 2500, true), "a dip between the thresholds restarts the hold");
+        Check(!Hold(c, 0.9, 1100, 2900), "a dip between the thresholds restarts the hold");
         // dwell: held long enough but too soon after the last change
         PacingRule d2;
-        d2.Update(0.9, 0, true);
-        d2.Update(0.9, 2000, true);         // on
-        d2.Update(0.2, 3000, true);
-        d2.Update(0.2, 6000, true);
-        Check(d2.on, "held low for 3 s but only 4 s after the change: stays on");
+        Hold(d2, 0.9, 0, 2000);             // on
+        Check(Hold(d2, 0.2, 2100, 11900), "held low for long, but under 10 s after the change: stays on");
         Check(!d2.Update(0.2, 12000, true), "off once the 10 s dwell is over");
-        d2.Update(0.9, 12100, true);
-        Check(!d2.Update(0.9, 14200, true), "not on again: 2.2 s after the off change, dwell not over");
-        Check(d2.Update(0.9, 22100, true), "on again after the dwell");
-        // eligibility: off at once, counted as a change, not held while ineligible
-        Check(!d2.Update(0.9, 23000, false), "ineligible: off at once");
-        d2.Update(0.9, 23500, true);
-        Check(!d2.Update(0.9, 26000, true), "after the eligibility off: dwell of 10 s from it (not on at 26 s)");
-        Check(d2.Update(0.9, 33100, true), "on after the dwell once the load was held");
+        Check(!Hold(d2, 0.9, 12100, 21900), "high again but the dwell after the off change is not over: stays off");
+        Check(d2.Update(0.9, 22000, true), "on again after the dwell");
+        // a hard cause: off at once, counted as a change, not held while it lasts
+        Check(!d2.Update(0.9, 22100, Eligibility::kHard), "hard cause: off at once");
+        Hold(d2, 0.9, 22200, 25900);
+        Check(!d2.on, "after the hard off: the 10 s dwell from it (not on at 25.9 s)");
+        Check(Hold(d2, 0.9, 26000, 32100), "on after the dwell once the load was held");
         PacingRule e2;
-        Check(!e2.Update(0.9, 0, false) && !e2.Update(0.9, 5000, false), "ineligible while off: stays off, no hold counted");
-        e2.Update(0.9, 5100, true);
-        Check(!e2.Update(0.9, 6000, true) && e2.Update(0.9, 7100, true), "the hold starts when it becomes eligible, and is not counted a change while off");
+        Check(!Hold(e2, 0.9, 0, 5000, Eligibility::kHard), "hard cause while off: stays off, no hold counted");
+        Hold(e2, 0.9, 5100, 6900);
+        Check(!e2.on && e2.Update(0.9, 7100, true), "the hold starts when it becomes eligible, and is not a change while off");
+        // a transient cause: the state stays for 1 s, then it counts as a hard one
+        PacingRule x;
+        Hold(x, 0.9, 0, 2000);              // on
+        Check(Hold(x, 0.9, 11000, 11900, Eligibility::kTransient), "a transient cause under 1 s: stays on");
+        Check(Hold(x, 0.9, 12000, 12000), "an eligible update ends the run");
+        Check(Hold(x, 0.9, 12100, 12900, Eligibility::kTransient), "a second run starts from zero: stays on");
+        Check(!Hold(x, 0.9, 13000, 13100, Eligibility::kTransient), "a transient cause for 1 s without a break: off like a hard one");
+        PacingRule y;
+        Hold(y, 0.9, 0, 2000);
+        Hold(y, 0.9, 5000, 5400, Eligibility::kTransient);
+        Hold(y, 0.9, 5500, 5500);
+        Hold(y, 0.9, 5600, 6400, Eligibility::kTransient);
+        Check(y.on, "transient runs broken by an eligible frame do not add up");
+        // a transient cause resets what was being held, and counts as a change only once it counts
+        PacingRule z;
+        Hold(z, 0.9, 0, 1500);
+        Hold(z, 0.9, 1600, 1700, Eligibility::kTransient);
+        Check(!Hold(z, 0.9, 1800, 3600), "a transient cause restarts the enter hold");
+        Check(z.Update(0.9, 3800, true), "and then it enters 2 s after it");
+        // a gap of over 0.5 s between updates restarts the holds
+        PacingRule k;
+        Hold(k, 0.9, 0, 1900);
+        Check(!k.Update(0.9, 3000, true), "gap of 1.1 s: the hold starts over, not on at 3 s");
+        Check(!Hold(k, 0.9, 3100, 4900), "still held only from 3 s");
+        Check(k.Update(0.9, 5000, true), "on 2 s after the restart");
+        PacingRule k2;
+        Hold(k2, 0.9, 0, 2000);             // on
+        Hold(k2, 0.3, 2100, 11500);
+        k2.Update(0.3, 12500, true);        // a gap: the leave hold restarts from here
+        Check(k2.on, "after a gap the leave hold has to be counted again");
+        Check(Hold(k2, 0.3, 12600, 14400), "held 1.9 s since the gap: stays on");
+        Check(!k2.Update(0.3, 14500, true), "off 2 s after the gap");
+        // the load of one frame is clamped to 3, and an unusable interval gives -1
+        Check(LoadShare(5000, 10) == 3.0 && LoadShare(20, 10) == 2.0 && LoadShare(5, 10) == 0.5, "load share: ms over the interval, at most 3");
+        Check(LoadShare(-4, 10) == 0.0 && LoadShare(10, 0) < 0 && LoadShare(10, 0.4) < 0, "load share: never negative, -1 without an interval");
+    }
+    // PacingMachine: the order of the actions for each path.
+    {
+        PacingMachine m;
+        uint64_t f = 0;
+        PacingActions a = m.Step(false, f++);
+        Check(!a.raiseExport && !a.signalsOn && !a.signalsOff && !a.sendOne && !a.lowerExport && m.state == PacingState::kOff, "off, nothing wanted: nothing to do");
+        a = m.Step(true, f++);
+        Check(a.raiseExport && !a.signalsOn && !a.sendOne && m.state == PacingState::kArming, "off -> arming: the export goes up first, no signals");
+        for (uint64_t i = 1; i < kPacingSettleFrames; ++i)
+        {
+            a = m.Step(true, f++);
+            Check(!a.signalsOn && !a.raiseExport && m.state == PacingState::kArming, "arming: the signals wait for the export to be read");
+        }
+        a = m.Step(true, f++);
+        Check(a.signalsOn && !a.raiseExport && !a.lowerExport && m.state == PacingState::kOn, "arming -> on after 30 frames: signals on");
+        a = m.Step(true, f++);
+        Check(!a.signalsOn && !a.signalsOff && !a.sendOne && m.state == PacingState::kOn, "on, still wanted: nothing to do");
+        a = m.Step(false, f++);
+        Check(a.signalsOff && a.sendOne && !a.lowerExport && m.state == PacingState::kDisarming, "on -> disarming: signals off and the 1 sent at once, the export stays");
+        m.SendResult(true);
+        for (uint64_t i = 1; i < kPacingSettleFrames; ++i)
+        {
+            a = m.Step(false, f++);
+            Check(!a.lowerExport && !a.sendOne && m.state == PacingState::kDisarming, "disarming: the export stays up for 30 frames");
+        }
+        a = m.Step(false, f++);
+        Check(a.lowerExport && !a.sendOne && !a.gaveUp && m.state == PacingState::kOff, "disarming -> off: the export comes down after the 30 frames");
+        // cancelled arming: only the export comes down, nothing was sent
+        PacingMachine c;
+        f = 0;
+        c.Step(true, f++);
+        c.Step(true, f++);
+        a = c.Step(false, f++);
+        Check(a.lowerExport && !a.sendOne && !a.signalsOff && !a.signalsOn && c.state == PacingState::kOff, "cancelled arming: the export comes down, nothing else");
+        // disarming back to on: the export is still up, the signals start again, no lowering
+        PacingMachine d;
+        f = 0;
+        d.Step(true, f++);
+        for (uint64_t i = 0; i < kPacingSettleFrames; ++i)
+            d.Step(true, f++);
+        d.Step(false, f++);
+        d.SendResult(true);
+        d.Step(false, f++);
+        a = d.Step(true, f++);
+        Check(a.signalsOn && !a.raiseExport && !a.lowerExport && d.state == PacingState::kOn, "disarming -> on: signals on again, the export untouched");
+        // a refused 1: sent again every frame, the export stays up until it is taken
+        PacingMachine r;
+        f = 0;
+        r.Step(true, f++);
+        for (uint64_t i = 0; i < kPacingSettleFrames; ++i)
+            r.Step(true, f++);
+        a = r.Step(false, f++);
+        Check(a.sendOne && a.signalsOff, "refusal path: the 1 is sent");
+        r.SendResult(false);
+        for (int i = 0; i < 40; ++i)
+        {
+            a = r.Step(false, f++);
+            Check(a.sendOne && !a.lowerExport && r.state == PacingState::kDisarming, "refused 1: sent again, the export stays up past the 30 frames");
+            r.SendResult(false);
+        }
+        r.SendResult(true);
+        a = r.Step(false, f++);
+        Check(a.lowerExport && !a.sendOne && !a.gaveUp && r.state == PacingState::kOff, "the 1 taken after the 30 frames: the export comes down");
+        // refused for good: after the give-up count the export comes down anyway
+        PacingMachine g;
+        f = 0;
+        g.Step(true, f++);
+        for (uint64_t i = 0; i < kPacingSettleFrames; ++i)
+            g.Step(true, f++);
+        a = g.Step(false, f++);
+        g.SendResult(false);
+        bool gave = false;
+        for (uint64_t i = 0; i < kPacingGiveUpRefusals + 5 && !gave; ++i)
+        {
+            a = g.Step(false, f++);
+            gave = a.gaveUp;
+            if (a.sendOne)
+                g.SendResult(false);
+        }
+        Check(gave && a.lowerExport && !a.sendOne && g.state == PacingState::kOff && g.refused == kPacingGiveUpRefusals, "120 refusals: the export comes down anyway, said plainly (gaveUp)");
+        // a want that returns while the 1 is still refused: back on, nothing pending
+        PacingMachine w;
+        f = 0;
+        w.Step(true, f++);
+        for (uint64_t i = 0; i < kPacingSettleFrames; ++i)
+            w.Step(true, f++);
+        w.Step(false, f++);
+        w.SendResult(false);
+        a = w.Step(true, f++);
+        Check(a.signalsOn && !w.sendPending && w.state == PacingState::kOn, "disarming with a refused 1, want returns: on again");
     }
     // TokenDebt: misses add, a taken token repays one, never negative, a timeout forgives.
     {
@@ -116,6 +242,14 @@ int main()
         d.Missed();
         d.Forgive();
         Check(d.owed == 0 && !d.Owes(), "a timeout forgives it all");
+        // the extra blocking wait of a present outside a burst: a token repays one and the own wait follows; a timeout forgives everything
+        // and the own wait is skipped (so no debt of its own: 100 ms a present, not 200)
+        TokenDebt p;
+        p.Missed();
+        p.Missed();
+        Check(p.PaidBack(true) && p.owed == 1, "extra wait got a token: one repaid, the own wait follows");
+        Check(!p.PaidBack(false) && p.owed == 0, "extra wait timed out: forgiven, the own wait is skipped");
+        Check(!p.Owes(), "after the timeout nothing is owed and no miss was added");
     }
     Check(kIdSetReflexSync == 0xB9F6FAFFu && kIdSetFlipConfig == 0xF3148C42u, "nvapi ids are the public ones");
     if (failures == 0)
