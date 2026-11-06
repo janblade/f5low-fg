@@ -31,10 +31,14 @@
 //     Gate=1 (clock): the clock paces on the GPU instead (ShowGated, PresentGenGated on the D3D12 path): the real swap
 //     chain lives on a present lane of its own, each Present goes out at once behind a fence the release thread signals
 //     at the frame's time.
-//     DriverPacing=1 (own swap chain, NVIDIA driver 570+, Gate=0): the driver signals (Reflex Sync with the frame generation multiplier,
-//     in-band present markers on a second queue, out of band markers, queue notices) and the burst: a batch the driver flip-meters
+//     DriverPacing=1 (automatic) or 2 (always) (own swap chain, NVIDIA driver 570+, Gate=0): the driver signals (Reflex Sync with the frame
+//     generation multiplier, in-band present markers on a second queue, out of band markers, queue notices) and the burst: a batch the driver flip-meters
 //     (Meter) has its presents after the first released at once, on their virtual slots, while the driver spaces the flips. The real
-//     swap chain then has 8 buffers and a frame latency of 16 while metered (2 otherwise); the game sees the buffer count it asked for.
+//     swap chain then has 8 buffers and a frame latency of 2 at all times (the burst's presents take their latency tokens without blocking
+//     and pay back the ones they lacked, oob_driver.h TokenDebt); the game sees the buffer count it asked for.
+//     DriverPacing=1 runs that set only while the GPU is the limit (PacingFrame, oob_driver.h PacingRule and PacingMachine): a capped
+//     session whose load stays under the enter threshold never sends a signal, though it has the 8-buffer chain from the start; once
+//     armed the queue notices stay as sent. 2 runs it always.
 // UI as Intel handles it (tools/XEFG_SETTINGS.md): with UI composition off everything is interpolated, UI
 // included, and HUD-less colour / UI texture are ignored. With it on, the mode (initParams.uiMode; AUTO picks
 // by what was tagged) decides: HUD-less colour is what gets interpolated (modes 3-5) and the output layer puts
@@ -77,7 +81,8 @@ void XLog(const char* fmt, ...);
 
 namespace xefgown
 {
-// Contexts whose driver signals (DriverFg) are on: xefgCudaDriverMultipliesReflexCap answers 1 while there is one.
+// Contexts whose driver signals (DriverFg) are on (DriverPacing=1: from the arming of the signals to the end of their disarming):
+// xefgCudaDriverMultipliesReflexCap answers 1 while there is one.
 inline std::atomic<int> g_driverSignals { 0 };
 
 using namespace xefgio;
@@ -475,9 +480,15 @@ public:
     bool flipMetering = true;                   // FlipMetering=0 in f5low.ini: no NVIDIA driver flip metering (Meter)
     bool oobQueue = false;                      // OobQueue=1 in f5low.ini: tell NVIDIA's driver our queues run out of band (OobNotify)
     bool oobSwitch = false;                     // OobQueue=switch: present type for the app's frame, render type for a generated one (RealPresent)
-    bool flipBurst = false;                     // FlipBurst=1 (or DriverPacing=1) in f5low.ini, Gate=0: a metered batch's presents after the first are released at once (PresentReal)
-    bool driverFg = false;                      // DriverFg=1 (or DriverPacing=1) in f5low.ini: the whole set of driver signals (DriverFgFrame, RealPresent)
+    bool flipBurst = false;                     // FlipBurst=1 (or DriverPacing=1 or 2) in f5low.ini, Gate=0: the chain made for the burst; a metered batch's presents after the first are released at once while pacingActive (PresentReal)
+    bool driverFg = false;                      // DriverFg=1 (or DriverPacing=1 or 2) in f5low.ini: the whole set of driver signals (DriverFgFrame, RealPresent)
     uint32_t driverFgParts = 15;                // DriverFgParts= (low-level, sum): 1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices
+    uint32_t pacingMode = 0;                    // DriverPacing= in f5low.ini after the host handshake, the GPU vendor and Gate (oob_driver.h ResolveDriver): 0 off, 1 automatic (PacingFrame, the default behind a host that routes the markers), 2 always on
+    bool pacingAuto = false;                    // pacingMode 1: pacingActive starts false and the presenter switches it
+    double pacingFlipSec = 0;                   // PacingFlipSec= (test only): force the requested state to flip every this many seconds
+    // The driver signals (present markers, Reflex Sync), the out of band markers and the burst run only while this is true. Always true
+    // except with DriverPacing=1 (automatic), where PacingStep sets it (presenter thread) and the application's thread and RealPresent read it.
+    std::atomic<bool> pacingActive { true };
     uint32_t appJobs = 2;                       // AppJobs= in f5low.ini (low-level): frames that may wait for the presenter before the game's Present blocks
     bool retireWait = true;                     // RetireWait=0 in f5low.ini (low-level): the game's Present does not wait for the frame before last on the GPU
     bool oobMarkers = false;                    // OobMarkers=1 in f5low.ini: out of band present markers around our Presents (RealPresent)
@@ -953,8 +964,10 @@ public:
         if (realFlag)
         {
             // The application waits on ours (released as the presenter takes each frame, when it asked for the object); we wait on the
-            // real one before each present so the real swap chain's queue stays short. Two queued presents (Gate=1: kGateLatency); with
-            // the burst Meter raises it to kGateLatency while a batch is metered.
+            // real one before each present so the real swap chain's queue stays short. Two queued presents (Gate=1: kGateLatency). The
+            // limit stays there: a chain whose limit went 2 -> 16 -> 2 kept the 14 extra tokens (host probe), and with them its queue. The
+            // burst takes its tokens without blocking and pays back the ones it lacked (tokenDebt, PresentReal).
+            tokenDebt.Forgive();
             if (gameWaits)
                 latencySem = CreateSemaphoreW(nullptr, static_cast<LONG>(latency), 16, nullptr);
             realLatency = pq ? kGateLatency : 2;
@@ -1884,7 +1897,29 @@ private:
         statGpuWait += gpuWaitMs;
         const long long tw0 = Now();
         if (realWait)
-            WaitForSingleObject(realWait, 100);
+        {
+            if (!BurstCapable())
+                WaitForSingleObject(realWait, 100);
+            else if (burst)
+            {
+                // Without blocking: a burst present takes a token when there is one, else owes it, and takes spare ones while it owes.
+                if (WaitForSingleObject(realWait, 0) != WAIT_OBJECT_0)
+                    tokenDebt.Missed();
+                while (tokenDebt.Owes() && tokenDebt.Repay(WaitForSingleObject(realWait, 0) == WAIT_OBJECT_0))
+                {
+                }
+            }
+            else
+            {
+                // Outside a burst: one extra blocking wait pays back one owed token (a timeout: nothing is in flight, everything is
+                // forgiven and the present's own wait is skipped: at most 100 ms), then the present's own wait.
+                bool ownWait = true;
+                if (tokenDebt.Owes())
+                    ownWait = tokenDebt.PaidBack(WaitForSingleObject(realWait, 100) == WAIT_OBJECT_0);     // a timeout skips the own wait
+                if (ownWait && WaitForSingleObject(realWait, 100) != WAIT_OBJECT_0)
+                    tokenDebt.Missed();
+            }
+        }
         const long long tw1 = Now();
         if (k == 1 && n > 0)
         {
@@ -2088,6 +2123,11 @@ private:
         statBehind += static_cast<double>(submitted.load() - j.frame - 1);
         statArriveToPick += static_cast<double>(pickT - j.arrive) * 1000.0 / freq();
         statArriveToReady += static_cast<double>(ready - j.arrive) * 1000.0 / freq();
+        // The GPU's share of the app interval (DriverPacing=1): how long after the game's Present call its GPU work finished, over the
+        // app's interval (ri.ms, the smoothed ready-to-ready time), smoothed by 1/8.
+        if (const double share = oobdriver::LoadShare(static_cast<double>(ready - j.arrive) * 1000.0 / freq(), ri.ms); share >= 0.0)
+            loadEma = loadSamples++ ? loadEma + (share - loadEma) / 8.0 : share;
+        PacingFrame(j);
         ++statJobs;
         catchUp = appFence->GetCompletedValue() >= j.frame + 2;
         statLate += catchUp;
@@ -2229,7 +2269,9 @@ private:
     bool Metered(const Job& j) const { return meteredFrame.load(std::memory_order_acquire) == j.frame + 1; }
     // The burst needs the swap chain we made for it (8 buffers, the waitable object) and our own present queue; a swap chain the game made
     // and presents on its own queue (InitFromSwapChain) keeps its pacing.
-    bool Burst() const { return flipBurst && ourChain && !pq && queue != appQueue; }
+    bool BurstCapable() const { return flipBurst && ourChain && !pq && queue != appQueue; }
+    // The burst runs now: capable, and the pacing is active (always, except with DriverPacing=1 while the GPU is not the limit).
+    bool Burst() const { return BurstCapable() && pacingActive.load(std::memory_order_acquire); }
     // How early a metered frame after a batch's first is released. Auto: 2500 us at 180 out (5.56 ms spacing, 0.45 of it), less
     // as the spacing shrinks - a lead longer than the spacing queued the frames at 540+ out (harness fast6x). A set value wins.
     static constexpr double kFlipLeadShare = 0.45;
@@ -2309,12 +2351,13 @@ private:
                 why = "no NvAPI_D3D12_SetFlipConfig: driver before 570, or OptiScaler's [NvApi] DisableFlipMetering=true";
         if (flipFn)
         {
-            if (Burst())
-                XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released at once (burst)");
+            if (BurstCapable())
+                XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released at once (burst%s)",
+                     pacingAuto ? ", while the pacing is active" : "");
             else
                 XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released %s%u us early",
                      flipLeadAuto ? "up to " : "", flipLeadUs);
-            if (flipBurst && !Burst())
+            if (flipBurst && !BurstCapable())
                 XLog("burst: off for this swap chain (it is not the one we made, or presents on the game's queue)");
         }
         else
@@ -2415,7 +2458,8 @@ private:
                 OobNotify();
             OobSwitchType(q, generated);
         }
-        const bool wantMark = (driverFg ? (driverFgParts & 4) && driverFgReady.load(std::memory_order_acquire) : asyncMarkerFn != nullptr) &&
+        const bool wantMark = (driverFg ? (driverFgParts & 4) && driverFgReady.load(std::memory_order_acquire) && pacingActive.load(std::memory_order_acquire)
+                                        : asyncMarkerFn != nullptr) &&
                               q != appQueue;
         const bool mark = wantMark && oobdriver::MarkFrame(j.presentId);
         if (wantMark && !mark)
@@ -2438,8 +2482,9 @@ private:
             XLog("out of band: no frame id from the caller for a Present - its markers are skipped (Reflex Sync is still sent)");
     }
 
-    // DriverFg=1, once, on the application's thread at its first Present: a second queue of ours, the queue notices, the marker and
-    // Reflex Sync entry points.
+    // Once: a second queue of ours, the queue notices, the marker and Reflex Sync entry points. DriverPacing=2 and DriverFg=1: on the
+    // application's thread at its first Present. DriverPacing=1: on the presenter thread, when the first arming wants the signals (the
+    // notices stay as sent from then on, whether the set is armed or not).
     void DriverFgInit()
     {
         driverFgTried = true;
@@ -2477,10 +2522,13 @@ private:
     }
 
     // At the application's Present: the in-band present markers on the second queue, then Reflex Sync. Reflex Sync is sent whatever the
-    // frame id is; the count the cap export reads is raised only once the driver took one (status 0), and lowered by DriverFgStop.
+    // frame id is. The count the cap export reads (g_driverSignals) goes up BEFORE the first Reflex Sync with N goes out, so the frame cap
+    // OptiScaler hands Reflex is undivided by the time the driver multiplies it (the first capped frame is faster, not slower); if that
+    // send is refused the count comes down again (balanced). DriverPacing=1 raises it earlier, at arming (PacingStep). After kPacingRefusalsMax
+    // refusals in a row the count is no longer raised ahead of the send (it is raised after a send the driver took, as before).
     void DriverFgFrame(const Job& j)
     {
-        if (driverFgStopped.load(std::memory_order_acquire))
+        if (driverFgStopped.load(std::memory_order_acquire) || !pacingActive.load(std::memory_order_acquire))
             return;
         if (!driverFgTried)
         {
@@ -2505,13 +2553,19 @@ private:
         if (!(driverFgParts & 1))
             return;
         std::lock_guard<std::mutex> sendLock(driverFgMu);
-        if (driverFgStopped.load(std::memory_order_acquire))
-            return;                         // Retire has reset the multiplier: nothing follows it
+        if (driverFgStopped.load(std::memory_order_acquire) || !pacingActive.load(std::memory_order_acquire))
+            return;                         // Retire has reset the multiplier, or the pacing went off (PacingStep sent 1): nothing follows
+        const bool raiseFirst = !pacingAuto && !driverFgCounted.load(std::memory_order_acquire) &&
+                                driverFgRefusals.load(std::memory_order_relaxed) < oobdriver::kPacingRefusalsMax;
+        if (raiseFirst)
+        {
+            driverFgCounted.store(true, std::memory_order_release);
+            g_driverSignals.fetch_add(1);
+        }
         oobdriver::ReflexSync s {};
         s.version = oobdriver::kReflexSyncVer;
         s.fgMultiplier = static_cast<uint8_t>(driverFgFrames);
         const int st = reflexSyncFn(dev, &s);
-        driverFgLastMult = driverFgFrames;
         if ((st != driverFgSyncStatus || driverFgFrames != driverFgSyncMult) && driverFgSyncLogs < 100)
         {
             ++driverFgSyncLogs;
@@ -2521,10 +2575,164 @@ private:
         }
         if (st == 0)
         {
+            driverFgLastMult = driverFgFrames;
             driverFgSynced = true;
-            if (!driverFgCounted.exchange(true))
+            driverFgRefusals.store(0, std::memory_order_relaxed);
+            if (!pacingAuto && !driverFgCounted.exchange(true))     // automatic pacing raises it ahead of the signals (PacingStep)
                 g_driverSignals.fetch_add(1);
         }
+        else
+        {
+            driverFgRefusals.fetch_add(1, std::memory_order_relaxed);
+            driverFgRefusedStatus.store(st, std::memory_order_relaxed);
+            if (raiseFirst)
+            {
+                driverFgCounted.store(false, std::memory_order_release);    // balanced: the driver did not take the multiplier
+                g_driverSignals.fetch_sub(1);
+            }
+        }
+    }
+
+    // ---- DriverPacing=1: the signals and the burst while the GPU is the limit ----------------------------------------
+    // Once per app frame, on the presenter thread (Pick). load: the GPU's share of the app interval (loadEma). The rule (oob_driver.h
+    // PacingRule) says whether the set should run; the machine (PacingMachine) orders the switch so a game frame never waits longer than it
+    // should, and PacingStep carries out its actions: raise the cap export, signals on or off, Reflex Sync 1, lower the export.
+    //   off -> on: the cap export (xefgCudaDriverMultipliesReflexCap) goes up first. OptiScaler then gives Reflex the shown-frame cap
+    //     undivided (the driver will multiply it by the frame count) - for kPacingSettleFrames app frames nothing is sent to the driver,
+    //     so they run faster than the cap, not slower. Then the markers, the burst and Reflex Sync with the real multiplier start.
+    //   on -> off: Reflex Sync with multiplier 1, the markers and the burst stop at once; the export goes down kPacingSettleFrames later
+    //     and only once the driver took the 1 (a refused 1 is repeated each frame, for 120 refusals at most).
+    // OptiScaler reads the export every game frame (measured in NBA 2K27: the Reflex interval changed in the frame of each change).
+    const char* PacingText() const
+    {
+        if (!driverFg && !flipBurst)
+            return "off";
+        if (!pacingAuto)
+            return pacingMode == 2 ? "on (always)" : "on (set by the low-level keys)";
+        static const char* const t[] = { "off", "arming", "on", "disarming" };
+        return t[static_cast<int>(pacingMachine.state)];
+    }
+    void PacingFrame(const Job& j)
+    {
+        if (!pacingAuto || driverFgStopped.load(std::memory_order_acquire))
+            return;
+        ++pacingFrames;
+        if (!pacingBroken && driverFgRefusals.load(std::memory_order_relaxed) >= oobdriver::kPacingRefusalsMax)
+        {
+            pacingBroken = true;        // the normal disarm follows (the rule is told it is not eligible)
+            XLog("pacing: the driver refused Reflex Sync %u times in a row (nvapi status %d) - automatic pacing is off for this session", oobdriver::kPacingRefusalsMax,
+                 driverFgRefusedStatus.load(std::memory_order_relaxed));
+        }
+        const double nowMs = static_cast<double>(Now()) * 1000.0 / freq();
+        // Hard causes act at once; transient ones (a history reset, the metering refilling, a one-batch dropout) must last about 1 s.
+        const bool hard = pacingBroken || !BurstCapable() || !flipMetering || (flipTried && !flipFn) || flipRefused || DisplayPaced(j) || !j.usable;
+        const bool transient = !flipTried || !flipMeteredNow || lastNGen == ~0u || lastNGen == 0;
+        const oobdriver::Eligibility kind = hard ? oobdriver::Eligibility::kHard : transient ? oobdriver::Eligibility::kTransient : oobdriver::Eligibility::kEligible;
+        bool want;
+        if (pacingFlipSec > 0)
+        {
+            // Test only: the requested state flips every pacingFlipSec seconds whatever the load; the rule does not run.
+            if (pacingFlipAt < 0)
+                pacingFlipAt = nowMs;
+            if (nowMs - pacingFlipAt >= pacingFlipSec * 1000.0)
+            {
+                pacingFlipWant = !pacingFlipWant;
+                pacingFlipAt = nowMs;
+            }
+            want = kind != oobdriver::Eligibility::kHard && pacingFlipWant;
+        }
+        else
+            want = pacingRule.Update(loadEma, nowMs, kind);
+        PacingStep(want, j.frame);
+    }
+    void PacingStep(bool want, UINT64 frame)
+    {
+        if (pacingMachine.state == oobdriver::PacingState::kOff && want)
+        {
+            if (!driverFgTried)
+            {
+                if (!built.load(std::memory_order_acquire))
+                    return;                 // SystemNvapi needs the built generator: try again next frame
+                DriverFgInit();
+            }
+            if (!driverFgReady.load(std::memory_order_acquire) || !(driverFgParts & 1))
+            {
+                pacingBroken = true;
+                XLog("pacing: the driver signals are not available - automatic pacing stays off");
+                return;
+            }
+        }
+        const oobdriver::PacingState before = pacingMachine.state;
+        const oobdriver::PacingActions a = pacingMachine.Step(want, pacingFrames);
+        const unsigned long long fr = static_cast<unsigned long long>(frame);
+        if (a.raiseExport)
+        {
+            RaiseExport();
+            XLog("pacing: arming at frame %llu (GPU load %.2f): cap export raised, the signals follow in %llu app frames", fr, loadEma,
+                 static_cast<unsigned long long>(oobdriver::kPacingSettleFrames));
+        }
+        if (a.signalsOff)
+        {
+            pacingActive.store(false, std::memory_order_release);
+            XLog("pacing: off at frame %llu (GPU load %.2f): markers and burst stopped, Reflex Sync multiplier 1, cap export follows after %llu app frames and the driver taking the 1",
+                 fr, loadEma, static_cast<unsigned long long>(oobdriver::kPacingSettleFrames));
+        }
+        if (a.sendOne)
+            pacingMachine.SendResult(SendMultiplierOne());
+        if (a.signalsOn)
+        {
+            pacingActive.store(true, std::memory_order_release);
+            XLog(before == oobdriver::PacingState::kArming ? "pacing: on at frame %llu (GPU load %.2f): markers, burst and Reflex Sync with the frame multiplier"
+                                                          : "pacing: on again at frame %llu (GPU load %.2f)", fr, loadEma);
+        }
+        if (a.lowerExport)
+        {
+            LowerExport();
+            if (a.gaveUp)
+                XLog("pacing: the driver refused Reflex Sync multiplier 1 %llu times - cap export lowered anyway at frame %llu; the driver may still multiply the cap by %u until the game's next Reflex change",
+                     static_cast<unsigned long long>(oobdriver::kPacingGiveUpRefusals), fr, driverFgLastMult);
+            else if (before == oobdriver::PacingState::kArming)
+                XLog("pacing: arming cancelled at frame %llu (GPU load %.2f): cap export lowered", fr, loadEma);
+            else
+                XLog("pacing: cap export lowered at frame %llu (GPU load %.2f)", fr, loadEma);
+        }
+    }
+    // Under driverFgMu, as the sends: the count the cap export reads goes up (once) - not after the context stopped.
+    void RaiseExport()
+    {
+        std::lock_guard<std::mutex> l(driverFgMu);
+        if (!driverFgStopped.load(std::memory_order_acquire) && !driverFgCounted.exchange(true))
+            g_driverSignals.fetch_add(1);
+    }
+    // Under driverFgMu, as the sends: the count the cap export reads goes down (once).
+    void LowerExport()
+    {
+        std::lock_guard<std::mutex> l(driverFgMu);
+        if (driverFgCounted.exchange(false))
+            g_driverSignals.fetch_sub(1);
+    }
+    // Reflex Sync with multiplier 1 for the driver, if a larger one was sent. pacingActive is already false, so DriverFgFrame sends nothing
+    // after it (it reads the flag under the same mutex). True when the driver took it or there was nothing to send; a refused call keeps the
+    // old driverFgLastMult (the driver still holds that multiplier) and the caller sends it again.
+    bool SendMultiplierOne()
+    {
+        std::lock_guard<std::mutex> l(driverFgMu);
+        if (driverFgStopped.load(std::memory_order_acquire) || !driverFgSynced || !reflexSyncFn || !dev || driverFgLastMult == 1)
+            return true;
+        oobdriver::ReflexSync s {};
+        s.version = oobdriver::kReflexSyncVer;
+        s.fgMultiplier = 1;
+        const int st = reflexSyncFn(dev, &s);
+        if (st == 0)
+        {
+            driverFgLastMult = 1;
+            oneRefusals = 0;
+            XLog("driver signals: Reflex Sync multiplier back to 1 -> nvapi status 0");
+            return true;
+        }
+        if (++oneRefusals == 1 || oneRefusals % 30 == 0)
+            XLog("driver signals: Reflex Sync multiplier 1 refused (nvapi status %d), %u times so far - sent again next frame", st, oneRefusals);
+        return false;
     }
 
     // Once (under driverFgMu, with the sends): the cap export stops counting this context. With sendReset (Retire, the device is alive) also back to multiplier 1 for the
@@ -2560,20 +2768,6 @@ private:
         if (!flipFn)
             return;
         MeterBatch(j, n);
-        // The burst queues a batch's presents; the real swap chain takes that many only while the driver meters them.
-        if (Burst())
-            RealLatency(flipMeteredNow ? kGateLatency : 2);
-    }
-    // Real swap chain's maximum frame latency, logged on each change (the first 100).
-    void RealLatency(UINT want)
-    {
-        if (!realWait || !real || want == realLatency)
-            return;
-        const HRESULT hr = real->SetMaximumFrameLatency(want);
-        if (latLogs++ < 100)
-            XLog("swap chain: the real swap chain's maximum frame latency %u -> %u (0x%08x)", realLatency, want, static_cast<unsigned>(hr));
-        if (SUCCEEDED(hr))
-            realLatency = want;
     }
     void MeterBatch(const Job& j, uint32_t n)
     {
@@ -3779,6 +3973,8 @@ private:
              "frame %.1f ms after its target; from the app's Present call: taken %.1f ms, ready stamp %.1f ms (avg of 120)",
              statJobs ? statStampAge / statJobs : 0.0, statJobs ? statBehind / statJobs : 0.0, statFirstN ? statFirstLate / statFirstN : 0.0,
              statJobs ? statArriveToPick / statJobs : 0.0, statJobs ? statArriveToReady / statJobs : 0.0);
+        if (loadSamples)
+            XLog("stats: GPU load %.2f of the app interval, pacing %s, token debt %u", loadEma, PacingText(), tokenDebt.owed);
         std::lock_guard<std::mutex> clk(clkMu);
         if (statRels)
         {
@@ -3990,6 +4186,7 @@ private:
         if (realWait)
             CloseHandle(realWait);
         realWait = nullptr;
+        tokenDebt.Forgive();
     }
 
     // Waits until our queue has finished everything (and the CUDA worker everything posted).
@@ -4661,7 +4858,8 @@ private:
     // release thread too.
     SetFlipConfigFn flipFn = nullptr;
     bool flipTried = false, flipRefused = false, flipMeteredNow = false;
-    UINT realLatency = 2, latLogs = 0;      // the real swap chain's maximum frame latency (presenter thread), and log lines about it
+    UINT realLatency = 2;                   // the real swap chain's maximum frame latency (set once, with the chain)
+    oobdriver::TokenDebt tokenDebt;         // presenter thread: burst presents that took no frame latency token (PresentReal)
     uint32_t flipOutputs = 0, flipSamples = 0, flipFails = 0, flipFeedback = 0, flipLogs = 0;
     int flipStatus = 0;
     double flipBatchMs = 0;
@@ -4688,12 +4886,24 @@ private:
     ReflexSyncFn reflexSyncFn = nullptr;    // DriverFg=1, set before driverFgReady
     ID3D12CommandQueue* driverFgQueue = nullptr;
     std::atomic<bool> driverFgReady { false };
-    std::atomic<bool> driverFgCounted { false };    // raised g_driverSignals (a Reflex Sync returned 0); lowered by DriverFgStop
+    std::atomic<bool> driverFgCounted { false };    // this context raised g_driverSignals (before the first Reflex Sync with N, or at arming); lowered by LowerExport or DriverFgStop
     std::atomic<bool> driverFgStopped { false };
     bool driverFgSynced = false;
     int driverFgSyncStatus = INT_MIN;       // sentinels: the first outcome is logged
     uint32_t driverFgSyncMult = 0, driverFgSyncLogs = 0;
-    bool driverFgTried = false;             // the application's Present thread
+    std::atomic<bool> driverFgTried { false };      // the application's Present thread (DriverPacing=2), the presenter (DriverPacing=1)
+    // DriverPacing=1 (presenter thread): the rule, the state of the switch, the load it works on.
+    oobdriver::PacingRule pacingRule;
+    oobdriver::PacingMachine pacingMachine;
+    uint64_t pacingFrames = 0;
+    std::atomic<uint32_t> driverFgRefusals { 0 };   // consecutive refused Reflex Syncs (the application's thread writes, PacingFrame reads)
+    std::atomic<int> driverFgRefusedStatus { 0 };
+    uint32_t oneRefusals = 0;               // refused Reflex Sync 1 calls in a row (SendMultiplierOne, under driverFgMu)
+    bool pacingBroken = false;              // the driver signals could not start: the automatic pacing stays off
+    double pacingFlipAt = -1;
+    bool pacingFlipWant = false;
+    double loadEma = 0;
+    unsigned loadSamples = 0;
     uint32_t driverFgFrames = 1;            // under mu, read after it on the same thread
     int oobSwitchType = -1;
     int oobSwitchFailed = 0;
