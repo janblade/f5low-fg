@@ -98,6 +98,25 @@ int main()
         e2.Update(0.9, 5100, true);
         Check(!e2.Update(0.9, 6000, true) && e2.Update(0.9, 7100, true), "the hold starts when it becomes eligible, and is not counted a change while off");
     }
+    // TokenDebt: misses add, a taken token repays one, never negative, a timeout forgives.
+    {
+        TokenDebt d;
+        Check(!d.Owes() && !d.Repay(true), "no debt: a token repays nothing");
+        d.Missed();
+        d.Missed();
+        d.Missed();
+        Check(d.owed == 3 && d.Owes(), "three presents without a token owe three");
+        Check(!d.Repay(false) && d.owed == 3, "no token came: still owed");
+        Check(d.Repay(true) && d.owed == 2, "a token repays one");
+        while (d.Owes() && d.Repay(true))
+        {
+        }
+        Check(d.owed == 0 && !d.Repay(true) && d.owed == 0, "paid back, and never below zero");
+        d.Missed();
+        d.Missed();
+        d.Forgive();
+        Check(d.owed == 0 && !d.Owes(), "a timeout forgives it all");
+    }
     Check(kIdSetReflexSync == 0xB9F6FAFFu && kIdSetFlipConfig == 0xF3148C42u, "nvapi ids are the public ones");
     if (failures == 0)
         std::printf("oob_driver_test PASS\n");

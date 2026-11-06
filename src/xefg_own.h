@@ -926,8 +926,10 @@ public:
         if (realFlag)
         {
             // The application waits on ours (released as the presenter takes each frame, when it asked for the object); we wait on the
-            // real one before each present so the real swap chain's queue stays short. Two queued presents (Gate=1: kGateLatency); with
-            // the burst Meter raises it to kGateLatency while a batch is metered.
+            // real one before each present so the real swap chain's queue stays short. Two queued presents (Gate=1: kGateLatency). The
+            // limit stays there: a chain whose limit went 2 -> 16 -> 2 kept the 14 extra tokens (host probe), and with them its queue. The
+            // burst takes its tokens without blocking and pays back the ones it lacked (tokenDebt, PresentReal).
+            tokenDebt.Forgive();
             if (gameWaits)
                 latencySem = CreateSemaphoreW(nullptr, static_cast<LONG>(latency), 16, nullptr);
             realLatency = pq ? kGateLatency : 2;
@@ -1857,7 +1859,33 @@ private:
         statGpuWait += gpuWaitMs;
         const long long tw0 = Now();
         if (realWait)
-            WaitForSingleObject(realWait, 100);
+        {
+            if (!BurstCapable())
+                WaitForSingleObject(realWait, 100);
+            else if (burst)
+            {
+                // Without blocking: a burst present takes a token when there is one, else owes it, and takes spare ones while it owes.
+                if (WaitForSingleObject(realWait, 0) != WAIT_OBJECT_0)
+                    tokenDebt.Missed();
+                while (tokenDebt.Owes() && tokenDebt.Repay(WaitForSingleObject(realWait, 0) == WAIT_OBJECT_0))
+                {
+                }
+            }
+            else
+            {
+                // Outside a burst: one extra blocking wait pays back one owed token (a timeout: nothing is in flight, forgiven), then
+                // the present's own wait.
+                if (tokenDebt.Owes())
+                {
+                    if (WaitForSingleObject(realWait, 100) == WAIT_OBJECT_0)
+                        tokenDebt.Repay(true);
+                    else
+                        tokenDebt.Forgive();
+                }
+                if (WaitForSingleObject(realWait, 100) != WAIT_OBJECT_0)
+                    tokenDebt.Missed();
+            }
+        }
         const long long tw1 = Now();
         if (k == 1 && n > 0)
         {
@@ -2682,20 +2710,6 @@ private:
         if (!flipFn)
             return;
         MeterBatch(j, n);
-        // The burst queues a batch's presents; the real swap chain takes that many only while the burst runs and the driver meters them.
-        if (BurstCapable())
-            RealLatency(Burst() && flipMeteredNow ? kGateLatency : 2);
-    }
-    // Real swap chain's maximum frame latency, logged on each change (the first 100).
-    void RealLatency(UINT want)
-    {
-        if (!realWait || !real || want == realLatency)
-            return;
-        const HRESULT hr = real->SetMaximumFrameLatency(want);
-        if (latLogs++ < 100)
-            XLog("swap chain: the real swap chain's maximum frame latency %u -> %u (0x%08x)", realLatency, want, static_cast<unsigned>(hr));
-        if (SUCCEEDED(hr))
-            realLatency = want;
     }
     void MeterBatch(const Job& j, uint32_t n)
     {
@@ -3902,7 +3916,7 @@ private:
              statJobs ? statStampAge / statJobs : 0.0, statJobs ? statBehind / statJobs : 0.0, statFirstN ? statFirstLate / statFirstN : 0.0,
              statJobs ? statArriveToPick / statJobs : 0.0, statJobs ? statArriveToReady / statJobs : 0.0);
         if (loadSamples)
-            XLog("stats: GPU load %.2f of the app interval, pacing %s", loadEma, PacingText());
+            XLog("stats: GPU load %.2f of the app interval, pacing %s, token debt %u", loadEma, PacingText(), tokenDebt.owed);
         std::lock_guard<std::mutex> clk(clkMu);
         if (statRels)
         {
@@ -4114,6 +4128,7 @@ private:
         if (realWait)
             CloseHandle(realWait);
         realWait = nullptr;
+        tokenDebt.Forgive();
     }
 
     // Waits until our queue has finished everything (and the CUDA worker everything posted).
@@ -4785,7 +4800,8 @@ private:
     // release thread too.
     SetFlipConfigFn flipFn = nullptr;
     bool flipTried = false, flipRefused = false, flipMeteredNow = false;
-    UINT realLatency = 2, latLogs = 0;      // the real swap chain's maximum frame latency (presenter thread), and log lines about it
+    UINT realLatency = 2;                   // the real swap chain's maximum frame latency (set once, with the chain)
+    oobdriver::TokenDebt tokenDebt;         // presenter thread: burst presents that took no frame latency token (PresentReal)
     uint32_t flipOutputs = 0, flipSamples = 0, flipFails = 0, flipFeedback = 0, flipLogs = 0;
     int flipStatus = 0;
     double flipBatchMs = 0;

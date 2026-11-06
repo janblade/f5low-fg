@@ -136,6 +136,28 @@ struct PacingRule
     }
 };
 
+// The real swap chain's frame latency tokens (the waitable object, limit 2 at all times) under the burst. A burst present takes its token
+// without blocking; when none is there it goes out anyway and its retirement still releases one, a token the chain would hand out on top
+// of the limit. TokenDebt counts those presents and pays them back: a burst present takes a spare token without blocking while it owes,
+// a present outside a burst waits for one (one extra blocking wait, the caller gives up and Forgive()s on a timeout: nothing is in flight
+// to wait for). Probed on a host swap chain (flag, limit 2): without it the surplus grew to 21 tokens over three bursts, with it 2.
+// Presenter thread only. Not negative, ever.
+struct TokenDebt
+{
+    uint32_t owed = 0;
+    void Missed() { ++owed; }                       // a present went out without a token (wait(0) failed, or a blocking wait timed out)
+    bool Owes() const { return owed > 0; }
+    // A token was taken while owing (tookToken: the wait succeeded): one less owed. False when nothing was owed or no token came.
+    bool Repay(bool tookToken)
+    {
+        if (!tookToken || owed == 0)
+            return false;
+        --owed;
+        return true;
+    }
+    void Forgive() { owed = 0; }                    // a timeout while paying back, or the chain's handle is new or gone
+};
+
 // The settings after Gate, DriverPacing and the low-level keys are resolved (xefg_cuda.cpp). Gate=1 paces on the GPU through a present
 // lane of its own, so it vetoes both the burst and DriverPacing. DriverPacing=1 or 2 sets the driver signals (all four parts) and the
 // burst; with 1 they run only while PacingRule says so (pacingAuto), with 2 always.
