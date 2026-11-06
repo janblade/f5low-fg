@@ -64,6 +64,13 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_pace_lead_test.ps1 -VsPath $vs
 
+      # The begin / end pairing of the timer raise (src/timer_raise.h): no GPU
+      - name: Timer raise test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_timer_raise_test.ps1 -VsPath $vs
+
       # The schedule pieces shared by the own generator and the intel sink (src/pace_sched.h): no GPU
       - name: Pace schedule test
         shell: pwsh

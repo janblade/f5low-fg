@@ -54,6 +54,7 @@
 #include "pace_lead.h"
 #include "oob_driver.h"
 #include "pace_sched.h"
+#include "timer_raise.h"
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
 #include "xefg_formats.h"
@@ -276,6 +277,8 @@ public:
     xefg_swapchain_frame_constant_data_t constants {};
     uint32_t initFlags = 0, maxInterp = 1, numInterp = 1;
     bool enabled = false;
+    std::mutex timerMu;                     // SetTimerRaised
+    timerraise::Hold timerHold;             // under timerMu
     std::atomic<bool> uiComposition { false };  // SetUiCompositionState (from any of the application's threads)
     float sceneThreshold = 0.7f;        // SetSceneChangeThreshold; Intel's default
     xefg_swapchain_d3d12_init_params_t initParams {};
@@ -556,12 +559,44 @@ public:
 
     bool D3d() const { return pg->InCommandLists(); }
 
+    // A 1 ms system timer while generating (timer_raise.h): a game that never raises it has every Sleep(1) in the process
+    // round up to the 15.6 ms tick, and generated frames are lost with it (NBA 2K27 with the timer forced back: 3.5 shown per rendered at 4x, 4.0 raised). DLSS-G does the same.
+    // Called without mu: the first call in a process measures, up to some 50 ms.
+    void SetTimerRaised(bool on)
+    {
+        using TimerFn = UINT(WINAPI*)(UINT);
+        // Once for the process; winmm stays loaded. By name: a winmm.dll proxy forwards these two.
+        static const HMODULE winmm = LoadLibraryW(L"winmm.dll");
+        static const TimerFn begin = winmm ? reinterpret_cast<TimerFn>(GetProcAddress(winmm, "timeBeginPeriod")) : nullptr;
+        static const TimerFn end = winmm ? reinterpret_cast<TimerFn>(GetProcAddress(winmm, "timeEndPeriod")) : nullptr;
+        static const auto sleep1 = [] {
+            const long long t0 = Now();
+            Sleep(1);
+            return static_cast<double>(Now() - t0) * 1000.0 / freq();
+        };
+        static std::atomic<bool> measured { false };
+        if (!begin || !end)
+        {
+            if (on && !measured.exchange(true))
+                XLog("timer: no timeBeginPeriod in winmm.dll - the system timer stays as it is");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(timerMu);
+        const bool first = on && !measured.exchange(true);
+        const double before = first ? (std::max)(sleep1(), sleep1()) : 0.0;
+        timerHold.Set(on, [&] { return begin(1) == 0; }, [&] { end(1); });
+        if (first)
+            XLog("timer: Sleep(1) took %.1f ms before the raise, %.1f ms with it (%s)", before, sleep1(),
+                 timerHold.Held() ? "1 ms requested" : "request refused");
+    }
+
     ~Own()
     {
         XLog("context freed");  // Destroy plus the app's last Release of its swap chain: nothing of it is left
         DriverFgStop(false);
         if (driverFgQueue)
             driverFgQueue->Release();
+        SetTimerRaised(false);
         StopDeferred();
         StopPresenter();
         generator->Stop();
