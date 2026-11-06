@@ -122,7 +122,7 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 ## Per backend, when it is built (stories A2-A4)
 
-- **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=1` in f5low.ini (`XEFG_CUDA_DRIVERPACING`), **default 0**, ignored with `Gate=1`, NVIDIA GPUs
+- **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off (**default**), `1` automatic, `2` always on; ignored with `Gate=1`, NVIDIA GPUs
   only, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
   turns on the driver signals (NvAPI_D3D_SetReflexSync with the frame generation multiplier, in-band present markers on a second queue, out of
   band markers and queue notices) and the burst: while the driver flip-meters a batch, the presents after the batch's first are released
@@ -131,6 +131,16 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   still work with `DriverPacing=0`: `DriverFg=1`, `DriverFgParts=` (1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue
   notices), `FlipBurst=1`, `OobQueue=`, `OobMarkers=1`, `AppJobs=`, `RetireWait=`, `FlipMetering=`, `FlipLeadUs=` (not used while the burst
   is on).
+  `DriverPacing=2` runs the set always (while the batch is metered). `DriverPacing=1` runs it only while the GPU is the limit: the presenter
+  measures the GPU's share of the app interval (how long after the game's Present call its GPU work finished, over the app interval,
+  smoothed by 1/8; logged every 120 app frames as `GPU load`), turns the set on after the load has been 0.75 or more for 2 s and off after
+  0.55 or less for 2 s, at most once per 10 s; V-Sync, no generated frames, no flip metering or a swap chain the game made turn it off at
+  once. Measured in one game so far (NBA 2K27, PresentMon): at 4x with the GPU at its limit the set cuts sim-to-screen from about
+  95-110 ms to 37-55 ms; at 6x with a 120 fps cap (the GPU idle part of the time) it gains nothing and spaces the frames less evenly.
+  In mode 1 nothing is sent while it is off (a capped session behaves as `DriverPacing=0`), and a switch goes in an order where a
+  frame is never held longer than it should be: on - the cap export (`xefgCudaDriverMultipliesReflexCap`) goes up first, the signals
+  follow 30 app frames later; off - the signals and the burst stop and Reflex Sync gets multiplier 1 at once, the export goes down 30
+  app frames later. `PacingFlipSec=N` (`XEFG_CUDA_PACINGFLIPSEC`, test only) flips the requested state every N seconds whatever the load.
 - **intel** (built, `src/generators/intel.h`, `src/unlock/FamilyXeFG.h` + `UnlockXeFg.h`): Intel's libxess_fg makes the frames, our sink
   paces them. Present-sink shape, spaced mode. Any D3D12 GPU Intel's library runs on.
   - *Routing.* `Generator=intel` in `D3D12CreateContext` builds an `xintel::Ctx` (not `Own`). The handle is the library's own handle; every XeFG

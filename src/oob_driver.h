@@ -1,8 +1,8 @@
 // What the own generator tells NVIDIA's driver about its queues and presents (public nvapi.h: NvAPI_D3D12_NotifyOutOfBandCommandQueue,
 // NvAPI_D3D12_SetAsyncFrameMarker, NvAPI_D3D_SetReflexSync), so Reflex can tell the generator's work and flips from the game's frames.
-// Off by default; DriverPacing=1 in f5low.ini turns the set on (xefg_own.h, DriverFgInit, DriverFgFrame and RealPresent), the low-level keys
-// OobQueue, OobMarkers, DriverFg and DriverFgParts do it piece by piece. No Windows in here: tested on the host
-// (tests/oob_driver_test.cpp).
+// Off by default; DriverPacing=2 in f5low.ini turns the set on for good (xefg_own.h, DriverFgInit, DriverFgFrame and RealPresent),
+// DriverPacing=1 lets PacingRule below decide while the game runs, the low-level keys OobQueue, OobMarkers, DriverFg and DriverFgParts do
+// it piece by piece. No Windows in here: tested on the host (tests/oob_driver_test.cpp).
 #pragma once
 
 #include <cstdint>
@@ -76,8 +76,69 @@ inline bool MarkFrame(uint32_t frameId) { return frameId != 0; }
 // smoothed schedule. Holding it to the schedule was measured worse in one game.
 inline bool BurstNow(bool burstOn, uint32_t k, bool metered) { return burstOn && k > 1 && metered; }
 
+// When DriverPacing=1 pays (xefg_own.h, PacingFrame). Measured in one game (NBA 2K27) with PresentMon: with the GPU at its limit the signals
+// and the burst cut the game's sim-to-screen time by about half; with the GPU idle part of the time (a frame cap) they gain nothing and
+// space the frames less evenly. So they run only while the GPU is the limit.
+// load: the GPU's share of the app interval, smoothed: how long after the game's Present call its GPU work finished, over the app's
+// interval. It is above 1 when the game is waiting for the GPU, and the signals themselves bring it down (1.85 -> 0.84 at 4x in the game),
+// so the leave threshold sits well below the enter one. The rule holds each side for a while and each state for a dwell time.
+inline constexpr double kPacingEnterLoad = 0.75, kPacingLeaveLoad = 0.55;
+inline constexpr double kPacingHoldMs = 2000.0, kPacingDwellMs = 10000.0;
+struct PacingRule
+{
+    bool on = false;
+    double aboveMs = -1;                // when load rose to the enter threshold (and stayed there); -1: not above
+    double belowMs = -1;                // when load fell to the leave threshold; -1: not below
+    double lastChangeMs = -1e9;
+
+    // Returns the new state. eligible false (V-Sync or a display paced game, no frames generated, no flip metering for the batch or
+    // none to be had, a swap chain the game made) turns it off at once, and that counts as a change; while off nothing is held.
+    bool Update(double load, double nowMs, bool eligible)
+    {
+        if (!eligible)
+        {
+            if (on)
+            {
+                on = false;
+                lastChangeMs = nowMs;
+            }
+            aboveMs = belowMs = -1;
+            return on;
+        }
+        if (load >= kPacingEnterLoad)
+        {
+            belowMs = -1;
+            if (aboveMs < 0)
+                aboveMs = nowMs;
+        }
+        else if (load <= kPacingLeaveLoad)
+        {
+            aboveMs = -1;
+            if (belowMs < 0)
+                belowMs = nowMs;
+        }
+        else
+            aboveMs = belowMs = -1;     // between the thresholds: neither side is being held
+        const bool dwelled = nowMs - lastChangeMs >= kPacingDwellMs;
+        if (!on && aboveMs >= 0 && nowMs - aboveMs >= kPacingHoldMs && dwelled)
+        {
+            on = true;
+            lastChangeMs = nowMs;
+            aboveMs = belowMs = -1;
+        }
+        else if (on && belowMs >= 0 && nowMs - belowMs >= kPacingHoldMs && dwelled)
+        {
+            on = false;
+            lastChangeMs = nowMs;
+            aboveMs = belowMs = -1;
+        }
+        return on;
+    }
+};
+
 // The settings after Gate, DriverPacing and the low-level keys are resolved (xefg_cuda.cpp). Gate=1 paces on the GPU through a present
-// lane of its own, so it vetoes both the burst and DriverPacing. DriverPacing=1 sets the driver signals (all four parts) and the burst.
+// lane of its own, so it vetoes both the burst and DriverPacing. DriverPacing=1 or 2 sets the driver signals (all four parts) and the
+// burst; with 1 they run only while PacingRule says so (pacingAuto), with 2 always.
 struct DriverSettings
 {
     bool driverFg;
@@ -85,22 +146,24 @@ struct DriverSettings
     bool flipBurst;
     bool pacingIgnored;     // DriverPacing was asked for and Gate=1 vetoed it
     bool burstIgnored;      // FlipBurst was asked for and Gate=1 vetoed it
+    bool pacingAuto;        // DriverPacing=1: the signals and the burst start off and PacingRule switches them
 };
-inline DriverSettings ResolveDriver(bool gate, bool driverPacing, bool driverFg, uint32_t parts, bool flipBurst)
+inline DriverSettings ResolveDriver(bool gate, int driverPacing, bool driverFg, uint32_t parts, bool flipBurst)
 {
-    DriverSettings r { driverFg, parts, flipBurst, false, false };
+    DriverSettings r { driverFg, parts, flipBurst, false, false, false };
     if (gate)
     {
         r.burstIgnored = flipBurst;
         r.flipBurst = false;
-        r.pacingIgnored = driverPacing;
+        r.pacingIgnored = driverPacing != 0;
         return r;
     }
-    if (driverPacing)
+    if (driverPacing != 0)
     {
         r.driverFg = true;
         r.parts = 15;
-        r.flipBurst = true;
+        r.flipBurst = true;             // the 8-buffer chain and the metering stay for both modes
+        r.pacingAuto = driverPacing == 1;
     }
     return r;
 }
