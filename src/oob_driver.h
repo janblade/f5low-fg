@@ -307,7 +307,7 @@ struct TokenDebt
 //   absent: automatic (1) when the host says it routes these markers (hostRoutes, the export f5lowHostRoutesMarkers), else off: an
 //     OptiScaler without that routing takes the async frame markers for the game's own Reflex calls.
 //   0 off. 1 automatic, 2 always on: honoured as asked; on a host that did not say it routes the markers it is warned about (oldHostWarn).
-//   Not an NVIDIA GPU (nvidia false: the vendor id could not be read counts as not): the signals, the burst and the mode are all off,
+//   No NVIDIA compute device for the adapter (nvidia false; xefg_cuda.cpp passes have > 0, the CUDA device matched by LUID): the signals, the burst and the mode are all off,
 //     explicit 1 and 2 and the low-level keys included, so the chain is the plain one of today.
 //   Gate=1 paces on the GPU through a present lane of its own, so it vetoes both the burst and DriverPacing.
 // DriverPacing 1 or 2 sets the driver signals (all four parts) and the burst; with 1 they run only while PacingRule says so (pacingAuto),

@@ -80,7 +80,7 @@ int main()
             const DriverSettings g2 = ResolveDriver(true, 2, false, 15, false, host, true);
             Check(g2.mode == 0 && !g2.flipBurst && g2.pacingIgnored, "Gate=1 vetoes DriverPacing=2");
         }
-        // not an NVIDIA GPU (or the vendor could not be read): everything off, whatever was asked, the low-level keys included
+        // no NVIDIA compute device for the adapter: everything off, whatever was asked, the low-level keys included
         for (const int ask : { -1, 0, 1, 2 })
             for (const bool host : { true, false })
             {

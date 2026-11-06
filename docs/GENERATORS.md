@@ -126,10 +126,10 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
   before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say
   logs one warning and is honoured. The resolved mode and why are logged once per context (`DriverPacing resolved: ...`). Ignored with
-  `Gate=1`. NVIDIA GPUs only: the adapter's vendor id is read when the context is made (`GetAdapterLuid`, DXGI `EnumAdapterByLuid`), and
-  on any other GPU, or when it cannot be read, the signals, the burst and the mode are off whatever was set (explicit `1`, `2` and the
-  low-level keys included), so the swap chain is the plain one of before. Measured in one game so far (NBA 2K27); not run on a non-NVIDIA
-  GPU, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
+  `Gate=1`. NVIDIA GPUs only, and the own generator only runs on those: a GPU with no CUDA device behind the adapter (not NVIDIA, or older than
+  the kernels need) gets Intel's library from `D3D12CreateContext` on, so these settings never apply there. As a guard the context
+  also checks that CUDA device when it resolves them (`have > 0`) and, without one, the signals, the burst, the mode and the `OobQueue` and
+  `OobMarkers` keys are all off whatever was set. Measured in one game so far (NBA 2K27); not run on a non-NVIDIA GPU, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
   turns on the driver signals (NvAPI_D3D_SetReflexSync with the frame generation multiplier, in-band present markers on a second queue, out of
   band markers and queue notices) and the burst: while the driver flip-meters a batch, the presents after the batch's first are released
   at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 2 at all times;

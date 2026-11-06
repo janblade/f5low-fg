@@ -11,7 +11,6 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <dxgi1_4.h>
 
 #include <compressapi.h>
 #include <psapi.h>
@@ -1324,29 +1323,6 @@ extern "C" __declspec(dllexport) void __cdecl f5lowHostRoutesMarkers()
     g_hostRoutesMarkers.store(true, std::memory_order_release);
 }
 
-// The adapter's vendor id behind the game's device (GetAdapterLuid, then DXGI EnumAdapterByLuid): 0 when it cannot be read. The
-// signals and the burst are for NVIDIA's driver only (vendor id 0x10DE); anything else gets the plain chain.
-static UINT AdapterVendorId(ID3D12Device* d)
-{
-    if (!d)
-        return 0;
-    UINT vendor = 0;
-    IDXGIFactory4* fac = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) && fac)
-    {
-        IDXGIAdapter1* ad = nullptr;
-        if (SUCCEEDED(fac->EnumAdapterByLuid(d->GetAdapterLuid(), IID_PPV_ARGS(&ad))) && ad)
-        {
-            DXGI_ADAPTER_DESC1 desc {};
-            if (SUCCEEDED(ad->GetDesc1(&desc)))
-                vendor = desc.VendorId;
-            ad->Release();
-        }
-        fac->Release();
-    }
-    return vendor;
-}
-
 // Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask at each cap decision).
 // 1 while a Generator=dlssg context runs, or an own-generator context is about to send or holds the frame generation multiplier for the
 // driver (NvAPI_D3D_SetReflexSync): DriverPacing=2 or DriverFg with part 1 raise it just before the first send (and take it back if that
@@ -1721,11 +1697,13 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             const std::string pacingText = Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "");
             const int pacing = pacingText.empty() ? -1 : std::clamp(atoi(pacingText.c_str()), 0, 2);
             const bool hostRoutes = g_hostRoutesMarkers.load(std::memory_order_acquire);
-            const UINT vendor = AdapterVendorId(d);
+            // NVIDIA: `have` is the CUDA device behind this adapter (GpuSm, matched by LUID): every context that reaches here has one
+            // (a GPU without goes to Intel's library above), so the GPU is read the way the generator reads it, with no DXGI of our own.
+            const bool nvidia = have > 0;
             const oobdriver::DriverSettings r = oobdriver::ResolveDriver(
                 o->gate, pacing, Setting("XEFG_CUDA_DRIVERFG", "DriverFg", "0") == "1",
                 static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_DRIVERFGPARTS", "DriverFgParts", "15").c_str())),
-                Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1", hostRoutes, vendor == 0x10DEu);
+                Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1", hostRoutes, nvidia);
             o->driverFg = r.driverFg;
             o->driverFgParts = r.parts;
             o->flipBurst = r.flipBurst;
@@ -1744,14 +1722,19 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 case oobdriver::PacingWhy::kDefaultAuto: why = "no DriverPacing key (the default) and the host routes the frame markers"; break;
                 case oobdriver::PacingWhy::kDefaultOffOldHost: why = "no DriverPacing key (the default), but this host did not say it routes the frame markers (an OptiScaler before 0.1.37)"; break;
                 case oobdriver::PacingWhy::kGateVeto: why = "Gate=1 vetoes it"; break;
-                case oobdriver::PacingWhy::kNotNvidia: why = "the GPU's vendor id is not NVIDIA's (or could not be read)"; break;
+                case oobdriver::PacingWhy::kNotNvidia: why = "no NVIDIA compute device for this adapter"; break;
                 }
                 XLog("DriverPacing resolved: mode %d (%s) - %s", r.mode, r.mode == 0 ? "off" : r.mode == 1 ? "automatic" : "always on", why);
             }
-            if (r.nvidiaOff)
-                XLog("driver signals and burst off: the GPU's vendor id is 0x%04x, not NVIDIA's (0x10de)%s - the swap chain stays the plain one", vendor,
-                     vendor == 0 ? " (it could not be read)" : "");
-            if (r.oldHostWarn)
+            if (r.nvidiaOff || (!nvidia && (o->oobQueue || o->oobSwitch)))
+            {
+                // every low-level driver key follows (OobMarkers is read just below and cleared there too)
+                o->oobQueue = false;
+                o->oobSwitch = false;
+                XLog("driver signals, burst and out of band notices off: no NVIDIA compute device for this adapter - the swap chain stays the plain one");
+            }
+            static std::atomic<bool> oldHostWarned { false };       // once per process, not per context
+            if (r.oldHostWarn && !oldHostWarned.exchange(true))
                 XLog("warning: DriverPacing=%d is set, but this host did not say it routes the frame markers: an OptiScaler before 0.1.37 takes them for the game's own Reflex calls", pacing);
             if (r.pacingIgnored && !r.nvidiaOff)
                 XLog("DriverPacing=%d ignored: Gate=1 is on", pacing);
@@ -1770,7 +1753,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         // AppJobs= / RetireWait=0 (XEFG_CUDA_APPJOBS, XEFG_CUDA_RETIREWAIT): low-level, where the game's Present blocks (xefg_own.h, OnPresent).
         o->appJobs = std::clamp(static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_APPJOBS", "AppJobs", "2").c_str())), 1u, 6u);
         o->retireWait = Setting("XEFG_CUDA_RETIREWAIT", "RetireWait", "1") != "0";
-        o->oobMarkers = Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";
+        o->oobMarkers = have > 0 && Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";      // (no NVIDIA compute device: off with the rest)
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):
         // 2500 us, less at a high rate - never more than 0.45 of the frame spacing (xefg_own.h, FlipLead). Not used while the burst is on.
         std::string lead = Setting("XEFG_CUDA_FLIPLEADUS", "FlipLeadUs", "auto");
