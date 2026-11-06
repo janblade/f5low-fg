@@ -1122,6 +1122,7 @@ xefg_swapchain_result_t xefgSwapChainSetEnabled(xefg_swapchain_handle_t h, uint3
             c = o->XellSync();
         }
         c.Send();
+        o->SetTimerRaised(e != 0);
         Log("SetEnabled %u (own)", e);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
