@@ -1139,8 +1139,11 @@ xefg_swapchain_result_t xefgSwapChainSetPresentId(xefg_swapchain_handle_t h, uin
         c->frameId = id;
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
     }
-    if (FindOwn(h))
+    if (auto o = FindOwn(h))
+    {
+        o->presentId.store(id, std::memory_order_relaxed);
         return XEFG_SWAPCHAIN_RESULT_SUCCESS;
+    }
     FORWARDH(xefgSwapChainSetPresentId, h, id);
     Log("SetPresentId %u -> %d", id, r);
     return r;
@@ -1311,14 +1314,16 @@ extern "C" __declspec(dllexport) uint32_t __cdecl f5lowPrepareDlssg()
 static const bool g_paceCfgHook = (xdlssg::g_paceCfg = SinkPaceCfg, true);
 static const bool g_ngxRefusedHook = (xdlssg::g_onRefused = [](const std::string& why) { SetStatus(3, "dlssg unavailable: " + why); }, true);
 
-// Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask once, when they load the library).
-// 1 while a Generator=dlssg context runs: the NVIDIA driver multiplies a Reflex interval on the device by DLSS-G's multiplier
-// itself (NBA 2K27: 33333 us read back as 99999 us at 3x), so the caller gives real Reflex the shown-frame cap undivided.
+// Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask at each cap decision).
+// 1 while a Generator=dlssg context runs, or an own-generator context has sent the frame generation multiplier to the driver
+// (DriverPacing / DriverFg with part 1, NvAPI_D3D_SetReflexSync): the NVIDIA driver then multiplies a Reflex interval on the device by
+// that multiplier itself (seen in one game, NBA 2K27: 33333 us read back as 99999 us at 3x), so the caller gives real Reflex the
+// shown-frame cap undivided.
 __declspec(dllexport) uint32_t xefgCudaDriverMultipliesReflexCap()
 {
     xdlssg::g_capAsked.store(true);
     std::lock_guard<std::mutex> lk(g_dlssgLock);
-    return g_dlssg.empty() ? 0u : 1u;
+    return g_dlssg.empty() && xefgown::g_driverSignals.load() == 0 ? 0u : 1u;
 }
 
 // Not Intel's API: for OptiScaler. What f5low decided for the most recent context: 0 not decided yet, 1 own generator,
@@ -1669,8 +1674,38 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->paceLeadFixedMs = PaceLeadSetting(&o->paceLeadAuto);
         // FlipMetering=0 (XEFG_CUDA_FLIPMETERING=0): no NVIDIA driver flip metering (xefg_own.h, Meter).
         o->flipMetering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "1") != "0";
+        // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
+        const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
+        o->oobQueue = oobQueue == "1";
+        o->oobSwitch = oobQueue == "switch";
+        // DriverFg=1 / DriverFgParts= / FlipBurst=1 (XEFG_CUDA_DRIVERFG, XEFG_CUDA_DRIVERFGPARTS, XEFG_CUDA_FLIPBURST): low-level, off by
+        // default. DriverPacing=1 (XEFG_CUDA_DRIVERPACING) sets the whole set: the driver signals (all parts) and the burst. Gate=1 vetoes both.
+        {
+            const bool pacing = Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "0") == "1";
+            const oobdriver::DriverSettings r = oobdriver::ResolveDriver(
+                o->gate, pacing, Setting("XEFG_CUDA_DRIVERFG", "DriverFg", "0") == "1",
+                static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_DRIVERFGPARTS", "DriverFgParts", "15").c_str())),
+                Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1");
+            o->driverFg = r.driverFg;
+            o->driverFgParts = r.parts;
+            o->flipBurst = r.flipBurst;
+            if (r.pacingIgnored)
+                XLog("DriverPacing=1 ignored: Gate=1 is on");
+            if (r.burstIgnored)
+                XLog("FlipBurst=1 ignored: Gate=1 is on");
+            if (pacing && !r.pacingIgnored)
+                XLog("DriverPacing=1: driver signals (all parts) and the burst (a metered batch's presents after the first are released at once)");
+            else if (o->flipBurst)
+                XLog("FlipBurst=1: a metered batch's presents after the first are released at once");
+            if (o->flipBurst && !o->flipMetering)
+                XLog("warning: the burst needs flip metering, and FlipMetering=0 is set - nothing is metered, so no present is released early");
+        }
+        // AppJobs= / RetireWait=0 (XEFG_CUDA_APPJOBS, XEFG_CUDA_RETIREWAIT): low-level, where the game's Present blocks (xefg_own.h, OnPresent).
+        o->appJobs = std::clamp(static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_APPJOBS", "AppJobs", "2").c_str())), 1u, 6u);
+        o->retireWait = Setting("XEFG_CUDA_RETIREWAIT", "RetireWait", "1") != "0";
+        o->oobMarkers = Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):
-        // 2500 us, less at a high rate - never more than 0.45 of the frame spacing (xefg_own.h, FlipLead).
+        // 2500 us, less at a high rate - never more than 0.45 of the frame spacing (xefg_own.h, FlipLead). Not used while the burst is on.
         std::string lead = Setting("XEFG_CUDA_FLIPLEADUS", "FlipLeadUs", "auto");
         lead.erase(0, lead.find_first_not_of(" \t\r\n"));
         lead.erase(lead.find_last_not_of(" \t\r\n") + 1);
@@ -1891,7 +1926,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
         IDXGISwapChain4* sc4 = nullptr;
         ID3D12CommandQueue* pq = o->PresentQueue();
         DXGI_SWAP_CHAIN_DESC1 dd = *d;
-        o->GateDesc(dd);                // Gate=1: more buffers, the waitable object
+        o->GateDesc(dd);                // Gate=1 or the burst: more buffers, the waitable object (the game still sees what it asked for)
         const HRESULT hr = pq ? fac->CreateSwapChainForHwnd(pq, wnd, &dd, fs, nullptr, &sc1) : E_FAIL;
         if (FAILED(hr) || FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc4))))
         {
@@ -1922,6 +1957,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
             sc4->Release();
             return XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED_DEVICE;
         }
+        o->NoteRequested(d->BufferCount, d->Flags);     // before Wrap: what the game asked for is what it is shown
         o->Wrap(sc4);
         Log("D3D12InitFromSwapChainDesc %ux%u fmt=%d buffers=%u effect=%d flags=0x%x queue=%p initFlags=0x%x (own)", d->Width, d->Height,
             static_cast<int>(d->Format), d->BufferCount, static_cast<int>(d->SwapEffect), d->Flags, static_cast<void*>(q), ip->initFlags);
