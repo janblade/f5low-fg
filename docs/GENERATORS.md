@@ -32,7 +32,7 @@ made. Switching to XeFG Tensor is the player's choice, never automatic. The gene
 | Makes frames from | our recipe/pack | its own network | NVIDIA driver/model | its own optical flow + interpolation |
 | Gets inputs by | host hands colour/motion/depth | `xefgSwapChainTagFrameResource` | `slSetTagForFrame` | prepare + dispatch descs |
 | Can return frames without presenting | yes | no: presents on its swap chain | no: presents on its swap chain proxy | **yes**: `ffxDispatchDescFrameGeneration` writes `outputs[]` on a command list we give it |
-| Paces itself | no (host; with `DriverPacing=1` the NVIDIA driver spaces the flips) | yes, on the chain's latency waitable | yes (driver flip metering, Reflex) | yes when its swap chain is used; no when we dispatch |
+| Paces itself | no (host; with `DriverPacing` on, the default on NVIDIA behind OptiScaler 0.1.37 or newer, the NVIDIA driver spaces the flips) | yes, on the chain's latency waitable | yes (driver flip metering, Reflex) | yes when its swap chain is used; no when we dispatch |
 | Max generated frames | pack/recipe (5) | `xefgSwapChainGetProperties` (3 native on 1.3.4.95) | `DLSSGState::numFramesToGenerateMax` (1-5 by GPU) | `numGeneratedFrames` into `outputs[4]` (version dependent) |
 | Latency partner | XeLL calls by host (`DriverPacing=1`: Reflex Sync with the frame generation multiplier as well) | XeLL (its own) | Reflex (required) | Anti-Lag 2 optional |
 | Frame id rule | host | host passes ids | `FrameToken` | `frameID` must step by exactly 1 or it resets |
@@ -122,8 +122,14 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 ## Per backend, when it is built (stories A2-A4)
 
-- **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off (**default**), `1` automatic, `2` always on; ignored with `Gate=1`, NVIDIA GPUs
-  only, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
+- **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
+  host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
+  before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say
+  logs one warning and is honoured. The resolved mode and why are logged once per context (`DriverPacing resolved: ...`). Ignored with
+  `Gate=1`. NVIDIA GPUs only: the adapter's vendor id is read when the context is made (`GetAdapterLuid`, DXGI `EnumAdapterByLuid`), and
+  on any other GPU, or when it cannot be read, the signals, the burst and the mode are off whatever was set (explicit `1`, `2` and the
+  low-level keys included), so the swap chain is the plain one of before. Measured in one game so far (NBA 2K27); not run on a non-NVIDIA
+  GPU, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
   turns on the driver signals (NvAPI_D3D_SetReflexSync with the frame generation multiplier, in-band present markers on a second queue, out of
   band markers and queue notices) and the burst: while the driver flip-meters a batch, the presents after the batch's first are released
   at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 2 at all times;

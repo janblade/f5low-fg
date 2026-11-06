@@ -2,6 +2,7 @@
 #include "../src/oob_driver.h"
 
 #include <cstdio>
+#include <initializer_list>
 
 static int failures = 0;
 
@@ -45,6 +46,57 @@ int main()
         Check(!d.driverFg && d.parts == 15 && !d.flipBurst && !d.pacingIgnored && !d.burstIgnored && !d.pacingAuto, "nothing asked, nothing changes");
         const DriverSettings e = ResolveDriver(false, 0, true, 6, true);
         Check(e.driverFg && e.parts == 6 && e.flipBurst && !e.pacingAuto, "the low-level keys still work with DriverPacing=0");
+    }
+    // The default and the host handshake: DriverPacing absent (-1) is automatic when the host says it routes the markers, else off; 0 is off;
+    // 1 and 2 are honoured as asked, with a warning on a host that did not say; Gate=1 vetoes; a GPU that is not NVIDIA's turns it all off.
+    {
+        // ResolveDriver(gate, driverPacing, driverFg, parts, flipBurst, hostRoutes, nvidia)
+        const DriverSettings a = ResolveDriver(false, -1, false, 15, false, true, true);
+        Check(a.mode == 1 && a.pacingAuto && a.driverFg && a.flipBurst && a.parts == 15 && a.why == PacingWhy::kDefaultAuto && !a.oldHostWarn,
+              "key absent, host routes the markers: automatic");
+        const DriverSettings b = ResolveDriver(false, -1, false, 15, false, false, true);
+        Check(b.mode == 0 && !b.pacingAuto && !b.driverFg && !b.flipBurst && b.why == PacingWhy::kDefaultOffOldHost && !b.oldHostWarn,
+              "key absent, old host: off, the chain is the plain one, no warning (nothing was asked)");
+        for (const bool host : { true, false })
+        {
+            const DriverSettings z = ResolveDriver(false, 0, false, 15, false, host, true);
+            Check(z.mode == 0 && !z.driverFg && !z.flipBurst && !z.pacingAuto && z.why == PacingWhy::kExplicitOff && !z.oldHostWarn,
+                  "DriverPacing=0: off with or without the handshake");
+            const DriverSettings o = ResolveDriver(false, 1, false, 15, false, host, true);
+            Check(o.mode == 1 && o.pacingAuto && o.driverFg && o.flipBurst && o.why == PacingWhy::kExplicit && o.oldHostWarn == !host,
+                  "DriverPacing=1: honoured, warned about on an old host only");
+            const DriverSettings t = ResolveDriver(false, 2, false, 15, false, host, true);
+            Check(t.mode == 2 && !t.pacingAuto && t.driverFg && t.flipBurst && t.why == PacingWhy::kExplicit && t.oldHostWarn == !host,
+                  "DriverPacing=2: honoured, warned about on an old host only");
+        }
+        // Gate=1 vetoes the default, and the explicit modes, with or without the handshake
+        for (const bool host : { true, false })
+        {
+            const DriverSettings g0 = ResolveDriver(true, -1, false, 15, false, host, true);
+            Check(g0.mode == 0 && !g0.flipBurst && !g0.driverFg && !g0.pacingAuto && !g0.pacingIgnored && (host ? g0.why == PacingWhy::kGateVeto : g0.why == PacingWhy::kDefaultOffOldHost),
+                  "Gate=1, key absent: off, nothing was asked, not 'ignored'");
+            const DriverSettings g1 = ResolveDriver(true, 1, false, 15, false, host, true);
+            Check(g1.mode == 0 && !g1.flipBurst && !g1.pacingAuto && g1.pacingIgnored && g1.why == PacingWhy::kGateVeto, "Gate=1 vetoes DriverPacing=1");
+            const DriverSettings g2 = ResolveDriver(true, 2, false, 15, false, host, true);
+            Check(g2.mode == 0 && !g2.flipBurst && g2.pacingIgnored, "Gate=1 vetoes DriverPacing=2");
+        }
+        // not an NVIDIA GPU (or the vendor could not be read): everything off, whatever was asked, the low-level keys included
+        for (const int ask : { -1, 0, 1, 2 })
+            for (const bool host : { true, false })
+            {
+                const DriverSettings n = ResolveDriver(false, ask, true, 3, true, host, false);
+                Check(n.mode == 0 && !n.driverFg && !n.flipBurst && !n.pacingAuto && n.nvidiaOff && n.why == PacingWhy::kNotNvidia && n.pacingIgnored == (ask > 0),
+                      "not NVIDIA: signals, burst and mode off, even the low-level keys, explicit 1 and 2 included");
+            }
+        const DriverSettings nq = ResolveDriver(false, 0, false, 15, false, true, false);
+        Check(nq.mode == 0 && !nq.nvidiaOff && nq.why == PacingWhy::kExplicitOff, "not NVIDIA and nothing asked: nothing to report");
+        const DriverSettings nb = ResolveDriver(false, -1, false, 15, false, false, false);
+        Check(nb.mode == 0 && !nb.nvidiaOff && nb.why == PacingWhy::kDefaultOffOldHost, "not NVIDIA, old host, key absent: nothing was asked, nothing to report");
+        const DriverSettings ng = ResolveDriver(true, 2, true, 3, true, true, false);
+        Check(!ng.driverFg && !ng.flipBurst && ng.mode == 0 && ng.nvidiaOff, "not NVIDIA wins over Gate=1: low-level driverFg off too");
+        // the low-level keys with DriverPacing=0 on NVIDIA still work, on any host
+        const DriverSettings ll = ResolveDriver(false, 0, true, 6, true, false, true);
+        Check(ll.driverFg && ll.parts == 6 && ll.flipBurst && ll.mode == 0 && !ll.pacingAuto, "the low-level keys with DriverPacing=0 work as before");
     }
     // PacingRule: enter at 0.75 held 2 s, leave at 0.55 held 2 s, 10 s between changes, a hard cause = off at once, a transient cause only
     // after 1 s without a break, a gap over 0.5 s between updates restarts the holds. Hold() updates every 100 ms from a to b.

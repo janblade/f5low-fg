@@ -483,7 +483,7 @@ public:
     bool flipBurst = false;                     // FlipBurst=1 (or DriverPacing=1 or 2) in f5low.ini, Gate=0: the chain made for the burst; a metered batch's presents after the first are released at once while pacingActive (PresentReal)
     bool driverFg = false;                      // DriverFg=1 (or DriverPacing=1 or 2) in f5low.ini: the whole set of driver signals (DriverFgFrame, RealPresent)
     uint32_t driverFgParts = 15;                // DriverFgParts= (low-level, sum): 1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue notices
-    uint32_t pacingMode = 0;                    // DriverPacing= in f5low.ini after Gate: 0 off, 1 automatic (PacingFrame), 2 always on
+    uint32_t pacingMode = 0;                    // DriverPacing= in f5low.ini after the host handshake, the GPU vendor and Gate (oob_driver.h ResolveDriver): 0 off, 1 automatic (PacingFrame, the default behind a host that routes the markers), 2 always on
     bool pacingAuto = false;                    // pacingMode 1: pacingActive starts false and the presenter switches it
     double pacingFlipSec = 0;                   // PacingFlipSec= (test only): force the requested state to flip every this many seconds
     // The driver signals (present markers, Reflex Sync), the out of band markers and the burst run only while this is true. Always true

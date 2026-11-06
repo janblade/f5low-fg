@@ -302,35 +302,68 @@ struct TokenDebt
     }
 };
 
-// The settings after Gate, DriverPacing and the low-level keys are resolved (xefg_cuda.cpp). Gate=1 paces on the GPU through a present
-// lane of its own, so it vetoes both the burst and DriverPacing. DriverPacing=1 or 2 sets the driver signals (all four parts) and the
-// burst; with 1 they run only while PacingRule says so (pacingAuto), with 2 always.
+// The settings after the host handshake, the GPU vendor, Gate, DriverPacing and the low-level keys are resolved (xefg_cuda.cpp, once per
+// context, before the swap chain is made). driverPacing: -1 when the key is absent (no ini key, no environment variable), else 0, 1 or 2.
+//   absent: automatic (1) when the host says it routes these markers (hostRoutes, the export f5lowHostRoutesMarkers), else off: an
+//     OptiScaler without that routing takes the async frame markers for the game's own Reflex calls.
+//   0 off. 1 automatic, 2 always on: honoured as asked; on a host that did not say it routes the markers it is warned about (oldHostWarn).
+//   Not an NVIDIA GPU (nvidia false: the vendor id could not be read counts as not): the signals, the burst and the mode are all off,
+//     explicit 1 and 2 and the low-level keys included, so the chain is the plain one of today.
+//   Gate=1 paces on the GPU through a present lane of its own, so it vetoes both the burst and DriverPacing.
+// DriverPacing 1 or 2 sets the driver signals (all four parts) and the burst; with 1 they run only while PacingRule says so (pacingAuto),
+// with 2 always.
+enum class PacingWhy : int { kExplicitOff, kExplicit, kDefaultAuto, kDefaultOffOldHost, kGateVeto, kNotNvidia };
 struct DriverSettings
 {
     bool driverFg;
     uint32_t parts;
     bool flipBurst;
-    bool pacingIgnored;     // DriverPacing was asked for and Gate=1 vetoed it
+    bool pacingIgnored;     // DriverPacing 1 or 2 was asked for (explicitly) and Gate=1 or a non-NVIDIA GPU vetoed it
     bool burstIgnored;      // FlipBurst was asked for and Gate=1 vetoed it
-    bool pacingAuto;        // DriverPacing=1: the signals and the burst start off and PacingRule switches them
+    bool pacingAuto;        // mode 1: the signals and the burst start off and PacingRule switches them
+    int mode = 0;           // the resolved DriverPacing: 0, 1 or 2
+    PacingWhy why = PacingWhy::kExplicitOff;
+    bool oldHostWarn = false;       // explicit 1 or 2, and the host did not say it routes the markers
+    bool nvidiaOff = false;         // something was asked for (a mode or a low-level key) and the GPU is not NVIDIA
 };
-inline DriverSettings ResolveDriver(bool gate, int driverPacing, bool driverFg, uint32_t parts, bool flipBurst)
+inline DriverSettings ResolveDriver(bool gate, int driverPacing, bool driverFg, uint32_t parts, bool flipBurst, bool hostRoutes = true,
+                                    bool nvidia = true)
 {
     DriverSettings r { driverFg, parts, flipBurst, false, false, false };
+    const bool absent = driverPacing < 0;
+    const int ask = absent ? (hostRoutes ? 1 : 0) : driverPacing;
+    r.why = absent ? (hostRoutes ? PacingWhy::kDefaultAuto : PacingWhy::kDefaultOffOldHost)
+                   : (driverPacing == 0 ? PacingWhy::kExplicitOff : PacingWhy::kExplicit);
+    if (!nvidia)
+    {
+        r.nvidiaOff = ask != 0 || driverFg || flipBurst;
+        r.pacingIgnored = !absent && driverPacing > 0;
+        r.burstIgnored = false;
+        r.driverFg = false;
+        r.flipBurst = false;
+        r.mode = 0;
+        if (r.nvidiaOff)
+            r.why = PacingWhy::kNotNvidia;
+        return r;
+    }
     if (gate)
     {
         r.burstIgnored = flipBurst;
         r.flipBurst = false;
-        r.pacingIgnored = driverPacing != 0;
+        r.pacingIgnored = !absent && driverPacing > 0;
+        if (ask != 0)
+            r.why = PacingWhy::kGateVeto;
         return r;
     }
-    if (driverPacing != 0)
+    if (ask != 0)
     {
         r.driverFg = true;
         r.parts = 15;
         r.flipBurst = true;             // the 8-buffer chain and the metering stay for both modes
-        r.pacingAuto = driverPacing == 1;
+        r.pacingAuto = ask == 1;
+        r.oldHostWarn = !absent && !hostRoutes;
     }
+    r.mode = ask;
     return r;
 }
 } // namespace oobdriver
