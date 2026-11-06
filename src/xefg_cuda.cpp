@@ -1315,8 +1315,9 @@ static const bool g_paceCfgHook = (xdlssg::g_paceCfg = SinkPaceCfg, true);
 static const bool g_ngxRefusedHook = (xdlssg::g_onRefused = [](const std::string& why) { SetStatus(3, "dlssg unavailable: " + why); }, true);
 
 // Not Intel's API: for OptiScaler's Reflex frame-cap fix (OptiScaler-NR 0.1.36 and newer ask at each cap decision).
-// 1 while a Generator=dlssg context runs, or an own-generator context has sent the frame generation multiplier to the driver
-// (DriverPacing / DriverFg with part 1, NvAPI_D3D_SetReflexSync): the NVIDIA driver then multiplies a Reflex interval on the device by
+// 1 while a Generator=dlssg context runs, or an own-generator context is about to send or holds the frame generation multiplier for the
+// driver (NvAPI_D3D_SetReflexSync): DriverPacing=2 or DriverFg with part 1 raise it just before the first send (and take it back if that
+// is refused), DriverPacing=1 from the arming of the signals until their disarming is over. The NVIDIA driver then multiplies a Reflex interval on the device by
 // that multiplier itself (seen in one game, NBA 2K27: 33333 us read back as 99999 us at 3x), so the caller gives real Reflex the
 // shown-frame cap undivided.
 __declspec(dllexport) uint32_t xefgCudaDriverMultipliesReflexCap()
@@ -1679,9 +1680,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->oobQueue = oobQueue == "1";
         o->oobSwitch = oobQueue == "switch";
         // DriverFg=1 / DriverFgParts= / FlipBurst=1 (XEFG_CUDA_DRIVERFG, XEFG_CUDA_DRIVERFGPARTS, XEFG_CUDA_FLIPBURST): low-level, off by
-        // default. DriverPacing=1 (XEFG_CUDA_DRIVERPACING) sets the whole set: the driver signals (all parts) and the burst. Gate=1 vetoes both.
+        // default. DriverPacing=1 or 2 (XEFG_CUDA_DRIVERPACING) sets the whole set: the driver signals (all parts) and the burst; 1 runs it
+        // only while the GPU is the limit (automatic, xefg_own.h PacingFrame), 2 always. Gate=1 vetoes both.
         {
-            const bool pacing = Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "0") == "1";
+            const int pacing = std::clamp(atoi(Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "0").c_str()), 0, 2);
             const oobdriver::DriverSettings r = oobdriver::ResolveDriver(
                 o->gate, pacing, Setting("XEFG_CUDA_DRIVERFG", "DriverFg", "0") == "1",
                 static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_DRIVERFGPARTS", "DriverFgParts", "15").c_str())),
@@ -1689,12 +1691,20 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             o->driverFg = r.driverFg;
             o->driverFgParts = r.parts;
             o->flipBurst = r.flipBurst;
+            o->pacingMode = r.pacingIgnored ? 0u : static_cast<uint32_t>(pacing);
+            o->pacingAuto = r.pacingAuto;
+            o->pacingActive.store(!r.pacingAuto);       // DriverPacing=1 starts off: nothing is sent until the rule turns it on
+            // PacingFlipSec=N (XEFG_CUDA_PACINGFLIPSEC): test only, flips the requested state every N seconds, ignoring the rule.
+            o->pacingFlipSec = r.pacingAuto ? std::max(0.0, atof(Setting("XEFG_CUDA_PACINGFLIPSEC", "PacingFlipSec", "0").c_str())) : 0.0;
             if (r.pacingIgnored)
-                XLog("DriverPacing=1 ignored: Gate=1 is on");
+                XLog("DriverPacing=%d ignored: Gate=1 is on", pacing);
             if (r.burstIgnored)
                 XLog("FlipBurst=1 ignored: Gate=1 is on");
-            if (pacing && !r.pacingIgnored)
-                XLog("DriverPacing=1: driver signals (all parts) and the burst (a metered batch's presents after the first are released at once)");
+            if (r.pacingAuto)
+                XLog("DriverPacing=1: automatic - driver signals (all parts) and the burst run only while the GPU is the limit (load >= 0.75 for 2 s on, <= 0.55 for 2 s off)%s",
+                     o->pacingFlipSec > 0 ? ", PacingFlipSec set: the rule is replaced by a flip every N seconds (test)" : "");
+            else if (pacing == 2 && !r.pacingIgnored)
+                XLog("DriverPacing=2: driver signals (all parts) and the burst (a metered batch's presents after the first are released at once), always");
             else if (o->flipBurst)
                 XLog("FlipBurst=1: a metered batch's presents after the first are released at once");
             if (o->flipBurst && !o->flipMetering)

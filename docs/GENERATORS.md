@@ -122,15 +122,32 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 ## Per backend, when it is built (stories A2-A4)
 
-- **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=1` in f5low.ini (`XEFG_CUDA_DRIVERPACING`), **default 0**, ignored with `Gate=1`, NVIDIA GPUs
+- **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off (**default**), `1` automatic, `2` always on; ignored with `Gate=1`, NVIDIA GPUs
   only, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
   turns on the driver signals (NvAPI_D3D_SetReflexSync with the frame generation multiplier, in-band present markers on a second queue, out of
   band markers and queue notices) and the burst: while the driver flip-meters a batch, the presents after the batch's first are released
-  at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 16 while
-  metered, 2 otherwise; the game still sees the buffer count it asked for). Measured in one game so far (NBA 2K27). The low-level keys
+  at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 2 at all times;
+  the burst's presents take their latency tokens without blocking and pay back the ones they lacked; the game still sees the buffer count it asked for). Measured in one game so far (NBA 2K27). The low-level keys
   still work with `DriverPacing=0`: `DriverFg=1`, `DriverFgParts=` (1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue
   notices), `FlipBurst=1`, `OobQueue=`, `OobMarkers=1`, `AppJobs=`, `RetireWait=`, `FlipMetering=`, `FlipLeadUs=` (not used while the burst
   is on).
+  `DriverPacing=2` runs the set always (while the batch is metered). `DriverPacing=1` runs it only while the GPU is the limit: the presenter
+  measures the GPU's share of the app interval (how long after the game's Present call its GPU work finished, over the app interval,
+  smoothed by 1/8; logged every 120 app frames as `GPU load`), turns the set on after the load has been 0.75 or more for 2 s and off after
+  0.55 or less for 2 s, at most once per 10 s; V-Sync, no generated frames, no flip metering or a swap chain the game made turn it off at
+  once. Measured in one game so far (NBA 2K27, PresentMon): at 4x with the GPU at its limit the set cuts sim-to-screen from about
+  95-110 ms to 37-55 ms; at 6x with a 120 fps cap (the GPU idle part of the time) it gains nothing and spaces the frames less evenly.
+  Note that `DriverPacing=1` used to mean "always on" and is now the automatic mode; `2` is what `1` meant before.
+  In mode 1 nothing is sent while it is off: a capped session whose load stays under the enter threshold never sends a signal (it
+  behaves as `DriverPacing=0` apart from the real swap chain, which has the 8 buffers and the waitable object from the start). Once the
+  set has been armed, the queue notices stay as sent. A switch goes in an order where a frame is never held longer than it should be:
+  on - the cap export (`xefgCudaDriverMultipliesReflexCap`) goes up first, the signals follow 30 app frames later; off - the signals and
+  the burst stop and Reflex Sync gets multiplier 1 at once, the export goes down after 30 app frames and after the driver took the 1
+  (a refused 1 is sent again each frame; after 120 refusals the export comes down anyway and the log says so). Eight refused Reflex
+  Syncs in a row turn the automatic mode off for the session. A cause that makes the set ineligible (V-Sync, frame generation off, a
+  swap chain the game made) acts at once; a history reset, the metering refilling or a one-batch dropout only after about 1 s without a
+  break. In modes 2 and with the low-level keys the export goes up just before the first Reflex Sync with the multiplier, and comes
+  down again if the driver refuses that send. `PacingFlipSec=N` (`XEFG_CUDA_PACINGFLIPSEC`, test only) flips the requested state every N seconds whatever the load.
 - **intel** (built, `src/generators/intel.h`, `src/unlock/FamilyXeFG.h` + `UnlockXeFg.h`): Intel's libxess_fg makes the frames, our sink
   paces them. Present-sink shape, spaced mode. Any D3D12 GPU Intel's library runs on.
   - *Routing.* `Generator=intel` in `D3D12CreateContext` builds an `xintel::Ctx` (not `Own`). The handle is the library's own handle; every XeFG
@@ -415,6 +432,7 @@ Present, a refused state ends after two usable frames, and the warning is logged
   the state stays after the last context is destroyed.
 - `uint32_t xefgCudaXellCountsRenderedOnly()` - XeLL cap accounting (see `src/xefg_cuda.cpp`); 1 also while a dlssg context runs.
 - `uint32_t xefgCudaDriverMultipliesReflexCap()` - OptiScaler's Reflex frame-cap fix asks at each cap decision: 1 while a
-  dlssg context runs, or an own context has sent the frame generation multiplier to the driver (`DriverPacing=1`, Reflex Sync accepted)
+  dlssg context runs, or an own context is about to send or holds the frame generation multiplier for the driver (`DriverPacing=2` or
+  `DriverFg`: from just before the first Reflex Sync; `DriverPacing=1`: from the arming of the signals to the end of their disarming)
   - the NVIDIA driver then multiplies a Reflex interval by that multiplier itself (seen in one game), so the caller gives Reflex the
   shown-frame cap undivided - else 0. A dlssg run whose OptiScaler never asked logs a warning after 600 presents.
