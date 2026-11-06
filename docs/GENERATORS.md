@@ -126,8 +126,8 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   only, needs OptiScaler 0.1.37 or newer (older versions take the async frame markers for the game's own Reflex calls; 0.1.37 also reads `xefgCudaDriverMultipliesReflexCap` to give Reflex the shown-frame cap undivided). It
   turns on the driver signals (NvAPI_D3D_SetReflexSync with the frame generation multiplier, in-band present markers on a second queue, out of
   band markers and queue notices) and the burst: while the driver flip-meters a batch, the presents after the batch's first are released
-  at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 16 while
-  metered, 2 otherwise; the game still sees the buffer count it asked for). Measured in one game so far (NBA 2K27). The low-level keys
+  at once on their virtual slots and the driver spaces the flips (the real swap chain then has 8 buffers and a frame latency of 2 at all times;
+  the burst's presents take their latency tokens without blocking and pay back the ones they lacked; the game still sees the buffer count it asked for). Measured in one game so far (NBA 2K27). The low-level keys
   still work with `DriverPacing=0`: `DriverFg=1`, `DriverFgParts=` (1 Reflex Sync, 2 present markers, 4 out of band markers, 8 queue
   notices), `FlipBurst=1`, `OobQueue=`, `OobMarkers=1`, `AppJobs=`, `RetireWait=`, `FlipMetering=`, `FlipLeadUs=` (not used while the burst
   is on).

@@ -34,7 +34,8 @@
 //     DriverPacing=1 (own swap chain, NVIDIA driver 570+, Gate=0): the driver signals (Reflex Sync with the frame generation multiplier,
 //     in-band present markers on a second queue, out of band markers, queue notices) and the burst: a batch the driver flip-meters
 //     (Meter) has its presents after the first released at once, on their virtual slots, while the driver spaces the flips. The real
-//     swap chain then has 8 buffers and a frame latency of 16 while metered (2 otherwise); the game sees the buffer count it asked for.
+//     swap chain then has 8 buffers and a frame latency of 2 at all times (the burst's presents take their latency tokens without blocking
+//     and pay back the ones they lacked, oob_driver.h TokenDebt); the game sees the buffer count it asked for.
 //     DriverPacing=1 runs that set only while the GPU is the limit (PacingFrame, oob_driver.h PacingRule); 2 always.
 // UI as Intel handles it (tools/XEFG_SETTINGS.md): with UI composition off everything is interpolated, UI
 // included, and HUD-less colour / UI texture are ignored. With it on, the mode (initParams.uiMode; AUTO picks
