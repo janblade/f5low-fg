@@ -1764,7 +1764,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 XLog("DriverPacing=1: automatic - driver signals (all parts) and the burst run only while the GPU is the limit (load >= 0.75 for 2 s on, <= 0.55 for 2 s off)%s",
                      o->pacingFlipSec > 0 ? ", PacingFlipSec set: the rule is replaced by a flip every N seconds (test)" : "");
             else if (r.mode == 2)
-                XLog("DriverPacing=2: driver signals (all parts) and the burst (a metered batch's presents after the first are released at once), always");
+                XLog("DriverPacing=2: driver signals (all parts) always; the burst (a metered batch's presents after the first released at once) while the GPU is the limit (load >= 0.75 for 2 s on, <= 0.55 for 2 s off)");
             else if (o->flipBurst)
                 XLog("FlipBurst=1: a metered batch's presents after the first are released at once");
         }

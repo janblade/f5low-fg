@@ -2277,7 +2277,14 @@ private:
     // and presents on its own queue (InitFromSwapChain) keeps its pacing.
     bool BurstCapable() const { return flipBurst && ourChain && !pq && queue != appQueue; }
     // The burst runs now: capable, and the pacing is active (always, except with DriverPacing=1 while the GPU is not the limit).
-    bool Burst() const { return BurstCapable() && pacingActive.load(std::memory_order_acquire); }
+    // DriverPacing=2 keeps the driver signals on always, but the burst only while the GPU is the limit (burstWanted, PacingFrame): under a
+    // frame cap the burst fills the whole app interval with metered flips and the driver drops a frame whenever the game's next one comes a
+    // little early (NBA 2K27, RTX 5070 Ti, 6x at a 116 cap: ~1 frame in 10 never shown; signals alone 6 in 4585).
+    bool Burst() const
+    {
+        return BurstCapable() && pacingActive.load(std::memory_order_acquire) &&
+               (pacingMode != 2 || pacingAuto || burstWanted.load(std::memory_order_acquire));
+    }
     // How early a metered frame after a batch's first is released. Auto: 2500 us at 180 out (5.56 ms spacing, 0.45 of it), less
     // as the spacing shrinks - a lead longer than the spacing queued the frames at 540+ out (harness fast6x). A set value wins.
     static constexpr double kFlipLeadShare = 0.45;
@@ -2643,8 +2650,29 @@ private:
         static const char* const t[] = { "off", "arming", "on", "disarming" };
         return t[static_cast<int>(pacingMachine.state)];
     }
+    // Hard causes act at once; transient ones (a history reset, the metering refilling, a one-batch dropout) must last about 1 s.
+    oobdriver::Eligibility PacingKind(const Job& j) const
+    {
+        const bool hard = pacingBroken || !BurstCapable() || !flipMetering || (flipTried && !flipFn) || flipRefused || DisplayPaced(j) || !j.usable;
+        const bool transient = !flipTried || !flipMeteredNow || lastNGen == ~0u || lastNGen == 0;
+        return hard ? oobdriver::Eligibility::kHard : transient ? oobdriver::Eligibility::kTransient : oobdriver::Eligibility::kEligible;
+    }
     void PacingFrame(const Job& j)
     {
+        if (!pacingAuto && pacingMode == 2 && flipBurst && !driverFgStopped.load(std::memory_order_acquire))
+        {
+            // DriverPacing=2: the signals stay on; the same rule as automatic pacing decides the burst alone (Burst).
+            const double nowMs = static_cast<double>(Now()) * 1000.0 / freq();
+            const bool want = burstRule.Update(loadEma, nowMs, PacingKind(j));
+            if (want != burstWanted.load(std::memory_order_relaxed))
+            {
+                burstWanted.store(want, std::memory_order_release);
+                XLog(want ? "burst: on at frame %llu (GPU load %.2f) - the GPU is the limit"
+                          : "burst: off at frame %llu (GPU load %.2f) - the GPU is not the limit; DriverPacing=2 keeps the driver signals",
+                     static_cast<unsigned long long>(j.frame), loadEma);
+            }
+            return;
+        }
         if (!pacingAuto || driverFgStopped.load(std::memory_order_acquire))
             return;
         ++pacingFrames;
@@ -2655,10 +2683,7 @@ private:
                  driverFgRefusedStatus.load(std::memory_order_relaxed));
         }
         const double nowMs = static_cast<double>(Now()) * 1000.0 / freq();
-        // Hard causes act at once; transient ones (a history reset, the metering refilling, a one-batch dropout) must last about 1 s.
-        const bool hard = pacingBroken || !BurstCapable() || !flipMetering || (flipTried && !flipFn) || flipRefused || DisplayPaced(j) || !j.usable;
-        const bool transient = !flipTried || !flipMeteredNow || lastNGen == ~0u || lastNGen == 0;
-        const oobdriver::Eligibility kind = hard ? oobdriver::Eligibility::kHard : transient ? oobdriver::Eligibility::kTransient : oobdriver::Eligibility::kEligible;
+        const oobdriver::Eligibility kind = PacingKind(j);
         bool want;
         if (pacingFlipSec > 0)
         {
@@ -4928,6 +4953,8 @@ private:
     std::atomic<bool> driverFgTried { false };      // the application's Present thread (DriverPacing=2), the presenter (DriverPacing=1)
     // DriverPacing=1 (presenter thread): the rule, the state of the switch, the load it works on.
     oobdriver::PacingRule pacingRule;
+    oobdriver::PacingRule burstRule;                    // DriverPacing=2: the burst only while the GPU is the limit (PacingFrame, Burst)
+    std::atomic<bool> burstWanted { false };
     oobdriver::PacingMachine pacingMachine;
     uint64_t pacingFrames = 0;
     std::atomic<uint32_t> driverFgRefusals { 0 };   // consecutive refused Reflex Syncs (the application's thread writes, PacingFrame reads)

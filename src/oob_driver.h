@@ -398,7 +398,7 @@ struct TokenDebt
 //     nothing does there; the presenter's own clock times every frame instead. (NBA 2K27, FlipMetering=0 with DriverPacing=2: the
 //     Reflex Sync multiplier flapped 1 <-> 6 and the on-screen spread went from 1.75 to 2.39 ms.) The low-level DriverFg key stays.
 // DriverPacing 1 or 2 sets the driver signals (all four parts) and the burst; with 1 they run only while PacingRule says so (pacingAuto),
-// with 2 always.
+// with 2 the signals run always and the burst only while PacingRule says so (xefg_own.h, Burst: under a cap it dropped frames).
 enum class PacingWhy : int { kExplicitOff, kExplicit, kDefaultAuto, kDefaultOffOldHost, kGateVeto, kNotNvidia, kNoMetering };
 struct DriverSettings
 {
