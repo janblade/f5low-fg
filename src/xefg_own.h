@@ -471,8 +471,8 @@ public:
     std::string genMode = "off";                // GenQueue= in f5low.ini: off, direct or compute (see PresentGen)
     std::string genPriority;                    // GenPriority= in f5low.ini: high or normal; empty: normal with the gate, else high
     bool genBlock = false;                      // GenBlock=1 in f5low.ini (blockFence, BlockDone): the game's next frame waits for our passes
-    bool presentNormal = false;                 // PresentPriority=normal in f5low.ini (test): our present queue at normal priority, as a GPU that
-                                                // does not favour it (an RTX 20 in a game: our work waits behind the game's)
+    bool presentNormal = false;                 // PresentPriority=normal in f5low.ini (diagnostic only): our present queue at normal priority.
+                                                // It does not imitate an RTX 20 (whose problem is slow switching between queues).
     uint32_t genSpread = 2;                     // GenSpread= in f5low.ini: the D3D12 gate's passes, steps apart (0: at once; PresentGenGated)
     bool noEarly = false;                       // Early=0 in f5low.ini: never take the next frame early (Early)
     double maxLag = 0.5;                        // MaxLag= in f5low.ini: the schedule's lag at most, in app frames (paceLag)
@@ -1380,7 +1380,9 @@ public:
             std::unique_lock<std::mutex> l(pm);
             pcv.wait(l, [this] { return pjobs.size() < appJobs || pQuit; });
             // GenBlock: the game's next frame waits on the GPU for this frame's passes - only when the presenter has nothing else
-            // queued (it takes this frame next, so the wait is one batch at most); behind, the frame goes unblocked (as DLSS-G skips).
+            // queued (it takes this frame next); behind, the frame goes unblocked (as DLSS-G skips). The passes are recorded when the
+            // presenter takes the frame, after the previous batch's paced presents, so the wait lasts up to one app frame of our
+            // pacing plus the passes (NBA 2K27 GPU-bound: 25.0 -> 24.4 fps).
             if (GenBlocks() && j.usable && !pQuit)
             {
                 if (pjobs.empty())
@@ -2019,11 +2021,13 @@ private:
 
     // One application frame on the presenter thread. Its inputs may have been taken already (Early), while the
     // frame before it waited to be presented.
-    bool GenBlocks() const { return genBlock && blockFence && genQueue && !pq && D3d(); }
+    // Not when our present queue is the game's (a context on the game's own swap chain): the game's wait would sit in front of our
+    // copies and presents, and the passes wait for those (hostFence) - a cycle on the GPU.
+    bool GenBlocks() const { return genBlock && blockFence && genQueue && !pq && D3d() && queue != appQueue; }
     // GenBlock: frame j's wait on the game's queue is released (on `on`, behind what is queued there; the value only rises).
     void BlockDone(const Job& j, ID3D12CommandQueue* on)
     {
-        if (!blockFence || j.frame + 1 <= blockSent)
+        if (!genBlock || !blockFence || j.frame + 1 <= blockSent)
             return;
         blockSent = j.frame + 1;
         on->Signal(blockFence, blockSent);
@@ -4028,11 +4032,9 @@ private:
             XLog("stats: GPU load %.2f of the app interval, pacing %s, token debt %u", loadEma, PacingText(), tokenDebt.owed);
         if (genBlock)
         {
-            // written on the game's thread; a stale read only shifts a count between two windows
             XLog("stats: GenBlock %s, the game's next frame waited for our passes %llu times, %llu not (the presenter was behind)",
                  GenBlocks() ? "on" : "off (needs the generation lane on the D3D12 path, Gate=0)",
-                 static_cast<unsigned long long>(statBlocked), static_cast<unsigned long long>(statBlockSkipped));
-            statBlocked = statBlockSkipped = 0;
+                 static_cast<unsigned long long>(statBlocked.exchange(0)), static_cast<unsigned long long>(statBlockSkipped.exchange(0)));
         }
         std::lock_guard<std::mutex> clk(clkMu);
         if (statRels)
@@ -4807,7 +4809,7 @@ private:
     // StopPresenter); blockSent is the presenter's last value, the fence never goes back.
     ID3D12Fence* blockFence = nullptr;
     UINT64 blockSent = 0;
-    uint64_t statBlocked = 0, statBlockSkipped = 0;
+    std::atomic<uint64_t> statBlocked { 0 }, statBlockSkipped { 0 };     // counted on the game's thread, read by Stats
     ID3D12Fence* retireFence = nullptr;     // frame f and its generated frames done on the GPU: f + 1
     HANDLE retireEvent = nullptr;
     HANDLE gpuEvent = nullptr;              // presenter: GPU waits (WaitGpu)
