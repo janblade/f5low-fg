@@ -262,6 +262,11 @@ struct MultiplierHold
         }
         return sent;
     }
+    void Reset()            // the driver was told 1 (pacing off): the next multiplier is sent as is
+    {
+        sent = 0;
+        lower = 0;
+    }
 };
 struct PacingActions
 {

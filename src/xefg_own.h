@@ -1303,6 +1303,11 @@ public:
             lastGenerated = willGen;
             lastCallPresented = 1 + n;
             driverFgFrames = 1 + n;
+            // A deliberate change reaches the driver at once (DriverFgFrame): generation off (the menu, OptiScaler pausing it, exclusive
+            // fullscreen) or another multiplier; a single frame without generated frames (reset, a missing input) is held.
+            driverFgNow = !enabled || inFullscreen || (n > 0 && driverFgLastGen > 0 && n != driverFgLastGen);
+            if (n > 0)
+                driverFgLastGen = n;
             if (xellFgOn)
             {
                 xr = xell;
@@ -2577,7 +2582,10 @@ private:
             driverFgCounted.store(true, std::memory_order_release);
             g_driverSignals.fetch_add(1);
         }
-        // A single app frame without generated frames does not lower the multiplier (oob_driver.h, MultiplierHold).
+        // A single app frame without generated frames does not lower the multiplier (oob_driver.h, MultiplierHold); generation turned off
+        // or another multiplier (driverFgNow) does at once.
+        if (driverFgNow)
+            driverFgHold.Reset();
         const uint32_t mult = driverFgHold.Next(driverFgFrames);
         oobdriver::ReflexSync s {};
         s.version = oobdriver::kReflexSyncVer;
@@ -2593,8 +2601,8 @@ private:
         if (driverFgFrames < mult && !driverFgHoldLogged && driverFgSyncLogs < 100)
         {
             driverFgHoldLogged = true;      // once per context: the first held frame
-            XLog("driver signals: an app frame without generated frames keeps Reflex Sync multiplier %u (lowered after %u such frames in a row)",
-                 mult, oobdriver::kMultiplierHoldFrames);
+            XLog("driver signals: an app frame without generated frames (%u in all) keeps Reflex Sync multiplier %u - lowered only after %u such app frames in a row",
+                 driverFgFrames, mult, oobdriver::kMultiplierHoldFrames);
         }
         if (st == 0)
         {
@@ -2749,6 +2757,7 @@ private:
         if (st == 0)
         {
             driverFgLastMult = 1;
+            driverFgHold.Reset();       // pacing back on later starts from what the driver holds, not a stale 6
             oneRefusals = 0;
             XLog("driver signals: Reflex Sync multiplier back to 1 -> nvapi status 0");
             return true;
@@ -4930,6 +4939,8 @@ private:
     double loadEma = 0;
     unsigned loadSamples = 0;
     uint32_t driverFgFrames = 1;            // under mu, read after it on the same thread
+    bool driverFgNow = false;               // with driverFgFrames: a deliberate change, sent without the hold (MultiplierHold)
+    uint32_t driverFgLastGen = 0;           // with driverFgFrames: generated frames per app frame when it last generated
     int oobSwitchType = -1;
     int oobSwitchFailed = 0;
     // Gate=1 (ShowGated): the present lane, its lists and fence; the gate's fence, the presents waiting for their time.

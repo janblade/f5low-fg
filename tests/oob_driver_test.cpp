@@ -85,6 +85,8 @@ int main()
         for (uint32_t i = 1; i < kMultiplierHoldFrames; ++i)
             k.Next(1);
         Check(k.Next(6) == 6 && k.Next(1) == 6, "a frame that generates restarts the count");
+        k.Reset();
+        Check(k.Next(3) == 3, "after a reset (the driver told 1) a lower multiplier is sent at once");
     }
     // Settings: Gate vetoes DriverPacing and the burst; DriverPacing sets the whole set; nothing asked changes nothing.
     {
