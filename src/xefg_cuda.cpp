@@ -1674,6 +1674,18 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         }
         o->genMode = GenQueueSetting();
         o->genPriority = GenPrioritySetting();
+        o->presentNormal = Setting("XEFG_CUDA_PRESENTPRIORITY", "PresentPriority", "high") == "normal";
+        // GenBlock=1 (XEFG_CUDA_GENBLOCK): as DLSS-G on D3D12, a frame's generated frames are made at once on the generation lane
+        // and the game's queue waits for them, so its next frame never runs ahead of our passes (on GPUs that switch to our
+        // queue slowly - RTX 20 in a game - each pass otherwise waited behind the game's next frame). D3D12 path, Gate=0.
+        o->genBlock = Setting("XEFG_CUDA_GENBLOCK", "GenBlock", "0") == "1";
+        if (o->genBlock)
+        {
+            if (o->genMode == "off")
+                o->genMode = "direct";
+            XLog("GenBlock=1: the frame's generated frames at once on the generation lane (%s), the game's next frame waits for them on the GPU",
+                 o->genMode.c_str());
+        }
         o->genSpread = GenSpreadSetting();
         o->noEarly = !EarlySetting();
         o->maxLag = MaxLagSetting();
