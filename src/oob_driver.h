@@ -237,6 +237,37 @@ struct PacingRule
 enum class PacingState : int { kOff, kArming, kOn, kDisarming };
 inline constexpr uint64_t kPacingSettleFrames = 30, kPacingGiveUpRefusals = 120;
 inline constexpr uint32_t kPacingRefusalsMax = 8;       // consecutive refused Reflex Syncs after which automatic pacing gives up
+
+// The frame multiplier sent with Reflex Sync (xefg_own.h, DriverFgFrame). An app frame that generates nothing (the game's reset, an
+// unusable input) wants 1; telling the driver 1 for that one frame lets the game's next frame go at the undivided cap, then 6 comes
+// back: NBA 2K27 at 6x flapped 1 <-> 6 every few seconds with DriverPacing=2 and the on-screen spread grew. So a larger multiplier is
+// sent at once, a smaller one only after it was wanted kMultiplierHoldFrames app frames in a row (generation really stopped, or the
+// multiplier was lowered).
+inline constexpr uint32_t kMultiplierHoldFrames = 8;
+struct MultiplierHold
+{
+    uint32_t sent = 0;      // 0: nothing sent yet
+    uint32_t lower = 0;     // app frames in a row that wanted less than sent
+    uint32_t Next(uint32_t want, uint32_t hold = kMultiplierHoldFrames)
+    {
+        if (want >= sent)
+        {
+            sent = want;
+            lower = 0;
+        }
+        else if (++lower >= hold)
+        {
+            sent = want;
+            lower = 0;
+        }
+        return sent;
+    }
+    void Reset()            // the driver was told 1 (pacing off): the next multiplier is sent as is
+    {
+        sent = 0;
+        lower = 0;
+    }
+};
 struct PacingActions
 {
     bool raiseExport = false, signalsOn = false, signalsOff = false, sendOne = false, lowerExport = false, gaveUp = false;
@@ -367,7 +398,7 @@ struct TokenDebt
 //     nothing does there; the presenter's own clock times every frame instead. (NBA 2K27, FlipMetering=0 with DriverPacing=2: the
 //     Reflex Sync multiplier flapped 1 <-> 6 and the on-screen spread went from 1.75 to 2.39 ms.) The low-level DriverFg key stays.
 // DriverPacing 1 or 2 sets the driver signals (all four parts) and the burst; with 1 they run only while PacingRule says so (pacingAuto),
-// with 2 always.
+// with 2 the signals run always and the burst only while PacingRule says so (xefg_own.h, Burst: under a cap it dropped frames).
 enum class PacingWhy : int { kExplicitOff, kExplicit, kDefaultAuto, kDefaultOffOldHost, kGateVeto, kNotNvidia, kNoMetering };
 struct DriverSettings
 {

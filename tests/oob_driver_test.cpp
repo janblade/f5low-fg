@@ -65,6 +65,29 @@ int main()
         const DriverSettings on = ResolveDriver(false, 2, false, 14, false, true, true, true);
         Check(on.mode == 2 && on.driverFg && on.flipBurst, "with metering (RTX 50) DriverPacing=2 is unchanged");
     }
+    // Reflex Sync multiplier: up at once, down only after kMultiplierHoldFrames app frames in a row.
+    {
+        MultiplierHold h;
+        Check(h.Next(6) == 6, "the first multiplier is sent as is");
+        Check(h.Next(1) == 6 && h.Next(6) == 6, "one app frame without generated frames keeps 6");
+        bool held = true;
+        for (uint32_t i = 1; i < kMultiplierHoldFrames; ++i)
+            held = held && h.Next(1) == 6;
+        Check(held && h.Next(1) == 1, "generation stopped: 1 after kMultiplierHoldFrames frames in a row");
+        Check(h.Next(6) == 6, "back up at once");
+        MultiplierHold g;
+        g.Next(6);
+        for (uint32_t i = 1; i < kMultiplierHoldFrames; ++i)
+            g.Next(4);
+        Check(g.Next(4) == 4 && g.Next(4) == 4, "a lowered multiplier (6x -> 4x) follows after the hold");
+        MultiplierHold k;
+        k.Next(6);
+        for (uint32_t i = 1; i < kMultiplierHoldFrames; ++i)
+            k.Next(1);
+        Check(k.Next(6) == 6 && k.Next(1) == 6, "a frame that generates restarts the count");
+        k.Reset();
+        Check(k.Next(3) == 3, "after a reset (the driver told 1) a lower multiplier is sent at once");
+    }
     // Settings: Gate vetoes DriverPacing and the burst; DriverPacing sets the whole set; nothing asked changes nothing.
     {
         const DriverSettings a = ResolveDriver(false, 2, false, 14, false);
