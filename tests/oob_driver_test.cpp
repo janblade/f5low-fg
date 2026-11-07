@@ -30,6 +30,13 @@ int main()
     Check(!BurstNow(true, 1, true), "no burst for the batch's first present");
     Check(!BurstNow(true, 2, false), "no burst when the batch is not metered");
     Check(!BurstNow(false, 2, true), "no burst when it is off");
+    Check(!FlipMeteringOn("auto", 75), "flip metering auto: off on an RTX 20 (sm_75), no hardware metering");
+    Check(!FlipMeteringOn("auto", 86) && !FlipMeteringOn("auto", 89), "flip metering auto: off on RTX 30/40");
+    Check(FlipMeteringOn("auto", 120) && FlipMeteringOn("auto", 100), "flip metering auto: on from Blackwell (sm_100, sm_120)");
+    Check(!FlipMeteringOn("auto", 0), "flip metering auto: off when the GPU is unknown");
+    Check(FlipMeteringOn("1", 75), "FlipMetering=1 forces it on any GPU");
+    Check(!FlipMeteringOn("0", 120), "FlipMetering=0 turns it off on Blackwell too");
+    Check(FlipMeteringOn(nullptr, 120) && !FlipMeteringOn("", 75), "no setting: the GPU decides");
     // Settings: Gate vetoes DriverPacing and the burst; DriverPacing sets the whole set; nothing asked changes nothing.
     {
         const DriverSettings a = ResolveDriver(false, 2, false, 14, false);

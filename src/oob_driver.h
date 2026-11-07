@@ -76,6 +76,21 @@ inline bool MarkFrame(uint32_t frameId) { return frameId != 0; }
 // smoothed schedule. Holding it to the schedule was measured worse in one game.
 inline bool BurstNow(bool burstOn, uint32_t k, bool metered) { return burstOn && k > 1 && metered; }
 
+// Whether the presenter asks the NVIDIA driver to meter a batch's flips (xefg_own.h, InitFlip). The spacing is done in the display
+// hardware of GeForce RTX 50 (Blackwell, sm_100 and newer); on older GPUs the driver takes the call (status 0) but nothing spaces the
+// flips, so frames released early or in a burst reach the screen together. An RTX 2070 SUPER at 6x (tester logs, 2026-11-07/08) showed
+// the batch's presents 12-15 ms apart in spread with DriverPacing=2 and 52-65 ms gaps between batches. FlipMetering= in f5low.ini:
+// "0" off, "1" on whatever the GPU (for tests), anything else (the default "auto") on from sm_100. gpuSm: sm_NN, 0 unknown.
+inline constexpr int kFlipMeteringMinSm = 100;
+inline bool FlipMeteringOn(const char* setting, int gpuSm)
+{
+    if (setting && setting[0] == '0' && setting[1] == '\0')
+        return false;
+    if (setting && setting[0] == '1' && setting[1] == '\0')
+        return true;
+    return gpuSm >= kFlipMeteringMinSm;
+}
+
 // When DriverPacing=1 pays (xefg_own.h, PacingFrame). Measured in one game (NBA 2K27) with PresentMon: with the GPU at its limit the signals
 // and the burst cut the game's sim-to-screen time by about half; with the GPU idle part of the time (a frame cap) they gain nothing and
 // space the frames less evenly. So they run only while the GPU is the limit.

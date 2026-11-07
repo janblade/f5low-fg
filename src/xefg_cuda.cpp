@@ -1682,8 +1682,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->gate = GateSetting();
         o->paceLog = PaceFlag("XEFG_CUDA_PACELOG", "PaceLog") && OpenLog();     // nothing to record where nothing is logged
         o->paceLeadFixedMs = PaceLeadSetting(&o->paceLeadAuto);
-        // FlipMetering=0 (XEFG_CUDA_FLIPMETERING=0): no NVIDIA driver flip metering (xefg_own.h, Meter).
-        o->flipMetering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "1") != "0";
+        // FlipMetering= (XEFG_CUDA_FLIPMETERING): NVIDIA driver flip metering (xefg_own.h, InitFlip, Meter). "0" off, "1" on any GPU (tests),
+        // the default "auto" only where the display hardware meters flips (oob_driver.h, FlipMeteringOn: RTX 50 / sm_100 and newer).
+        o->flipMeteringSetting = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "auto");
+        o->flipMetering = o->flipMeteringSetting != "0";
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
         o->oobQueue = oobQueue == "1";
