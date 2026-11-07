@@ -1683,8 +1683,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         {
             if (o->genMode == "off")
                 o->genMode = "direct";
-            XLog("GenBlock=1: the frame's generated frames at once on the generation lane (%s), the game's next frame waits for them on the GPU",
-                 o->genMode.c_str());
+            XLog("GenBlock=1: the frame's generated frames at once on the generation lane (%s), the game's next frame waits for them on the GPU "
+                 "(D3D12 path with our own swap chain and Gate=0 only - the stats line says whether it is on)", o->genMode.c_str());
         }
         o->genSpread = GenSpreadSetting();
         o->noEarly = !EarlySetting();
