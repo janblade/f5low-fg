@@ -2646,7 +2646,8 @@ private:
         if (!driverFg && !flipBurst)
             return "off";
         if (!pacingAuto)
-            return pacingMode == 2 ? "on (always)" : "on (set by the low-level keys)";
+            return pacingMode == 2 ? (burstWanted.load(std::memory_order_relaxed) ? "on (always), burst on" : "on (always), burst off - the GPU is not the limit")
+                                   : "on (set by the low-level keys)";
         static const char* const t[] = { "off", "arming", "on", "disarming" };
         return t[static_cast<int>(pacingMachine.state)];
     }
@@ -2774,7 +2775,10 @@ private:
     {
         std::lock_guard<std::mutex> l(driverFgMu);
         if (driverFgStopped.load(std::memory_order_acquire) || !driverFgSynced || !reflexSyncFn || !dev || driverFgLastMult == 1)
+        {
+            driverFgHold.Reset();       // the driver holds 1 (a refused larger one included): the next multiplier is sent as is
             return true;
+        }
         oobdriver::ReflexSync s {};
         s.version = oobdriver::kReflexSyncVer;
         s.fgMultiplier = 1;
