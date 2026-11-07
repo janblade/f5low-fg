@@ -477,7 +477,7 @@ public:
     double maxDelay = 1.5;                      // MaxDelay= in f5low.ini: the clock's delay at most, in app frames (clkTarget)
     GenSettings gs;                             // Prof=1/2 (or XEFG_CUDA_PROF), Native=0 in f5low.ini: shared with the generator
     bool gate = false;                          // Gate= in f5low.ini: pace on the GPU (ShowGated / PresentGenGated), with the clock
-    bool flipMetering = true;                   // FlipMetering=0 in f5low.ini: no NVIDIA driver flip metering (Meter)
+    bool flipMetering = true;                   // FlipMetering= in f5low.ini, resolved for this GPU at settings time (oob_driver.h FlipMeteringOn); InitFlip decides again and leaves flipFn null when off: gate on flipFn / Metered(), not on this alone
     std::string flipMeteringSetting = "auto";   // FlipMetering= as set: "auto" lets the GPU decide (oob_driver.h FlipMeteringOn, InitFlip)
     bool oobQueue = false;                      // OobQueue=1 in f5low.ini: tell NVIDIA's driver our queues run out of band (OobNotify)
     bool oobSwitch = false;                     // OobQueue=switch: present type for the app's frame, render type for a generated one (RealPresent)
@@ -2352,8 +2352,13 @@ private:
         {
             // The driver takes the call on older GPUs but nothing spaces the flips: frames let out early or in a burst then reach the
             // screen together. The presenter times every frame itself instead (no lead, no burst; automatic pacing stays off).
-            snprintf(gpuWhy, sizeof(gpuWhy), "this GPU (sm_%d) has no hardware flip metering (GeForce RTX 50 and newer); FlipMetering=1 forces it",
-                     pg->GpuSm());
+            if (oobdriver::FlipMeteringForced(flipMeteringSetting.c_str()) == 0)
+                snprintf(gpuWhy, sizeof(gpuWhy), "FlipMetering=%s in the settings", flipMeteringSetting.c_str());
+            else if (pg->GpuSm() <= 0)
+                snprintf(gpuWhy, sizeof(gpuWhy), "the GPU is not known as NVIDIA's (no compute capability)");
+            else
+                snprintf(gpuWhy, sizeof(gpuWhy), "this GPU (sm_%d) has no hardware flip metering (GeForce RTX 50 and newer); FlipMetering=1 forces it",
+                         pg->GpuSm());
             why = gpuWhy;
         }
         else if (const NvQueryFn qi = SystemNvapi(why))
