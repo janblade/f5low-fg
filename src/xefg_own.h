@@ -2577,20 +2577,28 @@ private:
             driverFgCounted.store(true, std::memory_order_release);
             g_driverSignals.fetch_add(1);
         }
+        // A single app frame without generated frames does not lower the multiplier (oob_driver.h, MultiplierHold).
+        const uint32_t mult = driverFgHold.Next(driverFgFrames);
         oobdriver::ReflexSync s {};
         s.version = oobdriver::kReflexSyncVer;
-        s.fgMultiplier = static_cast<uint8_t>(driverFgFrames);
+        s.fgMultiplier = static_cast<uint8_t>(mult);
         const int st = reflexSyncFn(dev, &s);
-        if ((st != driverFgSyncStatus || driverFgFrames != driverFgSyncMult) && driverFgSyncLogs < 100)
+        if ((st != driverFgSyncStatus || mult != driverFgSyncMult) && driverFgSyncLogs < 100)
         {
             ++driverFgSyncLogs;
             driverFgSyncStatus = st;
-            driverFgSyncMult = driverFgFrames;
-            XLog("driver signals: Reflex Sync multiplier %u -> nvapi status %d", driverFgFrames, st);
+            driverFgSyncMult = mult;
+            XLog("driver signals: Reflex Sync multiplier %u -> nvapi status %d", mult, st);
+        }
+        if (driverFgFrames < mult && !driverFgHoldLogged && driverFgSyncLogs < 100)
+        {
+            driverFgHoldLogged = true;      // once per context: the first held frame
+            XLog("driver signals: an app frame without generated frames keeps Reflex Sync multiplier %u (lowered after %u such frames in a row)",
+                 mult, oobdriver::kMultiplierHoldFrames);
         }
         if (st == 0)
         {
-            driverFgLastMult = driverFgFrames;
+            driverFgLastMult = mult;
             driverFgSynced = true;
             driverFgRefusals.store(0, std::memory_order_relaxed);
             if (!pacingAuto && !driverFgCounted.exchange(true))     // automatic pacing raises it ahead of the signals (PacingStep)
@@ -4893,6 +4901,8 @@ private:
     const char* nvapiWhy = nullptr;
     std::mutex driverFgMu;                  // Reflex Sync sends and DriverFgStop: no send follows the reset
     uint32_t driverFgLastMult = 0;          // the multiplier of the last Reflex Sync sent, whatever the log cap
+    oobdriver::MultiplierHold driverFgHold;  // under driverFgMu: lowers the multiplier only after kMultiplierHoldFrames app frames (DriverFgFrame)
+    bool driverFgHoldLogged = false;        // under driverFgMu
     bool oobTried = false;                  // the presenting thread's, as flipTried
     std::atomic<bool> oobMarked { false };  // the app's thread (DriverFgFrame) and the presenter both mark
     std::atomic<int> oobMarkerFailed { 0 };
