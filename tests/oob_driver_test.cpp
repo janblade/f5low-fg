@@ -30,6 +30,41 @@ int main()
     Check(!BurstNow(true, 1, true), "no burst for the batch's first present");
     Check(!BurstNow(true, 2, false), "no burst when the batch is not metered");
     Check(!BurstNow(false, 2, true), "no burst when it is off");
+    Check(!FlipMeteringOn("auto", 75), "flip metering auto: off on an RTX 20 (sm_75), no hardware metering");
+    Check(!FlipMeteringOn("auto", 86) && !FlipMeteringOn("auto", 89), "flip metering auto: off on RTX 30/40");
+    Check(FlipMeteringOn("auto", 120) && FlipMeteringOn("auto", 100), "flip metering auto: on from Blackwell (sm_100, sm_120)");
+    Check(!FlipMeteringOn("auto", 0), "flip metering auto: off when the GPU is unknown");
+    Check(FlipMeteringOn("1", 75), "FlipMetering=1 forces it on any GPU");
+    Check(!FlipMeteringOn("0", 120), "FlipMetering=0 turns it off on Blackwell too");
+    Check(FlipMeteringOn(nullptr, 120) && !FlipMeteringOn("", 75), "no setting: the GPU decides");
+    Check(!FlipMeteringOn("auto", -1), "flip metering auto: off for a negative (test) sm");
+    Check(FlipMeteringOn("true", 75) && FlipMeteringOn("ON", 75) && FlipMeteringOn(" yes ", 75), "true/on/yes force it on, any case, spaces trimmed");
+    Check(!FlipMeteringOn("false", 120) && !FlipMeteringOn("Off", 120) && !FlipMeteringOn("0 ", 120) && !FlipMeteringOn("no", 120), "false/off/no/\"0 \" turn it off");
+    {
+        bool known = false;
+        Check(FlipMeteringForced("AUTO", &known) == -1 && known, "AUTO is auto, a known value");
+        Check(FlipMeteringForced("maybe", &known) == -1 && !known, "an unknown value is auto, flagged for the log");
+        Check(FlipMeteringForced("1234567890", &known) == -1 && !known, "a long value is auto, flagged");
+        Check(FlipMeteringForced("", &known) == -1 && known && FlipMeteringForced(nullptr, &known) == -1 && known, "empty / no setting is auto, known");
+        Check(FlipMeteringOn("auto", 120) && !FlipMeteringOn("maybe", 75), "an unknown value lets the GPU decide");
+    }
+    // No flip metering (a GPU before RTX 50, or FlipMetering=0): DriverPacing and the burst are off, explicit 2 included.
+    {
+        const DriverSettings m2 = ResolveDriver(false, 2, false, 14, false, true, true, false);
+        Check(m2.mode == 0 && !m2.driverFg && !m2.flipBurst && !m2.pacingAuto && m2.pacingIgnored && m2.why == PacingWhy::kNoMetering,
+              "no metering: DriverPacing=2 is off and logged as ignored");
+        const DriverSettings m1 = ResolveDriver(false, -1, false, 14, false, true, true, false);
+        Check(m1.mode == 0 && !m1.driverFg && !m1.flipBurst && !m1.pacingAuto && !m1.pacingIgnored && m1.why == PacingWhy::kNoMetering,
+              "no metering: the automatic default is off, not reported as ignored");
+        const DriverSettings mb = ResolveDriver(false, 0, false, 14, true, true, true, false);
+        Check(mb.mode == 0 && !mb.flipBurst && mb.burstIgnored, "no metering: FlipBurst=1 is ignored");
+        const DriverSettings md = ResolveDriver(false, 0, true, 3, false, true, true, false);
+        Check(md.driverFg && md.parts == 3 && md.mode == 0, "no metering: the low-level DriverFg key stays");
+        const DriverSettings mg = ResolveDriver(true, 2, false, 14, false, true, true, false);
+        Check(mg.why == PacingWhy::kGateVeto && mg.pacingIgnored, "Gate=1 still names itself as the veto");
+        const DriverSettings on = ResolveDriver(false, 2, false, 14, false, true, true, true);
+        Check(on.mode == 2 && on.driverFg && on.flipBurst, "with metering (RTX 50) DriverPacing=2 is unchanged");
+    }
     // Settings: Gate vetoes DriverPacing and the burst; DriverPacing sets the whole set; nothing asked changes nothing.
     {
         const DriverSettings a = ResolveDriver(false, 2, false, 14, false);

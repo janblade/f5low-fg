@@ -76,6 +76,58 @@ inline bool MarkFrame(uint32_t frameId) { return frameId != 0; }
 // smoothed schedule. Holding it to the schedule was measured worse in one game.
 inline bool BurstNow(bool burstOn, uint32_t k, bool metered) { return burstOn && k > 1 && metered; }
 
+// Whether the presenter asks the NVIDIA driver to meter a batch's flips (xefg_own.h, InitFlip). The spacing is done in the display
+// hardware of GeForce RTX 50 (Blackwell, sm_100 and newer); on older GPUs the driver takes the call (status 0) but nothing spaces the
+// flips, so frames released early or in a burst reach the screen together. An RTX 2070 SUPER at 6x (tester logs, 2026-11-07/08) showed
+// the batch's presents 12-15 ms apart in spread with DriverPacing=2 and 52-65 ms gaps between batches. FlipMetering= in f5low.ini:
+// "0"/"off"/"false"/"no" off, "1"/"on"/"true"/"yes" on whatever the GPU (for tests), "auto" (the default) on from sm_100. Any other
+// value counts as auto (the caller logs it). Case and spaces around the value don't matter. gpuSm: sm_NN, 0 or less unknown.
+inline constexpr int kFlipMeteringMinSm = 100;
+// -1 auto, 0 off, 1 on. *known = false for a value that is none of the words above (it is taken as auto).
+inline int FlipMeteringForced(const char* setting, bool* known = nullptr)
+{
+    char v[8] = {};
+    size_t n = 0;
+    bool tooLong = false;
+    if (setting)
+    {
+        while (*setting == ' ' || *setting == '\t')
+            ++setting;
+        for (; *setting; ++setting)
+        {
+            if (n + 1 >= sizeof(v))
+            {
+                tooLong = true;
+                break;
+            }
+            v[n++] = (*setting >= 'A' && *setting <= 'Z') ? static_cast<char>(*setting - 'A' + 'a') : *setting;
+        }
+        while (n && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\r' || v[n - 1] == '\n'))
+            v[--n] = '\0';
+    }
+    auto is = [&](const char* s) {
+        if (tooLong)
+            return false;
+        size_t i = 0;
+        for (; s[i] && v[i] == s[i]; ++i) {}
+        return s[i] == '\0' && v[i] == '\0';
+    };
+    if (known)
+        *known = true;
+    if (is("0") || is("off") || is("false") || is("no"))
+        return 0;
+    if (is("1") || is("on") || is("true") || is("yes"))
+        return 1;
+    if (known)
+        *known = !tooLong && (n == 0 || is("auto"));
+    return -1;
+}
+inline bool FlipMeteringOn(const char* setting, int gpuSm)
+{
+    const int forced = FlipMeteringForced(setting);
+    return forced >= 0 ? forced == 1 : gpuSm >= kFlipMeteringMinSm;
+}
+
 // When DriverPacing=1 pays (xefg_own.h, PacingFrame). Measured in one game (NBA 2K27) with PresentMon: with the GPU at its limit the signals
 // and the burst cut the game's sim-to-screen time by about half; with the GPU idle part of the time (a frame cap) they gain nothing and
 // space the frames less evenly. So they run only while the GPU is the limit.
@@ -310,9 +362,13 @@ struct TokenDebt
 //   No NVIDIA compute device for the adapter (nvidia false; xefg_cuda.cpp passes have > 0, the CUDA device matched by LUID): the signals, the burst and the mode are all off,
 //     explicit 1 and 2 and the low-level keys included, so the chain is the plain one of today.
 //   Gate=1 paces on the GPU through a present lane of its own, so it vetoes both the burst and DriverPacing.
+//   No flip metering (metering false: FlipMeteringOn says no, as on GPUs before RTX 50): DriverPacing and FlipBurst are off, explicit 1
+//     and 2 included. The burst leans on metering, and the driver signals tell Reflex the driver spaces the generated flips, which
+//     nothing does there; the presenter's own clock times every frame instead. (NBA 2K27, FlipMetering=0 with DriverPacing=2: the
+//     Reflex Sync multiplier flapped 1 <-> 6 and the on-screen spread went from 1.75 to 2.39 ms.) The low-level DriverFg key stays.
 // DriverPacing 1 or 2 sets the driver signals (all four parts) and the burst; with 1 they run only while PacingRule says so (pacingAuto),
 // with 2 always.
-enum class PacingWhy : int { kExplicitOff, kExplicit, kDefaultAuto, kDefaultOffOldHost, kGateVeto, kNotNvidia };
+enum class PacingWhy : int { kExplicitOff, kExplicit, kDefaultAuto, kDefaultOffOldHost, kGateVeto, kNotNvidia, kNoMetering };
 struct DriverSettings
 {
     bool driverFg;
@@ -327,7 +383,7 @@ struct DriverSettings
     bool nvidiaOff = false;         // something was asked for (a mode or a low-level key) and the GPU is not NVIDIA
 };
 inline DriverSettings ResolveDriver(bool gate, int driverPacing, bool driverFg, uint32_t parts, bool flipBurst, bool hostRoutes = true,
-                                    bool nvidia = true)
+                                    bool nvidia = true, bool metering = true)
 {
     DriverSettings r { driverFg, parts, flipBurst, false, false, false };
     const bool absent = driverPacing < 0;
@@ -353,6 +409,15 @@ inline DriverSettings ResolveDriver(bool gate, int driverPacing, bool driverFg, 
         r.pacingIgnored = !absent && driverPacing > 0;
         if (ask != 0)
             r.why = PacingWhy::kGateVeto;
+        return r;
+    }
+    if (!metering)
+    {
+        r.burstIgnored = flipBurst;
+        r.flipBurst = false;
+        r.pacingIgnored = !absent && driverPacing > 0;
+        if (ask != 0)
+            r.why = PacingWhy::kNoMetering;
         return r;
     }
     if (ask != 0)

@@ -1682,8 +1682,26 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->gate = GateSetting();
         o->paceLog = PaceFlag("XEFG_CUDA_PACELOG", "PaceLog") && OpenLog();     // nothing to record where nothing is logged
         o->paceLeadFixedMs = PaceLeadSetting(&o->paceLeadAuto);
-        // FlipMetering=0 (XEFG_CUDA_FLIPMETERING=0): no NVIDIA driver flip metering (xefg_own.h, Meter).
-        o->flipMetering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "1") != "0";
+        // FlipMetering= (XEFG_CUDA_FLIPMETERING): NVIDIA driver flip metering (xefg_own.h, InitFlip, Meter). "0" off, "1" on any GPU (tests),
+        // the default "auto" only where the display hardware meters flips (oob_driver.h, FlipMeteringOn: RTX 50 / sm_100 and newer).
+        // Decided here for the settings below (DriverPacing, the burst); InitFlip checks it again on the generator's GPU.
+        o->flipMeteringSetting = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "auto");
+        {
+            bool known = true;
+            oobdriver::FlipMeteringForced(o->flipMeteringSetting.c_str(), &known);
+            if (!known)
+                XLog("warning: FlipMetering=%s is not auto, 0 or 1 (or on/off, true/false, yes/no) - taken as auto", o->flipMeteringSetting.c_str());
+        }
+        o->flipMetering = oobdriver::FlipMeteringOn(o->flipMeteringSetting.c_str(), have);
+        if (!o->flipMetering)      // Meter then never reaches InitFlip, so the reason is logged here
+        {
+            if (oobdriver::FlipMeteringForced(o->flipMeteringSetting.c_str()) == 0)
+                XLog("flip metering: off - FlipMetering=%s in the settings", o->flipMeteringSetting.c_str());
+            else if (have <= 0)
+                XLog("flip metering: off - no NVIDIA compute device for this adapter");
+            else
+                XLog("flip metering: off - this GPU (sm_%d) has no hardware flip metering (GeForce RTX 50 and newer), f5low times every frame itself; FlipMetering=1 forces it", have);
+        }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
         o->oobQueue = oobQueue == "1";
@@ -1703,7 +1721,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             const oobdriver::DriverSettings r = oobdriver::ResolveDriver(
                 o->gate, pacing, Setting("XEFG_CUDA_DRIVERFG", "DriverFg", "0") == "1",
                 static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_DRIVERFGPARTS", "DriverFgParts", "15").c_str())),
-                Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1", hostRoutes, nvidia);
+                Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1", hostRoutes, nvidia, o->flipMetering);
             o->driverFg = r.driverFg;
             o->driverFgParts = r.parts;
             o->flipBurst = r.flipBurst;
@@ -1723,6 +1741,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 case oobdriver::PacingWhy::kDefaultOffOldHost: why = "no DriverPacing key (the default), but this host did not say it routes the frame markers (an OptiScaler before 0.1.37)"; break;
                 case oobdriver::PacingWhy::kGateVeto: why = "Gate=1 vetoes it"; break;
                 case oobdriver::PacingWhy::kNotNvidia: why = "no NVIDIA compute device for this adapter"; break;
+                case oobdriver::PacingWhy::kNoMetering: why = "no flip metering (a GPU before GeForce RTX 50, or FlipMetering=0): f5low times every frame itself"; break;
                 }
                 XLog("DriverPacing resolved: mode %d (%s) - %s", r.mode, r.mode == 0 ? "off" : r.mode == 1 ? "automatic" : "always on", why);
             }
@@ -1736,10 +1755,11 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             static std::atomic<bool> oldHostWarned { false };       // once per process, not per context
             if (r.oldHostWarn && !oldHostWarned.exchange(true))
                 XLog("warning: DriverPacing=%d is set, but this host did not say it routes the frame markers: an OptiScaler before 0.1.37 takes them for the game's own Reflex calls", pacing);
+            const char* vetoBy = o->gate ? "Gate=1 is on" : "no flip metering (a GPU before GeForce RTX 50, or FlipMetering=0)";
             if (r.pacingIgnored && !r.nvidiaOff)
-                XLog("DriverPacing=%d ignored: Gate=1 is on", pacing);
+                XLog("DriverPacing=%d ignored: %s", pacing, vetoBy);
             if (r.burstIgnored)
-                XLog("FlipBurst=1 ignored: Gate=1 is on");
+                XLog("FlipBurst=1 ignored: %s", vetoBy);
             if (r.pacingAuto)
                 XLog("DriverPacing=1: automatic - driver signals (all parts) and the burst run only while the GPU is the limit (load >= 0.75 for 2 s on, <= 0.55 for 2 s off)%s",
                      o->pacingFlipSec > 0 ? ", PacingFlipSec set: the rule is replaced by a flip every N seconds (test)" : "");
@@ -1747,8 +1767,6 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 XLog("DriverPacing=2: driver signals (all parts) and the burst (a metered batch's presents after the first are released at once), always");
             else if (o->flipBurst)
                 XLog("FlipBurst=1: a metered batch's presents after the first are released at once");
-            if (o->flipBurst && !o->flipMetering)
-                XLog("warning: the burst needs flip metering, and FlipMetering=0 is set - nothing is metered, so no present is released early");
         }
         // AppJobs= / RetireWait=0 (XEFG_CUDA_APPJOBS, XEFG_CUDA_RETIREWAIT): low-level, where the game's Present blocks (xefg_own.h, OnPresent).
         o->appJobs = std::clamp(static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_APPJOBS", "AppJobs", "2").c_str())), 1u, 6u);
