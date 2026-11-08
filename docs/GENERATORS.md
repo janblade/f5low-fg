@@ -129,7 +129,8 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   (NBA 2K27, RTX 5070 Ti, 6x: 4.3-4.8 ms after its frame is done; the stats line logs it). The present lane reads three sets of its
   own, and the game is blocked only while nothing is queued for the presenter and the set is free, so the display never holds the
   game. `auto` turns it on where f5low times every frame itself (no hardware flip metering: RTX 20/30/40, or `FlipMetering=0`). NBA
-  2K27 at 6x, GPU at its limit, metering off: 26.8 -> 29.8-30.1 game fps, p99 frame gap 10.3 -> 7.7 ms, no late generated frames.
+  2K27 at 6x, GPU at its limit, metering off: 26.8 -> 29.8-30.1 game fps, p99 frame gap 10.3 -> 7.7 ms, no late generated frames;
+  with a 116 fps cap: the same rate, spread and latency, no late generated frames (off: 0-6 per 120 app frames).
   Not on by default with metering: there, with the automatic driver pacing, NBA 2K27 ran at 27.7 fps in some runs and sat at 14 in
   others (with `DriverPacing=0`: 30 every run). D3D12 path with our own swap chain and `Gate=0` only.
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
