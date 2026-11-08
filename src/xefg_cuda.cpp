@@ -1674,6 +1674,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         }
         o->genMode = GenQueueSetting();
         o->genPriority = GenPrioritySetting();
+        o->presentNormal = Setting("XEFG_CUDA_PRESENTPRIORITY", "PresentPriority", "high") == "normal";
         o->genSpread = GenSpreadSetting();
         o->noEarly = !EarlySetting();
         o->maxLag = MaxLagSetting();
@@ -1701,6 +1702,23 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 XLog("flip metering: off - no NVIDIA compute device for this adapter");
             else
                 XLog("flip metering: off - this GPU (sm_%d) has no hardware flip metering (GeForce RTX 50 and newer), f5low times every frame itself; FlipMetering=1 forces it", have);
+        }
+        // GenBlock (XEFG_CUDA_GENBLOCK): as DLSS-G on D3D12, a generation thread makes each frame's generated frames at once on the
+        // generation lane as the frame arrives, and the game's queue waits for them (xefg_own.h StartGenAhead): its next frame never
+        // runs ahead of our passes, and a present never waits for a pass (on GPUs that switch to our queue slowly - RTX 20 in a game -
+        // each pass otherwise waited behind the game's next frame). "auto" (default): on where f5low times every frame itself (no
+        // hardware flip metering: RTX 20/30/40, or FlipMetering=0). Not yet with metering: NBA 2K27 on an RTX 5070 Ti with the
+        // automatic driver pacing then sat at 14 fps in some runs (27.7 in others); with DriverPacing=0 it ran 30 fps every run.
+        // "1" on, "0" off. D3D12 path with our own swap chain and Gate=0 only (the stats line says whether it is on).
+        {
+            const std::string gb = Setting("XEFG_CUDA_GENBLOCK", "GenBlock", "auto");
+            const bool on = gb == "1" || gb == "on" || gb == "true" || gb == "yes";
+            const bool off = gb == "0" || gb == "off" || gb == "false" || gb == "no";
+            if (!on && !off && gb != "auto")
+                XLog("warning: GenBlock=%s is not auto, 0 or 1 (or on/off, true/false, yes/no) - taken as auto", gb.c_str());
+            o->genBlock = on || (!off && !o->flipMetering);
+            // What a context then does (on, or off and why) is logged when its presenter starts (xefg_own.h StartGenAhead).
+            XLog("GenBlock=%s: %s", gb.c_str(), o->genBlock ? "wanted" : off ? "off" : "off (flip metering is on for this GPU)");
         }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
