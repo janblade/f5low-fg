@@ -1675,17 +1675,6 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->genMode = GenQueueSetting();
         o->genPriority = GenPrioritySetting();
         o->presentNormal = Setting("XEFG_CUDA_PRESENTPRIORITY", "PresentPriority", "high") == "normal";
-        // GenBlock=1 (XEFG_CUDA_GENBLOCK): as DLSS-G on D3D12, a frame's generated frames are made at once on the generation lane
-        // and the game's queue waits for them, so its next frame never runs ahead of our passes (on GPUs that switch to our
-        // queue slowly - RTX 20 in a game - each pass otherwise waited behind the game's next frame). D3D12 path, Gate=0.
-        o->genBlock = Setting("XEFG_CUDA_GENBLOCK", "GenBlock", "0") == "1";
-        if (o->genBlock)
-        {
-            if (o->genMode == "off")
-                o->genMode = "direct";
-            XLog("GenBlock=1: the frame's generated frames at once on the generation lane (%s), the game's next frame waits for them on the GPU "
-                 "(D3D12 path with our own swap chain and Gate=0 only - the stats line says whether it is on)", o->genMode.c_str());
-        }
         o->genSpread = GenSpreadSetting();
         o->noEarly = !EarlySetting();
         o->maxLag = MaxLagSetting();
@@ -1713,6 +1702,28 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 XLog("flip metering: off - no NVIDIA compute device for this adapter");
             else
                 XLog("flip metering: off - this GPU (sm_%d) has no hardware flip metering (GeForce RTX 50 and newer), f5low times every frame itself; FlipMetering=1 forces it", have);
+        }
+        // GenBlock (XEFG_CUDA_GENBLOCK): as DLSS-G on D3D12, a generation thread makes each frame's generated frames at once on the
+        // generation lane as the frame arrives, and the game's queue waits for them (xefg_own.h StartGenAhead): its next frame never
+        // runs ahead of our passes, and a present never waits for a pass (on GPUs that switch to our queue slowly - RTX 20 in a game -
+        // each pass otherwise waited behind the game's next frame). "auto" (default): on where f5low times every frame itself (no
+        // hardware flip metering: RTX 20/30/40, or FlipMetering=0). Not yet with metering: NBA 2K27 on an RTX 5070 Ti with the
+        // automatic driver pacing then sat at 14 fps in some runs (27.7 in others); with DriverPacing=0 it ran 30 fps every run.
+        // "1" on, "0" off. D3D12 path with our own swap chain and Gate=0 only (the stats line says whether it is on).
+        {
+            const std::string gb = Setting("XEFG_CUDA_GENBLOCK", "GenBlock", "auto");
+            o->genBlock = gb == "1" || (gb != "0" && !o->flipMetering);
+            if (gb != "0" && gb != "1" && gb != "auto")
+                XLog("warning: GenBlock=%s is not auto, 0 or 1 - taken as auto", gb.c_str());
+            if (o->genBlock)
+            {
+                if (o->genMode == "off")
+                    o->genMode = "direct";
+                XLog("GenBlock=%s: on - the frame's generated frames at once on the generation lane (%s) as it arrives, the game's next frame "
+                     "waits for them on the GPU", gb.c_str(), o->genMode.c_str());
+            }
+            else
+                XLog("GenBlock=%s: off%s", gb.c_str(), gb == "0" ? "" : " (flip metering is on: the driver paces the frames)");
         }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");

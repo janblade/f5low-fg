@@ -122,6 +122,16 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 
 ## Per backend, when it is built (stories A2-A4)
 
+- **own** (`src/xefg_own.h`, D3D12 path): `GenBlock=` in f5low.ini (`XEFG_CUDA_GENBLOCK`): `auto` (default), `1` on, `0` off. On, a
+  generation thread takes each game frame as it arrives and records its copy-in, every pass and cur -> prev at once on the generation
+  lane (`GenQueue=direct` unless set), then releases a wait the game's queue got at its Present: the game's next frame starts after our
+  passes, never alongside them, and a present only copies a frame that is already done. The game waits for the passes' GPU time only
+  (NBA 2K27, RTX 5070 Ti, 6x: 4.3-4.8 ms after its frame is done; the stats line logs it). The present lane reads three sets of its
+  own, and the game is blocked only while nothing is queued for the presenter and the set is free, so the display never holds the
+  game. `auto` turns it on where f5low times every frame itself (no hardware flip metering: RTX 20/30/40, or `FlipMetering=0`). NBA
+  2K27 at 6x, GPU at its limit, metering off: 26.8 -> 29.8-30.1 game fps, p99 frame gap 10.3 -> 7.7 ms, no late generated frames.
+  Not on by default with metering: there, with the automatic driver pacing, NBA 2K27 ran at 27.7 fps in some runs and sat at 14 in
+  others (with `DriverPacing=0`: 30 every run). D3D12 path with our own swap chain and `Gate=0` only.
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
   before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say
