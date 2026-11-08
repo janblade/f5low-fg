@@ -3816,6 +3816,39 @@ private:
             return;
         aheadQuit = false;
         aheadPrev = false;
+        // Diagnostics: when each frame's block is released on the GPU, against when the game's frame was done there (readyAt):
+        // what the game's next frame waits at most (stats line).
+        bwQuit = false;
+        blockWatch = std::thread([this] {
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            uint64_t v = blockFence->GetCompletedValue();
+            while (!bwQuit)
+            {
+                const UINT64 done = blockFence->GetCompletedValue();
+                if (done == UINT64_MAX)
+                {
+                    Sleep(50);
+                    continue;
+                }
+                if (done <= v)
+                {
+                    blockFence->SetEventOnCompletion(v + 1, ev);
+                    WaitForSingleObject(ev, 50);
+                    continue;
+                }
+                v = done;
+                const uint64_t f = v - 1;           // frame f's block: value f + 1
+                const long long now = Now();
+                if (readyCount.load() > f && readyCount.load() - f <= kReady)
+                {
+                    const long long d = now - readyAt[f % kReady];
+                    statBlockGpuUs += static_cast<uint64_t>(std::max(0LL, d) * 1000000 / static_cast<long long>(freq()));
+                    statBlockGpuMaxUs = std::max<uint64_t>(statBlockGpuMaxUs.load(), static_cast<uint64_t>(std::max(0LL, d) * 1000000 / static_cast<long long>(freq())));
+                    ++statBlockGpuN;
+                }
+            }
+            CloseHandle(ev);
+        });
         genner = std::thread([this] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             for (;;)
@@ -3859,6 +3892,9 @@ private:
         }
         pcv.notify_all();
         genner.join();      // what it had is in pjobs now: the presenter shows it before it quits
+        bwQuit = true;
+        if (blockWatch.joinable())
+            blockWatch.join();
     }
 
     // Generation thread: frame j's generation, all of it, as soon as it arrives (see StartGenAhead). Not generating: its
@@ -3940,6 +3976,8 @@ private:
             j.preDone[nGen] = EndGen();
         }
         BlockDone(j, genQueue);             // the game's next frame may start: every pass is in
+        statAheadCpuUs += static_cast<uint64_t>(std::max(0LL, Now() - j.arrive) * 1000000 / static_cast<long long>(freq()));
+        ++statAheadCpuN;
         aheadPrev = true;
         aheadJitter[0] = j.jitter[0];
         aheadJitter[1] = j.jitter[1];
@@ -4298,6 +4336,14 @@ private:
             XLog("stats: GenBlock %s, the game's next frame waited for our passes %llu times, %llu not (the presenter behind, or the set still being shown)",
                  ahead ? "on (generation ahead)" : "off (needs the generation lane on the D3D12 path, our own swap chain, Gate=0)",
                  static_cast<unsigned long long>(statBlocked.exchange(0)), static_cast<unsigned long long>(statBlockSkipped.exchange(0)));
+            if (ahead)
+            {
+                const uint64_t n = statBlockGpuN.exchange(0), cn = statAheadCpuN.exchange(0);
+                const uint64_t us = statBlockGpuUs.exchange(0), mx = statBlockGpuMaxUs.exchange(0), cus = statAheadCpuUs.exchange(0);
+                XLog("stats: GenBlock release %.2f ms after the game's frame was done on the GPU (max %.2f; %llu frames), passes submitted "
+                     "%.2f ms after the game's Present",
+                     n ? us / 1000.0 / n : 0.0, mx / 1000.0, static_cast<unsigned long long>(n), cn ? cus / 1000.0 / cn : 0.0);
+            }
         }
         std::lock_guard<std::mutex> clk(clkMu);
         if (statRels)
@@ -5073,7 +5119,10 @@ private:
     ID3D12Fence* blockFence = nullptr;
     ID3D12Fence* aheadRead = nullptr;       // GenBlock: the present lane finished frame f's presents (read its set) at f + 1
     UINT64 blockSent = 0;
-    std::atomic<uint64_t> statBlocked { 0 }, statBlockSkipped { 0 };     // counted on the game's thread, read by Stats
+    std::atomic<uint64_t> statBlocked { 0 }, statBlockSkipped { 0 };
+    std::atomic<uint64_t> statBlockGpuUs { 0 }, statBlockGpuMaxUs { 0 }, statBlockGpuN { 0 }, statAheadCpuUs { 0 }, statAheadCpuN { 0 };
+    std::thread blockWatch;                 // GenBlock diagnostics (StartGenAhead)
+    std::atomic<bool> bwQuit { false };     // counted on the game's thread, read by Stats
     ID3D12Fence* retireFence = nullptr;     // frame f and its generated frames done on the GPU: f + 1
     HANDLE retireEvent = nullptr;
     HANDLE gpuEvent = nullptr;              // presenter: GPU waits (WaitGpu)
