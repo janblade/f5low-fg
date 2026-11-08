@@ -628,7 +628,7 @@ public:
             CloseHandle(tagEvent);
         ReleaseStaging();
         ReleaseRing();
-        for (IUnknown* u : std::initializer_list<IUnknown*> { appFence, consumedFence, blockFence, idleFence, retireFence, tagBuf,
+        for (IUnknown* u : std::initializer_list<IUnknown*> { appFence, consumedFence, blockFence, aheadRead, idleFence, retireFence, tagBuf,
                                                              genList, genFence, genQueue, convRs, convPso })
             if (u)
                 u->Release();
@@ -908,6 +908,7 @@ public:
             FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&appFence))) ||
             FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&consumedFence))) ||
             FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&blockFence))) ||
+            FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&aheadRead))) ||
             FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&idleFence))) ||
             FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&retireFence))))
             return false;
@@ -1383,14 +1384,14 @@ public:
         {
             // Bounded latency: at most appJobs frames wait for the presenter.
             std::unique_lock<std::mutex> l(pm);
-            pcv.wait(l, [this] { return pjobs.size() < appJobs || pQuit; });
-            // GenBlock: the game's next frame waits on the GPU for this frame's passes - only when the presenter has nothing else
-            // queued (it takes this frame next); behind, the frame goes unblocked (as DLSS-G skips). The passes are recorded when the
-            // presenter takes the frame, after the previous batch's paced presents, so the wait lasts up to one app frame of our
-            // pacing plus the passes (NBA 2K27 GPU-bound: 25.0 -> 24.4 fps).
-            if (GenBlocks() && j.usable && !pQuit)
+            pcv.wait(l, [this] { return pjobs.size() + gjobs.size() + (gBusy ? 1 : 0) < appJobs || pQuit; });
+            // GenBlock: the game's next frame waits on the GPU for this frame's passes, which the generation thread records as soon as
+            // it takes the frame (GenAhead), so the wait is the passes' GPU time, not our pacing. Only when nothing is queued for the
+            // presenter: behind, this frame's passes would wait for the present lane to read its set (aheadRead) and the frame goes
+            // unblocked (as DLSS-G skips).
+            if (ahead && j.usable && !pQuit)
             {
-                if (pjobs.empty())
+                if (pjobs.empty() && gjobs.empty() && !gBusy)
                 {
                     appQueue->Wait(blockFence, j.frame + 1);
                     ++statBlocked;
@@ -1398,7 +1399,7 @@ public:
                 else
                     ++statBlockSkipped;
             }
-            pjobs.push_back(j);
+            (ahead ? gjobs : pjobs).push_back(j);
         }
         pcv.notify_all();
         QueryPerformanceCounter(&t2);
@@ -1556,6 +1557,10 @@ private:
         uint32_t presentId = 0;             // the game's frame id (xefgSwapChainSetPresentId), for RealPresent's markers
         long long arrive = 0;               // QPC of the application's Present
         Conversion conv[2];                 // motion, depth: converted from their raw copy (ConvertIn)
+        // GenBlock (GenAhead): generated already on the generation thread, into ringG[frame & 1] and gateHeld[frame & 1]
+        bool pre = false;
+        uint32_t preN = 0;                  // its generated frames
+        UINT64 preDone[kMaxInterp + 1] {};  // genFence: generated frame k done at preDone[k - 1]; the own picture and cur -> prev at preDone[preN]
     };
 
     // An application frame whose inputs are taken and whose generation has started (Submit), for Show.
@@ -1729,6 +1734,7 @@ private:
         });
         StartGate();
         pQuit = false;
+        StartGenAhead();
         presenter = std::thread([this] {
             // As the pacers of DLSS-G, AMD's FSR FG and the unlocker run theirs: a release must not wait for the scheduler.
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -1765,12 +1771,13 @@ private:
     void DrainPresenter()
     {
         std::unique_lock<std::mutex> l(pm);
-        pcv.wait(l, [this] { return (pjobs.empty() && !pBusy) || !presenter.joinable(); });
+        pcv.wait(l, [this] { return (pjobs.empty() && gjobs.empty() && !gBusy && !pBusy) || !presenter.joinable(); });
     }
     void StopPresenter()
     {
         if (!presenter.joinable())
             return;
+        StopGenAhead();     // first: it hands what it still has to the presenter
         {
             std::lock_guard<std::mutex> l(pm);
             pQuit = true;
@@ -1791,6 +1798,8 @@ private:
             consumedFence->Signal(appFrame);
         if (blockFence && appFrame > blockSent)
             blockFence->Signal(blockSent = appFrame);
+        if (aheadRead)
+            aheadRead->Signal(appFrame);
         if (retireFence)
             retireFence->Signal(appFrame);
     }
@@ -2040,7 +2049,10 @@ private:
     void Present(const Job& j)
     {
         PresentPaths(j);
-        BlockDone(j, queue);            // any path without the passes (not generating, gated, early): released now
+        if (ahead)
+            queue->Signal(aheadRead, j.frame + 1);  // GenAhead: the present lane is done reading this frame's set
+        else
+            BlockDone(j, queue);        // any path without the passes (not generating, gated, early): released now
     }
     void PresentPaths(const Job& j)
     {
@@ -2071,6 +2083,12 @@ private:
             return;
         }
         Pick(j);
+        if (j.pre)
+        {
+            clkLast = 0;                    // the generation lane keeps the schedule, as PresentGen
+            PresentAhead(j);
+            return;
+        }
         ID3D12Resource* bb = appBufs[j.bb];
         if (j.usable && genQueue && pq)
         {
@@ -3779,6 +3797,188 @@ private:
         Stats(j, nGen);
     }
 
+    // ---- GenBlock: generation ahead of the presenter ----------------------------------------------------------------------------
+    // The game's frame goes to the generation thread first, which at once records its inputs' copy, every pass of the frame
+    // and cur -> prev on the generation lane, then releases the game's next frame (blockFence) behind them: the game waits
+    // for the passes' GPU time only, never for our pacing of the frame before (the first GenBlock recorded the passes when
+    // the presenter took the frame, after the previous batch's paced presents: NBA 2K27 with RTX 50 metering, 20.3 -> 17.2
+    // fps). What the present lane reads is by parity (ringG[set], gateHeld[set]); the generation lane rewrites a set only once
+    // the present lane is done with the frame two before (aheadRead). The presenter only waits, copies and presents
+    // (PresentAhead).
+    void StartGenAhead()
+    {
+        ahead = GenBlocks();
+        if (!ahead)
+            return;
+        aheadQuit = false;
+        aheadPrev = false;
+        genner = std::thread([this] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            for (;;)
+            {
+                Job j;
+                {
+                    std::unique_lock<std::mutex> l(pm);
+                    pcv.wait(l, [this] { return aheadQuit || !gjobs.empty(); });
+                    if (gjobs.empty())
+                        return;             // quitting with nothing left
+                    j = gjobs.front();
+                    gjobs.pop_front();
+                    gBusy = true;
+                }
+                if (resizePending && j.frame >= resizeFrame)
+                {
+                    // The rebuild frees the sets the presenter may still read: only once it showed every frame before this one.
+                    {
+                        std::unique_lock<std::mutex> l(pm);
+                        pcv.wait(l, [this] { return (pjobs.empty() && !pBusy) || pQuit; });
+                    }
+                    RebuildForSizes("generation thread");
+                }
+                GenAhead(j);
+                {
+                    std::lock_guard<std::mutex> l(pm);
+                    pjobs.push_back(j);
+                    gBusy = false;
+                }
+                pcv.notify_all();
+            }
+        });
+    }
+    void StopGenAhead()
+    {
+        if (!genner.joinable())
+            return;
+        {
+            std::lock_guard<std::mutex> l(pm);
+            aheadQuit = true;
+        }
+        pcv.notify_all();
+        genner.join();      // what it had is in pjobs now: the presenter shows it before it quits
+    }
+
+    // Generation thread: frame j's generation, all of it, as soon as it arrives (see StartGenAhead). Not generating: its
+    // history ends here, and the presenter shows the frame as it is.
+    void GenAhead(Job& j)
+    {
+        if (!j.usable)
+        {
+            aheadPrev = false;
+            return;
+        }
+        std::optional<GenScope> cuda;
+        if (!deferBusy.load(std::memory_order_acquire))
+            cuda.emplace(*pg);
+        const uint32_t set = static_cast<uint32_t>(j.frame & 1);
+        const bool gen = aheadPrev && !j.reset;
+        uint32_t nGen = !gen ? 0 : j.passes ? j.nInterp : 1;
+        // Every buffer first, so a pass is never prepared for a count that then shrinks.
+        const bool bufs = gateHeld[set] || (gateHeld[set] = PlainBuffer(pg->Buf(GenSlot::Cur).bytes)) != nullptr;
+        for (uint32_t k = 1; bufs && k <= nGen && !j.cut; ++k)
+            if (!ringG[set][k - 1] && !(ringG[set][k - 1] = PlainBuffer(pg->Buf(GenSlot::Output).bytes, true)))
+            {
+                nGen = k - 1;               // as many as have a buffer
+                break;
+            }
+        if (!bufs)
+        {
+            if (!aheadNoBuf)
+                XLog("GenBlock: no buffer for the frame's own picture - these frames are shown without generated ones");
+            aheadNoBuf = true;
+            j.usable = false;
+            aheadPrev = false;
+            BlockDone(j, genQueue);         // its wait was queued at the push
+            return;
+        }
+        ID3D12Resource* bb = appBufs[j.bb];
+        genQueue->Wait(appFence, j.frame + 1);
+        ID3D12Resource* realSrc;
+        {
+            ID3D12GraphicsCommandList* g = BeginGen();
+            realSrc = CopyFrame(g, j, bb);
+            EndGen();
+        }
+        Consumed(j, genQueue);
+        // This set was last read by the frame two before (its presents). The game is not held by this: the push blocks only when
+        // nothing is queued for the presenter, so that frame's presents are submitted already.
+        if (j.frame >= 2)
+            genQueue->Wait(aheadRead, j.frame - 1);
+        {
+            ID3D12GraphicsCommandList* g = BeginGen();
+            Out(g, realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            g->CopyBufferRegion(gateHeld[set], 0, realSrc, 0, pg->Buf(GenSlot::Cur).bytes);
+            Back(g, realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            EndGen();
+        }
+        if (nGen != lastNGen)
+        {
+            XLog("present: %u generated frame(s) per app frame (numInterp %u, max %u, pack %s the per-pass patches)", nGen, numInterp,
+                 maxInterp, j.passes ? "has" : "LACKS - run tools/pack_add_patches.py on it");
+            lastNGen = nGen;
+        }
+        float mvs[2] = { j.mvs[0], j.mvs[1] };
+        if (mvs[0] == 0 && mvs[1] == 0)
+            pg->MvScale(mvs[0], mvs[1]);
+        for (uint32_t k = 1; k <= nGen && !j.cut; ++k)
+        {
+            const float jc[2] = { j.jitter[0], j.jitter[1] };
+            const float jp[2] = { aheadJitter[0], aheadJitter[1] };
+            pg->PreparePass(k, nGen, jc, jp, mvs);
+            ID3D12GraphicsCommandList* g = BeginGen();
+            RecordPassInto(g, k, ringG[set][k - 1]);
+            j.preDone[k - 1] = EndGen();
+            // no DumpOnce here: it waits for every queue (WaitIdle), the presenter's included
+        }
+        {
+            // cur -> prev for the next frame, once every pass read them; after the own picture's copy.
+            ID3D12GraphicsCommandList* g = BeginGen();
+            CopyToPrev(g);
+            j.preDone[nGen] = EndGen();
+        }
+        BlockDone(j, genQueue);             // the game's next frame may start: every pass is in
+        aheadPrev = true;
+        aheadJitter[0] = j.jitter[0];
+        aheadJitter[1] = j.jitter[1];
+        j.preN = nGen;
+        j.pre = true;
+    }
+
+    // Presenter: a frame GenAhead generated - each generated frame, then the app's own, copied into the swap chain and presented
+    // at its time (PresentGen's presents, reading the frame's set).
+    void PresentAhead(const Job& j)
+    {
+        const Resource& ox = pg->Output();
+        const uint32_t set = static_cast<uint32_t>(j.frame & 1);
+        const uint32_t nGen = j.preN;
+        ID3D12Resource* frame = gateHeld[set];
+        for (uint32_t k = 1; k <= nGen + 1; ++k)
+        {
+            const bool app = k > nGen;
+            // a camera cut puts the app's frame in the generated frames' places (as Intel copies it into its output)
+            ID3D12Resource* src = !app ? (j.cut ? frame : ringG[set][k - 1]) : j.dbgOnly && nGen && !j.cut ? ringG[set][nGen - 1] : frame;
+            queue->Wait(genFence, j.preDone[app || j.cut ? nGen : k - 1]);
+            ID3D12Resource* rb = RealBuffer();
+            ID3D12GraphicsCommandList* g = Begin();
+            Barrier(g, rb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+            Out(g, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (app || j.cut)
+                Copy(g, rb, src, ox, true);
+            else
+                CopyGenerated(g, rb, src, frame, ox);
+            Back(g, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (!app && j.dbgTag)
+                DrawTags(g, rb, ox);
+            Barrier(g, rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+            End();
+            rb->Release();
+            PresentReal(j, k, nGen, j.sync, app ? j.flags : j.flags & DXGI_PRESENT_ALLOW_TEARING);
+            if (!app && (++genCount == 1 || genCount % 600 == 0))
+                XLog("present: %u frames generated", genCount);
+        }
+        queue->Signal(retireFence, j.frame + 1);
+        Stats(j, nGen);
+    }
+
     // Gate=1 on the D3D12 path: PresentGen's generation on the generation lane, the presents behind the gate on the present
     // lane (ShowGated's rules). The CUDA path in NBA 2K27 left the compositor without the GPU for 15-20 ms each game frame
     // (30% not shown; run F on this path: 1.5%). What the present lane reads is per parity (ringG[set], gateHeld[set]); the
@@ -4079,7 +4279,7 @@ private:
         if (genBlock)
         {
             XLog("stats: GenBlock %s, the game's next frame waited for our passes %llu times, %llu not (the presenter was behind)",
-                 GenBlocks() ? "on" : "off (needs the generation lane on the D3D12 path, Gate=0)",
+                 ahead ? "on (generation ahead)" : "off (needs the generation lane on the D3D12 path, our own swap chain, Gate=0)",
                  static_cast<unsigned long long>(statBlocked.exchange(0)), static_cast<unsigned long long>(statBlockSkipped.exchange(0)));
         }
         std::lock_guard<std::mutex> clk(clkMu);
@@ -4160,7 +4360,7 @@ private:
         }
         ReleaseStaging();
         ReleaseRing();
-        hasPrev = lastUsable = false;
+        hasPrev = lastUsable = aheadPrev = false;
     }
 
     // The new pack is built: the staging sets the application's tags land in, sized by its buffers.
@@ -4811,7 +5011,7 @@ private:
     void ReadStamps(size_t i) { pg->ReadStamps(i); }
 
     uint32_t genCount = 0;
-    uint32_t lastNGen = ~0u;
+    std::atomic<uint32_t> lastNGen { ~0u };    // the generation thread writes it with GenBlock (GenAhead), the presenter reads it
     std::string packDir;
     IPackGenerator* pg = nullptr;       // generator->AsPack(): the pack surface the host drives (own is the only one that runs)
     std::unique_ptr<IGenerator> generator;  // the frame generator (generators/own.h unless another is chosen and available)
@@ -4854,6 +5054,7 @@ private:
     // the presenting queue is blocked until frame generation completes). Every frame a wait was queued for is signalled (Present,
     // StopPresenter); blockSent is the presenter's last value, the fence never goes back.
     ID3D12Fence* blockFence = nullptr;
+    ID3D12Fence* aheadRead = nullptr;       // GenBlock: the present lane finished frame f's presents (read its set) at f + 1
     UINT64 blockSent = 0;
     std::atomic<uint64_t> statBlocked { 0 }, statBlockSkipped { 0 };     // counted on the game's thread, read by Stats
     ID3D12Fence* retireFence = nullptr;     // frame f and its generated frames done on the GPU: f + 1
@@ -4893,6 +5094,14 @@ private:
     std::condition_variable pcv;
     std::deque<Job> pjobs;
     bool pBusy = false, pQuit = false;
+    // GenBlock: the generation thread (GenAhead) - the game's frames go to it first (gjobs, under pm), then to the presenter.
+    std::thread genner;
+    std::deque<Job> gjobs;
+    bool gBusy = false, aheadQuit = false;
+    bool ahead = false;                     // set at StartPresenter (GenBlocks()), fixed while the presenter runs
+    bool aheadPrev = false;                 // the generation thread's own hasPrev / prevJitter (the presenter's are not its to share)
+    float aheadJitter[2] {};
+    bool aheadNoBuf = false;
     Frame early;                            // presenter: the next app frame, taken while this one waited (Early)
 
     // Set by the presenter thread after a rebuild (RebuildForSizes), read under mu by the application's threads.
