@@ -1387,11 +1387,11 @@ public:
             pcv.wait(l, [this] { return pjobs.size() + gjobs.size() + (gBusy ? 1 : 0) < appJobs || pQuit; });
             // GenBlock: the game's next frame waits on the GPU for this frame's passes, which the generation thread records as soon as
             // it takes the frame (GenAhead), so the wait is the passes' GPU time, not our pacing. Only when nothing is queued for the
-            // presenter: behind, this frame's passes would wait for the present lane to read its set (aheadRead) and the frame goes
+            // presenter and its set is free on the GPU: else its passes would wait for the present lane (aheadRead), and the frame goes
             // unblocked (as DLSS-G skips).
             if (ahead && j.usable && !pQuit)
             {
-                if (pjobs.empty() && gjobs.empty() && !gBusy)
+                if (pjobs.empty() && gjobs.empty() && !gBusy && AheadSetFree(j.frame))
                 {
                     appQueue->Wait(blockFence, j.frame + 1);
                     ++statBlocked;
@@ -3802,9 +3802,13 @@ private:
     // and cur -> prev on the generation lane, then releases the game's next frame (blockFence) behind them: the game waits
     // for the passes' GPU time only, never for our pacing of the frame before (the first GenBlock recorded the passes when
     // the presenter took the frame, after the previous batch's paced presents: NBA 2K27 with RTX 50 metering, 20.3 -> 17.2
-    // fps). What the present lane reads is by parity (ringG[set], gateHeld[set]); the generation lane rewrites a set only once
-    // the present lane is done with the frame two before (aheadRead). The presenter only waits, copies and presents
-    // (PresentAhead).
+    // fps). What the present lane reads is in sets of its own (aheadRing[set], aheadHeld[set], frame % kAheadSets); the generation
+    // lane rewrites a set only once the present lane is done with the frame kAheadSets before (aheadRead). Three, not two: with
+    // RTX 50 flip metering a frame's presents are done on the GPU only when the driver lets its last flip go, and with two the
+    // game's next frame waited for that - its rate then held our present spacing and ours its rate, and NBA 2K27 stayed at 14
+    // fps (run K3; K1, same build, 25). The push also blocks only when the set is free already (AheadSetFree), so the display
+    // never holds the game. The presenter only waits, copies and presents (PresentAhead).
+    bool AheadSetFree(uint64_t frame) const { return frame < kAheadSets || aheadRead->GetCompletedValue() >= frame - kAheadSets + 1; }
     void StartGenAhead()
     {
         ahead = GenBlocks();
@@ -3869,13 +3873,13 @@ private:
         std::optional<GenScope> cuda;
         if (!deferBusy.load(std::memory_order_acquire))
             cuda.emplace(*pg);
-        const uint32_t set = static_cast<uint32_t>(j.frame & 1);
+        const uint32_t set = static_cast<uint32_t>(j.frame % kAheadSets);
         const bool gen = aheadPrev && !j.reset;
         uint32_t nGen = !gen ? 0 : j.passes ? j.nInterp : 1;
         // Every buffer first, so a pass is never prepared for a count that then shrinks.
-        const bool bufs = gateHeld[set] || (gateHeld[set] = PlainBuffer(pg->Buf(GenSlot::Cur).bytes)) != nullptr;
+        const bool bufs = aheadHeld[set] || (aheadHeld[set] = PlainBuffer(pg->Buf(GenSlot::Cur).bytes)) != nullptr;
         for (uint32_t k = 1; bufs && k <= nGen && !j.cut; ++k)
-            if (!ringG[set][k - 1] && !(ringG[set][k - 1] = PlainBuffer(pg->Buf(GenSlot::Output).bytes, true)))
+            if (!aheadRing[set][k - 1] && !(aheadRing[set][k - 1] = PlainBuffer(pg->Buf(GenSlot::Output).bytes, true)))
             {
                 nGen = k - 1;               // as many as have a buffer
                 break;
@@ -3899,14 +3903,14 @@ private:
             EndGen();
         }
         Consumed(j, genQueue);
-        // This set was last read by the frame two before (its presents). The game is not held by this: the push blocks only when
-        // nothing is queued for the presenter, so that frame's presents are submitted already.
-        if (j.frame >= 2)
-            genQueue->Wait(aheadRead, j.frame - 1);
+        // This set was last read by the presents of the frame kAheadSets before. The game is not held by those: the push blocks only
+        // when they are done already (AheadSetFree).
+        if (j.frame >= kAheadSets)
+            genQueue->Wait(aheadRead, j.frame - kAheadSets + 1);
         {
             ID3D12GraphicsCommandList* g = BeginGen();
             Out(g, realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g->CopyBufferRegion(gateHeld[set], 0, realSrc, 0, pg->Buf(GenSlot::Cur).bytes);
+            g->CopyBufferRegion(aheadHeld[set], 0, realSrc, 0, pg->Buf(GenSlot::Cur).bytes);
             Back(g, realSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
             EndGen();
         }
@@ -3925,7 +3929,7 @@ private:
             const float jp[2] = { aheadJitter[0], aheadJitter[1] };
             pg->PreparePass(k, nGen, jc, jp, mvs);
             ID3D12GraphicsCommandList* g = BeginGen();
-            RecordPassInto(g, k, ringG[set][k - 1]);
+            RecordPassInto(g, k, aheadRing[set][k - 1]);
             j.preDone[k - 1] = EndGen();
             // no DumpOnce here: it waits for every queue (WaitIdle), the presenter's included
         }
@@ -3948,14 +3952,14 @@ private:
     void PresentAhead(const Job& j)
     {
         const Resource& ox = pg->Output();
-        const uint32_t set = static_cast<uint32_t>(j.frame & 1);
+        const uint32_t set = static_cast<uint32_t>(j.frame % kAheadSets);
         const uint32_t nGen = j.preN;
-        ID3D12Resource* frame = gateHeld[set];
+        ID3D12Resource* frame = aheadHeld[set];
         for (uint32_t k = 1; k <= nGen + 1; ++k)
         {
             const bool app = k > nGen;
             // a camera cut puts the app's frame in the generated frames' places (as Intel copies it into its output)
-            ID3D12Resource* src = !app ? (j.cut ? frame : ringG[set][k - 1]) : j.dbgOnly && nGen && !j.cut ? ringG[set][nGen - 1] : frame;
+            ID3D12Resource* src = !app ? (j.cut ? frame : aheadRing[set][k - 1]) : j.dbgOnly && nGen && !j.cut ? aheadRing[set][nGen - 1] : frame;
             queue->Wait(genFence, j.preDone[app || j.cut ? nGen : k - 1]);
             ID3D12Resource* rb = RealBuffer();
             ID3D12GraphicsCommandList* g = Begin();
@@ -4165,6 +4169,19 @@ private:
                     r->Release();
                 r = nullptr;
             }
+        for (auto& s2 : aheadRing)
+            for (ID3D12Resource*& r : s2)
+            {
+                if (r)
+                    r->Release();
+                r = nullptr;
+            }
+        for (ID3D12Resource*& r : aheadHeld)    // sized as cur
+        {
+            if (r)
+                r->Release();
+            r = nullptr;
+        }
     }
 
     // The frame's inputs are taken: the application's queue may go on (its next frame waits for this), and
@@ -4278,7 +4295,7 @@ private:
             XLog("stats: GPU load %.2f of the app interval, pacing %s, token debt %u", loadEma, PacingText(), tokenDebt.owed);
         if (genBlock)
         {
-            XLog("stats: GenBlock %s, the game's next frame waited for our passes %llu times, %llu not (the presenter was behind)",
+            XLog("stats: GenBlock %s, the game's next frame waited for our passes %llu times, %llu not (the presenter behind, or the set still being shown)",
                  ahead ? "on (generation ahead)" : "off (needs the generation lane on the D3D12 path, our own swap chain, Gate=0)",
                  static_cast<unsigned long long>(statBlocked.exchange(0)), static_cast<unsigned long long>(statBlockSkipped.exchange(0)));
         }
@@ -5102,6 +5119,9 @@ private:
     bool aheadPrev = false;                 // the generation thread's own hasPrev / prevJitter (the presenter's are not its to share)
     float aheadJitter[2] {};
     bool aheadNoBuf = false;
+    static constexpr uint32_t kAheadSets = 3;
+    ID3D12Resource* aheadRing[kAheadSets][kMaxInterp] {};  // generated frames by set (frame % kAheadSets)
+    ID3D12Resource* aheadHeld[kAheadSets] {};               // each frame's own picture by set
     Frame early;                            // presenter: the next app frame, taken while this one waited (Early)
 
     // Set by the presenter thread after a rebuild (RebuildForSizes), read under mu by the application's threads.
