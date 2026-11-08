@@ -1712,18 +1712,13 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         // "1" on, "0" off. D3D12 path with our own swap chain and Gate=0 only (the stats line says whether it is on).
         {
             const std::string gb = Setting("XEFG_CUDA_GENBLOCK", "GenBlock", "auto");
-            o->genBlock = gb == "1" || (gb != "0" && !o->flipMetering);
-            if (gb != "0" && gb != "1" && gb != "auto")
-                XLog("warning: GenBlock=%s is not auto, 0 or 1 - taken as auto", gb.c_str());
-            if (o->genBlock)
-            {
-                if (o->genMode == "off")
-                    o->genMode = "direct";
-                XLog("GenBlock=%s: on - the frame's generated frames at once on the generation lane (%s) as it arrives, the game's next frame "
-                     "waits for them on the GPU", gb.c_str(), o->genMode.c_str());
-            }
-            else
-                XLog("GenBlock=%s: off%s", gb.c_str(), gb == "0" ? "" : " (flip metering is on: the driver paces the frames)");
+            const bool on = gb == "1" || gb == "on" || gb == "true" || gb == "yes";
+            const bool off = gb == "0" || gb == "off" || gb == "false" || gb == "no";
+            if (!on && !off && gb != "auto")
+                XLog("warning: GenBlock=%s is not auto, 0 or 1 (or on/off, true/false, yes/no) - taken as auto", gb.c_str());
+            o->genBlock = on || (!off && !o->flipMetering);
+            // What a context then does (on, or off and why) is logged when its presenter starts (xefg_own.h StartGenAhead).
+            XLog("GenBlock=%s: %s", gb.c_str(), o->genBlock ? "wanted" : off ? "off" : "off (flip metering is on for this GPU)");
         }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
