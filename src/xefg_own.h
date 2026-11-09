@@ -2239,10 +2239,10 @@ private:
             squeeze = pacesched::CompressEarly(n > 0 && !DisplayPaced(j) && !Metered(j) && !Burst(), true);
         }
         // LateGen=auto, timed batch: a generated frame is stale (not presented, no wait) when the game's next frame is finished and its
-        // slot is already past (it would be late anyway) or the presenter was already behind when it took the batch (catchUp). An on-time
-        // frame is never dropped. Same bookkeeping as the drop below, but the dropped frame's slot is the schedule's, so Bound cannot pull
+        // slot is already past (it would be late anyway). An on-time frame is never dropped (a presenter that is behind catches up under the
+        // early-out). Same bookkeeping as the drop below, but the dropped frame's slot is the schedule's, so Bound cannot pull
         // the batch's later frames earlier than the early-out allows. The real frame is never dropped.
-        if (autoTimed && pacesched::AutoStale(gen, GameFrameDone(j, 1), Now() >= target - lead, showing ? showing->catchUp : catchUp))
+        if (autoTimed && pacesched::AutoStale(gen, GameFrameDone(j, 1), Now() >= target - lead))
         {
             ++statDropLate;
             ++statDropStale;

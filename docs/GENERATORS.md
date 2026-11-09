@@ -143,8 +143,8 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   presented yet counts as not finished). Once it is, the frames of the batch still waiting for their slots - the real frame included - stop
   waiting and go out, no sooner than half a step after the last present that went out (so nothing bunches): the picture on the screen is a game
   frame behind and a slot would only make it older. The wait sleeps on the fence and a timer and spins only the last half millisecond. A
-  generated frame is not presented (stale) when the next game frame is finished and its slot is already past, or the presenter was already
-  behind when it took the batch; a frame on time is never dropped. The real frame is never dropped. A GPU timeout drops with or without
+  generated frame is not presented (stale) when the next game frame is finished and its slot is already past; a frame on time is never dropped
+  (a presenter that is behind catches up under the early-out). The real frame is never dropped. A GPU timeout drops with or without
   V-Sync. Host tests: `tests/build_compress_late_test.ps1` (decisions, and a model of a jittered game with the same schedule rules). `show` presents every generated frame on any
   GPU. `drop` (an experiment) adds the time rule: it leaves out a generated frame that is late by more than a step instead of showing it
   (frames up to one step late are still shown), on every GPU. With `drop` a frame is dropped when its GPU work timed out, or a frame that at the moment of its present is more than one step past its time on its own schedule

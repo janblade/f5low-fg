@@ -225,11 +225,12 @@ inline bool DropLate(bool enabled, bool generated, bool gpuOk, bool timed, long 
 // present that went out (CompressAt), so the batch never bunches. The wait for a slot ends here (the caller checks in between).
 inline bool AutoWaitOver(bool nextDone, long long now, long long slot) { return nextDone || now >= slot; }
 // Stale: a GENERATED frame is not presented when the next game frame is finished and the frame would be late anyway (`slotPassed`: its slot
-// is past when the presenter gets to it), or the presenter was already behind when it took the batch (`behindAtPick`: the next game frame was
-// finished before the batch started). A frame that is on time is never dropped: it goes out under the early-out.
-inline bool AutoStale(bool generated, bool nextDone, bool slotPassed, bool behindAtPick)
+// is past when the presenter gets to it). A frame that is on time is never dropped: it goes out under the early-out. A presenter that is
+// behind (the next game frame was finished before the batch started) is not a reason of its own: the early-out releases the rest of the
+// batch at the MinGap floor, and a frame whose slot has passed is dropped by this rule.
+inline bool AutoStale(bool generated, bool nextDone, bool slotPassed)
 {
-    return generated && nextDone && (slotPassed || behindAtPick);
+    return generated && nextDone && slotPassed;
 }
 // How long the wait for a slot spins at its end instead of sleeping (ms): the timer is set to the slot less this.
 constexpr double kAutoSpinMs = 0.5;

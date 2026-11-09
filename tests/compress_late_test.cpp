@@ -27,12 +27,11 @@ int main()
     CHECK(!AutoWaitOver(false, 100, 5000));                         // not finished, or not known: waits for the slot
     CHECK(AutoWaitOver(false, 5000, 5000));
     CHECK(AutoWaitOver(false, 9000, 5000));
-    // auto stale: only a generated frame, with the next game frame finished AND (its slot already past, or the presenter was behind at Pick)
-    CHECK(AutoStale(true, true, true, false));                      // late anyway
-    CHECK(AutoStale(true, true, false, true));                      // behind when it took the batch
-    CHECK(!AutoStale(true, true, false, false));                    // on time: goes out under the early-out, never dropped
-    CHECK(!AutoStale(true, false, true, true));                     // next frame not finished or not known
-    CHECK(!AutoStale(false, true, true, true));                     // the real frame
+    // auto stale: only a generated frame, with the next game frame finished AND its slot already past
+    CHECK(AutoStale(true, true, true));                             // late anyway
+    CHECK(!AutoStale(true, true, false));                           // on time: goes out under the early-out, never dropped
+    CHECK(!AutoStale(true, false, true));                           // next frame not finished or not known
+    CHECK(!AutoStale(false, true, true));                           // the real frame
     // auto is active only without flip metering; its GPU timeout drop does not need a timed batch (V-Sync included), the time rule is off
     CHECK(LateActive(kLateAuto, false) && !LateActive(kLateAuto, true));
     CHECK(DropLate(true, true, false, LateTimeRule(kLateAuto), raw - 500, raw, step));      // timeout, V-Sync (timed false in the caller)
@@ -96,9 +95,12 @@ int main()
     CHECK(CompressDrop(true, false, false, false, false));
 
     // ---- a jittered game through the schedule rules (xefg_own.h PresentReal's, with its smoothing), counting what auto does
-    for (int variant = 0; variant < 2; ++variant)
+    // variant 2: steady 60 fps, the presenter starts one game frame behind (the next frame is already done when the first batch starts)
+    for (int variant = 0; variant < 3; ++variant)
         for (unsigned n : { 1u, 3u, 5u })
         {
+            if (variant == 2 && n == 1)
+                continue;
             const bool ramp = variant == 1;
             std::mt19937 rng(12345 + n + variant * 100);
             std::normal_distribution<double> noise(0.0, 0.10);
@@ -113,8 +115,10 @@ int main()
             }
             ReadyInterval ri;
             long long base = 0, lastAny = 0, lastShown = 0, now = 0;
-            unsigned stale = 0, early = 0, gens = 0, tooClose = 0, presents = 0;
+            unsigned stale = 0, early = 0, gens = 0, tooClose = 0, presents = 0, staleFirst5 = 0, staleAfter5 = 0, earlyFirst5 = 0, lastStaleBatch = 0;
             double lat = 0;
+            if (variant == 2)
+                now = ready[2];
             for (size_t f = 1; f + 2 < ready.size(); ++f)
             {
                 ri.Observe(static_cast<double>(ready[f] - ready[f - 1]) / us);
@@ -122,7 +126,7 @@ int main()
                 base = NextBase(base, ready[f], 0, iv);
                 const long long st = iv / (n + 1);
                 now = std::max(now, ready[f]);                          // the presenter takes the frame once it is done
-                const bool behind = ready[f + 1] <= now;
+                const unsigned stale0 = stale, early0 = early;
                 for (unsigned k = 1; k <= n + 1; ++k)
                 {
                     const bool gen = k <= n;
@@ -130,7 +134,7 @@ int main()
                     const bool nextDone = now >= ready[f + 1];
                     if (gen)
                         ++gens;
-                    if (AutoStale(gen, nextDone, now >= slot, behind))
+                    if (AutoStale(gen, nextDone, now >= slot))
                     {
                         ++stale;
                         lastAny = std::max(lastAny, slot);
@@ -153,11 +157,23 @@ int main()
                     if (k == n + 1)
                         lat += static_cast<double>(at - ready[f]) / us;
                 }
+                if (f <= 5)
+                {
+                    staleFirst5 += stale - stale0;
+                    earlyFirst5 += early - early0;
+                }
+                else
+                    staleAfter5 += stale - stale0;
+                if (stale != stale0)
+                    lastStaleBatch = static_cast<unsigned>(f);
             }
+            if (variant == 2)
+                printf("model behind-at-start 60 fps %ux: stale %u in the first 5 batches (last stale batch %u), %u after; %u early-outs in the first "
+                       "5 batches\n", n + 1, staleFirst5, lastStaleBatch, staleAfter5, earlyFirst5);
             printf("model %s %ux: %u of %u generated frames stale, %u of %u presents released early, %u gaps under the minimum, "
                    "real frame %.2f ms after its ready stamp on average\n", ramp ? "40->60 fps" : "60 fps", n + 1, stale, gens, early, presents,
                    tooClose, lat / 5900.0);
-            CHECK(stale == 0);
+            CHECK(variant == 2 ? staleAfter5 == 0 : stale == 0);   // from a start one frame behind it converges within a few batches
             CHECK(tooClose == 0);
         }
 
