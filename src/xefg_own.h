@@ -486,6 +486,10 @@ public:
     bool gate = false;                          // Gate= in f5low.ini: pace on the GPU (ShowGated / PresentGenGated), with the clock
     bool flipMetering = true;                   // FlipMetering= in f5low.ini, resolved for this GPU at settings time (oob_driver.h FlipMeteringOn); InitFlip decides again and leaves flipFn null when off: gate on flipFn / Metered(), not on this alone
     std::string flipMeteringSetting = "auto";   // FlipMetering= as set: "auto" lets the GPU decide (oob_driver.h FlipMeteringOn, InitFlip)
+    // FixedPacing=timer in f5low.ini: each frame waits for its time even when the game asks for V-Sync. World of Warcraft through
+    // OptiScaler, RTX 40 (no flip metering), 120 Hz VRR panel: with sync 1 the frames still reached the screen as soon as they
+    // were done (2x: displayed 7.3 / 9.7 ms alternating). PresentReal's paths only (Show, PresentAhead, PresentGen); not the gate.
+    bool fixedTimer = false;
     bool oobQueue = false;                      // OobQueue=1 in f5low.ini: tell NVIDIA's driver our queues run out of band (OobNotify)
     bool oobSwitch = false;                     // OobQueue=switch: present type for the app's frame, render type for a generated one (RealPresent)
     bool flipBurst = false;                     // FlipBurst=1 (or DriverPacing=1 or 2) in f5low.ini, Gate=0: the chain made for the burst; a metered batch's presents after the first are released at once while pacingActive (PresentReal)
@@ -5609,10 +5613,6 @@ private:
     ID3D12RootSignature* convRs = nullptr;  // xefg_convert.hlsl
     ID3D12PipelineState* convPso = nullptr;
     bool convFailed = false;
-    // FixedPacing=timer in f5low.ini: each frame waits for its time even when the game asks for V-Sync. World of Warcraft through
-    // OptiScaler, RTX 40 (no flip metering), 120 Hz VRR panel: with sync 1 the frames still reached the screen as soon as they
-    // were done (2x: displayed 7.3 / 9.7 ms alternating). PresentReal's paths only (Show, PresentAhead, PresentGen); not the gate.
-    bool fixedTimer = false;
     bool rawFailed = false;                 // a raw-copy buffer could not be made: conversions stay off (logged once)
     std::atomic<bool> listBroken { false }; // one of our lists failed to close: generation stays off (Submit)
 
