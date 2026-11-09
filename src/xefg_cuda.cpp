@@ -1720,6 +1720,12 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             // What a context then does (on, or off and why) is logged when its presenter starts (xefg_own.h StartGenAhead).
             XLog("GenBlock=%s: %s", gb.c_str(), o->genBlock ? "wanted" : off ? "off" : "off (flip metering is on for this GPU)");
         }
+        // FixedPacing=timer (XEFG_CUDA_FIXEDPACING): each frame keeps its own timing with V-Sync too (xefg_own.h fixedTimer).
+        {
+            o->fixedTimer = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "display") == "timer";
+            if (o->fixedTimer)
+                XLog("FixedPacing=timer: each frame waits for its time even with V-Sync (the display may not pace them; not with Gate=1)");
+        }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
         o->oobQueue = oobQueue == "1";
