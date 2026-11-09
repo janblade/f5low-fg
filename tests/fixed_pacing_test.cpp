@@ -25,14 +25,13 @@ int main()
     CHECK(!FixedTimer(kFixedAuto, false, true, false, false));      // wants metering, InitFlip not run yet: counts as metering on -> display
     CHECK(!FixedTimer(kFixedAuto, false, true, true, true));        // the driver meters -> display
     CHECK(FixedTimer(kFixedAuto, false, true, true, false));        // wanted but the driver path is unusable (InitFlip tried, no call) -> timer
-    // the same condition as PresentReal's meterOff
+    // the same condition as PresentReal's meterOff (MeterOff, the one function both use)
+    CHECK(MeterOff(false, false, false) && MeterOff(false, true, true) && !MeterOff(true, false, false) && !MeterOff(true, true, true) &&
+          MeterOff(true, true, false));
     for (int m = 0; m < 2; ++m)
         for (int t = 0; t < 2; ++t)
             for (int f = 0; f < 2; ++f)
-            {
-                const bool meterOff = !m || (t && !f);
-                CHECK(FixedTimer(kFixedAuto, false, m != 0, t != 0, f != 0) == meterOff);
-            }
+                CHECK(FixedTimer(kFixedAuto, false, m != 0, t != 0, f != 0) == MeterOff(m != 0, t != 0, f != 0));
     // display and timer are fixed whatever the driver does
     for (int m = 0; m < 2; ++m)
         for (int t = 0; t < 2; ++t)

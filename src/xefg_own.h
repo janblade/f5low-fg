@@ -427,7 +427,8 @@ public:
         xellMaxGen = on ? gen : 0;
         xellDisplayDirty = true;
         XLog("xell: frame generation %s for XeLL%s", on ? "on" : "off",
-             !fits && enabled ? " (more generated frames than XeLL takes: it counts the game's own)"
+             xellListBroken && enabled ? " (our GPU work could not be recorded: generation is off until the swap chain is rebuilt)"
+             : !fits && enabled ? " (more generated frames than XeLL takes: it counts the game's own)"
              : !inputsOk && enabled ? " (the tagged motion vectors / depth cannot be used: no frames are generated)" : "");
         if (on)
             XLog("xell: up to %u generated per rendered frame", gen);
@@ -489,7 +490,8 @@ public:
     // FixedPacing= in f5low.ini (pacesched::FixedMode): who spaces the frames when the game asks for V-Sync. On a VRR display below its
     // top refresh rate a V-Sync present is shown as soon as it is ready, so leaving the spacing to the display gave uneven frames
     // (World of Warcraft through OptiScaler, RTX 40 laptop, 120 Hz VRR panel: displayed 7.3 / 9.7 ms alternating at 2x, 8.30-8.43 ms
-    // with the timer). auto = timer where flip metering is off for this context, display where the driver meters. PresentReal's paths
+    // with the timer). auto = timer where flip metering is off for this context (the driver meters nothing under V-Sync, so the
+    // rule keys on the context's metering state, not on V-Sync metering), display otherwise. Real V-Sync only (sync >= 1). PresentReal's paths
     // only (Show, PresentAhead, PresentGen); not the gate. FixedTimer() is the effective choice.
     unsigned char fixedMode = pacesched::kFixedAuto;
     bool FixedTimer() const { return pacesched::FixedTimer(fixedMode, gate, flipMetering, flipTried, flipFn != nullptr); }
@@ -518,7 +520,7 @@ public:
     unsigned testStallMs = 1500;
     int testStallKind = 0;
     std::atomic<bool> testFired { false };
-    unsigned testCloseFail = 0;                     // F5LOW_TEST_CLOSEFAIL / TestCloseFail: the n-th Close of our lists counts as failed (0 = off)
+    unsigned testCloseFail = 0;                     // XEFG_CUDA_TESTCLOSEFAIL / TestCloseFail: the n-th Close of our lists counts as failed (0 = off)
     std::atomic<unsigned> testCloseCount { 0 };
     std::atomic<uint64_t> testFrameNow { 0 };       // the app frame the presenter / generation thread is on (TestStall)
     ID3D12Fence* testFence = nullptr;
@@ -1236,11 +1238,11 @@ public:
     bool Submit(ID3D12CommandQueue* q, ID3D12GraphicsCommandList* l, const char* what)
     {
         HRESULT hr = l->Close();
-        // Diagnostics (TestCloseFail, F5LOW_TEST_CLOSEFAIL=<n>): the n-th Close of one of our lists counts as failed. The list is closed
+        // Diagnostics (TestCloseFail, XEFG_CUDA_TESTCLOSEFAIL=<n>): the n-th Close of one of our lists counts as failed. The list is closed
         // for real (so it can be Reset as usual) and then left out, as a failed one is.
         if (testCloseFail && SUCCEEDED(hr) && ++testCloseCount == testCloseFail)
         {
-            XLog("TestCloseFail: Close number %u of our lists (%s) is treated as failed (diagnostics, F5LOW_TEST_CLOSEFAIL)", testCloseFail, what);
+            XLog("TestCloseFail: Close number %u of our lists (%s) is treated as failed (diagnostics, XEFG_CUDA_TESTCLOSEFAIL)", testCloseFail, what);
             hr = E_FAIL;
         }
         if (FAILED(hr))
@@ -1259,13 +1261,60 @@ public:
         Removed(what);
         return true;
     }
-    // Generation is "off for good" after a failed list (a recording error repeats, so no timed retry) - until the swap chain is rebuilt:
-    // ResizeBuffers or RebuildForSizes succeeded. The presenter (Present) tells XeLL again by the existing path (XellSync) when it sees
-    // listBroken differ from xellListBroken.
+    // Generation is "off for good" after a failed list (a recording error repeats, so no timed retry) - until the swap chain changes: a
+    // ResizeBuffers on the real chain succeeded (Resize; a new chain is a new context). Not on a pack rebuild (RebuildForSizes also runs
+    // for a render-size change, dynamic resolution). Resize drains the presenter and the generation thread first, so no frame recorded
+    // before the failure can still be presented (PresentAhead) when it is cleared. At most kListBrokenRearms times per context, then it
+    // stays off. The presenter (Present) tells XeLL again by the existing path (XellSync) when it sees listBroken differ from xellListBroken.
+    static constexpr unsigned kListBrokenRearms = 3;
+    unsigned listBrokenRearms = 0;
     void ClearListBroken()
     {
-        if (listBroken.exchange(false))
-            XLog("generation back on after the swap chain was rebuilt");
+        if (!listBroken.load(std::memory_order_relaxed))
+            return;
+        if (listBrokenRearms >= kListBrokenRearms)
+        {
+            if (listBrokenRearms++ == kListBrokenRearms)
+                XLog("generation stays off: our GPU work failed to record again after %u swap chain rebuilds", kListBrokenRearms);
+            return;
+        }
+        ++listBrokenRearms;
+        listBroken.store(false);
+        XLog("generation back on after the swap chain was rebuilt (%u of %u)", listBrokenRearms, kListBrokenRearms);
+        NoteShownAgain();
+    }
+    // Frames not presented because our recording broke (a frozen picture): counted, logged once a second while it goes on and with the
+    // total when presenting resumes (NoteShownAgain). Presenter and generation thread both call.
+    std::mutex notShownMu;
+    std::atomic<unsigned> notShownRun { 0 };
+    unsigned notShownTotal = 0, notShownWindow = 0;
+    long long notShownT = 0;
+    void NoteNotPresented()
+    {
+        std::lock_guard<std::mutex> l(notShownMu);
+        ++notShownRun;
+        ++notShownTotal;
+        ++notShownWindow;
+        const long long t = Now();
+        if (!notShownT)
+            notShownT = t;
+        if (t - notShownT >= freq())
+        {
+            XLog("after a failed list: %u frame(s) not presented in the last second (%u in a row so far, %u in all) - the picture is frozen "
+                 "until the swap chain is rebuilt", notShownWindow, notShownRun.load(), notShownTotal);
+            notShownWindow = 0;
+            notShownT = t;
+        }
+    }
+    void NoteShownAgain()
+    {
+        if (!notShownRun.load())
+            return;
+        std::lock_guard<std::mutex> l(notShownMu);
+        XLog("presenting again after %u frame(s) not presented (%u in all since the list failed)", notShownRun.load(), notShownTotal);
+        notShownRun = 0;
+        notShownWindow = 0;
+        notShownT = 0;
     }
     // The first time the device is seen removed, where (after which of our submissions, or at which call).
     void Removed(const char* where)
@@ -2226,19 +2275,26 @@ private:
     }
     // A generated frame the caller leaves out because our recording broke (listBroken, or its own list failed to close): the same
     // bookkeeping as PresentReal's drops - the batch's flip metering is still declared (k == 1), the slot stays the last present's time
-    // (lastAnyPresent) and the clock gets catch-up (lastRelease), the pace log records it as dropped. Not counted as a timeout.
+    // (lastAnyPresent) and the clock gets catch-up (lastRelease), the pace log records it as dropped. Counted apart (statListSkips), not as
+    // a late drop or a timeout. The frame's target is the schedule's, as PresentReal would have worked it out (Target on the frame's
+    // own schedule in Show, PaceTarget on the lanes); a frame on the clock pacer (showing->clock) has no target that can be read without
+    // advancing the clock's state (ClockTarget), so there it is Now().
     void SkipGenerated(const Job& j, uint32_t k, uint32_t n)
     {
         if (k == 1)
             Meter(j, n);
-        ++statDropLate;
-        statDropFirst += k == 1;
+        ++statListSkips;
         const long long t = Now();
+        long long target = 0;
+        if (n > 0 && !(showing && showing->clock))
+            target = showing ? Target(*showing, k) : PaceTarget(k, n);
+        if (!target)
+            target = t;
         lastRealRelease = t;
-        lastRelease = t;
-        lastAnyPresent = std::max(lastAnyPresent, t);
+        lastRelease = target;
+        lastAnyPresent = std::max(lastAnyPresent, target);
         if (paceLog)
-            PaceRecord(t, showing ? showing->ready : jobBase, t, j.frame, k, n + 1, kPaceDropped);
+            PaceRecord(t, showing ? showing->ready : jobBase, target, j.frame, k, n + 1, kPaceDropped);
     }
     // target: worked out by the caller beforehand (Show, before Early moves the timeline on), else here. Returns how
     // many ms our GPU work held the frame past its target (0 if it was done in time).
@@ -2254,7 +2310,8 @@ private:
         }
         if (!rawTarget)
             rawTarget = target;
-        const bool paced = n > 0 && (!DisplayPaced(j) || FixedTimer());
+        // FixedPacing=timer: only a real V-Sync present (sync interval >= 1); sync 0 with other flags (DO_NOT_WAIT) stays display paced.
+        const bool paced = n > 0 && (!DisplayPaced(j) || (j.sync != 0 && FixedTimer()));
         // The time rules of LateGen (auto, drop, compress) key on !DisplayPaced(j), not on `paced`: V-Sync keeps them off even if `paced` is
         // ever turned on under V-Sync (a fixed timer pacing option).
         // The burst (DriverPacing / FlipBurst): a metered batch's presents after the first are not waited for (lastRelease below keeps
@@ -2271,7 +2328,7 @@ private:
         // driver path turned out unusable (InitFlip tried and left flipFn null - never metered, whatever the settings); the batch is then not
         // metered either (`metered` false), and a batch the driver does meter keeps its pacing. A batch on the clock pacer (CUDA path,
         // showing->clock) keeps it too: its release times feed the clock's correction.
-        const bool meterOff = !flipMetering || (flipTried && !flipFn);
+        const bool meterOff = pacesched::MeterOff(flipMetering, flipTried, flipFn != nullptr);
         const bool gen = n > 0 && k <= n;
         const bool autoTimed = pacesched::LateNextFrame(lateMode) && meterOff && n > 0 && !DisplayPaced(j) && !metered && !(showing && showing->clock);
         if (gen)
@@ -2571,9 +2628,12 @@ private:
             hasPrev = false;
             if (closed)
             {
+                NoteShownAgain();
                 GateWait(f, 1, 0);
                 LanePresent(f, 1, j.sync, j.flags);
             }
+            else
+                NoteNotPresented();
             queue->Signal(retireFence, j.frame + 1);
             Stats(j, 0);
             return;
@@ -2595,7 +2655,12 @@ private:
             Consumed(j);
             hasPrev = false;
             if (closed)
+            {
+                NoteShownAgain();
                 PresentReal(j, 1, 0, j.sync, j.flags);
+            }
+            else
+                NoteNotPresented();
             clkLast = 0;                    // off the clock: set it anew (ClockTarget)
             paceLag *= 0.98;                // falls while nothing is generated too (Show)
             queue->Signal(retireFence, j.frame + 1);
@@ -2896,7 +2961,7 @@ private:
                 XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released %s%u us early",
                      flipLeadAuto ? "up to " : "", flipLeadUs);
             if (fixedMode == pacesched::kFixedAuto && !gate)
-                XLog("FixedPacing=auto: display (the driver meters flips; with V-Sync the display spaces the frames)");
+                XLog("FixedPacing=auto: display (this context uses flip metering; with V-Sync the display spaces the frames)");
             if (flipBurst && !BurstCapable())
                 XLog("burst: off for this swap chain (it is not the one we made, or presents on the game's queue)");
         }
@@ -3630,6 +3695,8 @@ private:
         Early();
         if (realShown)
             PresentReal(j, nGen + 1, nGen, j.sync, j.flags, f.clock ? ClockTarget(f, nGen + 1) : nGen ? Target(f, nGen + 1) : 0);
+        else
+            NoteNotPresented();
         clkLast = f.clock ? lastRelease : 0;  // a frame off the clock sets it anew
         if (f.clock)
             ClockAfter(f, firstRelease);
@@ -3654,6 +3721,7 @@ private:
         showing = &f;
         const Job& j = f.j;
         const uint32_t nGen = f.nGen;
+        bool realClosed = true;                         // the application's frame's list closed (EndP): else it is not presented
         gateFrameEnd = gateValue.load() + nGen + 1;     // its presents' values (the next frame's spread starts after them)
         const Resource& ox = pg->Output();
         ID3D12Resource* frame = gateHeld[f.set] ? gateHeld[f.set] : f.realSrc;
@@ -3686,12 +3754,19 @@ private:
             if (j.dbgTag)
                 DrawTags(g, rb, ox);
             Barrier(g, rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-            EndP();
+            // The lane's list failed to close, or an earlier one did (listBroken): this frame is not presented (GateWait and LanePresent go
+            // together; the fences stay as they are).
+            const bool closed = EndP() && !listBroken.load(std::memory_order_relaxed);
             rb->Release();
-            GateWait(f, k, j.cut ? 0 : f.done[k - 1]);
-            LanePresent(f, k, j.sync, j.flags & DXGI_PRESENT_ALLOW_TEARING);
-            if (++genCount == 1 || genCount % 600 == 0)
-                XLog("present: %u frames generated", genCount);
+            if (closed)
+            {
+                GateWait(f, k, j.cut ? 0 : f.done[k - 1]);
+                LanePresent(f, k, j.sync, j.flags & DXGI_PRESENT_ALLOW_TEARING);
+                if (++genCount == 1 || genCount % 600 == 0)
+                    XLog("present: %u frames generated", genCount);
+            }
+            else
+                SkipGenerated(j, k, nGen);
         }
         {
             ID3D12Resource* rb = RealBuffer();
@@ -3702,7 +3777,7 @@ private:
             Copy(g, rb, src, ox, true);
             EndLaneCopy(g);
             Barrier(g, rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-            EndP();
+            realClosed = EndP() && !listBroken.load(std::memory_order_relaxed);
             pqRead[f.set] = pqValue;        // the lane's last read of this set
             rb->Release();
         }
@@ -3714,8 +3789,14 @@ private:
         if (!f.handed)
             HandOff(f, false);
         Early();
-        GateWait(f, nGen + 1, 0);
-        LanePresent(f, nGen + 1, j.sync, j.flags);
+        if (realClosed)
+        {
+            NoteShownAgain();
+            GateWait(f, nGen + 1, 0);
+            LanePresent(f, nGen + 1, j.sync, j.flags);
+        }
+        else
+            NoteNotPresented();
         // Retired once its own frame went out (as Show does): signalled on our queue here, the application ran a frame further
         // ahead and its frames waited 22 ms longer to be taken (harness 6x at 30 fps, same rate).
         pq->Signal(retireFence, j.frame + 1);
@@ -4281,6 +4362,8 @@ private:
             {
                 if (!app)
                     SkipGenerated(j, k, nGen);
+                else
+                    NoteNotPresented();
                 continue;           // our recording broke: this frame is dropped whole
             }
             ID3D12Resource* rb = RealBuffer();
@@ -4301,6 +4384,8 @@ private:
             {
                 if (!app)
                     SkipGenerated(j, k, nGen);
+                else
+                    NoteNotPresented();
                 continue;           // not executed: the swap chain's buffer holds an older picture; it is not presented
             }
             PresentReal(j, k, nGen, j.sync, app ? j.flags : j.flags & DXGI_PRESENT_ALLOW_TEARING);
@@ -4550,6 +4635,8 @@ private:
             {
                 if (!app)
                     SkipGenerated(j, k, nGen);
+                else
+                    NoteNotPresented();
                 continue;           // our recording broke: this frame is dropped whole
             }
             ID3D12Resource* rb = RealBuffer();
@@ -4570,6 +4657,8 @@ private:
             {
                 if (!app)
                     SkipGenerated(j, k, nGen);
+                else
+                    NoteNotPresented();
                 continue;           // not executed: the swap chain's buffer holds an older picture; it is not presented
             }
             PresentReal(j, k, nGen, j.sync, app ? j.flags : j.flags & DXGI_PRESENT_ALLOW_TEARING);
@@ -4589,6 +4678,7 @@ private:
     {
         const Resource& ox = pg->Output();
         const uint32_t set = static_cast<uint32_t>(j.frame & 1);
+        bool realClosed = true;                         // the application's frame's list closed (EndP): else it is not presented
         genQueue->Wait(appFence, j.frame + 1);
         ID3D12Resource* realSrc;
         {
@@ -4691,12 +4781,19 @@ private:
             if (j.dbgTag)
                 DrawTags(g, rb, ox);
             Barrier(g, rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-            EndP();
+            // The lane's list failed to close, or an earlier one did (listBroken): this frame is not presented (GateWait and LanePresent go
+            // together; the fences stay as they are).
+            const bool closed = EndP() && !listBroken.load(std::memory_order_relaxed);
             rb->Release();
-            GateWait(f, k, j.cut ? 0 : f.done[k - 1]);
-            LanePresent(f, k, j.sync, j.flags & DXGI_PRESENT_ALLOW_TEARING);
-            if (++genCount == 1 || genCount % 600 == 0)
-                XLog("present: %u frames generated", genCount);
+            if (closed)
+            {
+                GateWait(f, k, j.cut ? 0 : f.done[k - 1]);
+                LanePresent(f, k, j.sync, j.flags & DXGI_PRESENT_ALLOW_TEARING);
+                if (++genCount == 1 || genCount % 600 == 0)
+                    XLog("present: %u frames generated", genCount);
+            }
+            else
+                SkipGenerated(j, k, nGen);
         }
         {
             ID3D12Resource* rb = RealBuffer();
@@ -4707,12 +4804,18 @@ private:
             Copy(g, rb, src, ox, true);
             EndLaneCopy(g);
             Barrier(g, rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-            EndP();
+            realClosed = EndP() && !listBroken.load(std::memory_order_relaxed);
             pqRead[set] = pqValue;
             rb->Release();
         }
-        GateWait(f, nGen + 1, 0);
-        LanePresent(f, nGen + 1, j.sync, j.flags);
+        if (realClosed)
+        {
+            NoteShownAgain();
+            GateWait(f, nGen + 1, 0);
+            LanePresent(f, nGen + 1, j.sync, j.flags);
+        }
+        else
+            NoteNotPresented();
         pq->Signal(retireFence, j.frame + 1);   // retired once its own frame went out (ShowGated)
         Stats(j, nGen);
         showing = nullptr;
@@ -4952,6 +5055,9 @@ private:
                  "the slot past; %u of all of them a batch's first: those are not in the first-frame time above), %u presents released early "
                  "(the game's next frame was done before their slot)", lateMode == pacesched::kLateDrop ? "drop" : lateMode == pacesched::kLateCompress ? "compress" : lateMode == pacesched::kLateEarly ? "early" : "auto",
                  statDropLate, statGenPresents, statDropTimeout, statDropStale, statDropFirst, statAutoEarly);
+        if (statListSkips)
+            XLog("stats: %u generated frames left out after a failed list (generation is off)", statListSkips);
+        statListSkips = 0;
         if (statCompressed)
             XLog("stats: LateGen=compress: %u presents released early (the game's next frame was done)", statCompressed);
         statDropLate = statDropTimeout = statDropFirst = statDropStale = statCompressed = statAutoEarly = statGenPresents = 0;
@@ -5233,8 +5339,6 @@ private:
         XLog("resize to output %ux%u, render %ux%u, interpolation area %s%u,%u %ux%u: %s in %.1f ms (%s)", want.OW,
              want.OH, want.RW, want.RH, want.AW ? "" : "(whole) ", want.AX, want.AY, want.AW ? want.AW : want.OW,
              want.AH ? want.AH : want.OH, ok ? "rebuilt" : "FAILED", static_cast<double>(Now() - t0) * 1000.0 / freq(), where);
-        if (ok)
-            ClearListBroken();
     }
 
     // The output layer's UI mode for this frame, as Intel resolves it (captures in tools/XEFG_SETTINGS.md): 1 with UI
@@ -5833,6 +5937,7 @@ private:
     unsigned statGaps = 0, statFrames = 0, statLate = 0, statEarly = 0, traced = 0;
     unsigned statCompressed = 0;            // LateGen=compress: presents released early (PresentReal)
     unsigned statAutoEarly = 0, statGenPresents = 0;    // LateGen=auto: presents released early by the next game frame, and generated presents (PresentReal)
+    unsigned statListSkips = 0;             // generated frames left out after a failed list (SkipGenerated)
     unsigned statDropStale = 0;             // LateGen=auto: generated frames left out as stale (PresentReal), also in statDropLate
     unsigned statDropLate = 0, statDropTimeout = 0, statDropFirst = 0;    // LateGen=drop: generated frames left out (PresentReal), and those after a GPU wait that ran out
     bool catchUp = false;               // presenter: the next app frame was already done on the GPU when this one started
