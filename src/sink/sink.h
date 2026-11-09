@@ -71,6 +71,7 @@
 #include "../pace_lead.h"
 #include "../pace_sched.h"
 #include "release_rule.h"
+#include "../wait_bound.h"
 
 #include <d3d12.h>
 
@@ -362,6 +363,9 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     std::condition_variable cvItem, cvSpace;
     std::deque<Item> q;
     bool stop = false;
+    waitbound::Episode stall;           // bounded waits (wait_bound.h)
+    std::atomic<bool> stallTripped { false };   // a wait ran out since the last Enqueue (the copy path sets it on the pacer thread)
+    bool copySkipped = false;           // the pacer's last CopyToBackBuffer was skipped by the bound
     uint64_t in = 0;                    // frames accepted from the library
     uint64_t presented = 0;             // frames released on the real chain
     uint32_t burst = 1;
@@ -728,13 +732,36 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         lastBurstStart = t;
     }
 
-    void WaitFence(UINT64 v)
+    // Waits for the copy fence within `ms`; false when it ran out (the caller must not touch what the GPU may still use). The teardown
+    // keeps the longer 2 s (what follows frees the slots).
+    bool WaitFence(UINT64 v, DWORD ms = 2000)
     {
-        if (fence->GetCompletedValue() < v)
-        {
-            fence->SetEventOnCompletion(v, fenceEvent);
-            WaitForSingleObject(fenceEvent, 2000);
-        }
+        return WaitFenceOn(v, ms, fenceEvent);
+    }
+    // (the loop is waitbound::WaitReached: a late event of an earlier registration must not end it)
+    bool WaitFenceOn(UINT64 v, DWORD ms, HANDLE ev)
+    {
+        return waitbound::WaitReached(
+            v, ms, [&] { return fence->GetCompletedValue(); }, [&](uint64_t x) { fence->SetEventOnCompletion(x, ev); },
+            [&](unsigned w) { WaitForSingleObject(ev, w); });
+    }
+
+    // A wait ran into its bound (wait_bound.h; the sink's bounds are fixed, 500 ms or the short slice while stalled, not WaitBoundMs): logged
+    // once per episode; the frame that timed out is dropped (or goes on without its wait), the thread is not held. A timeout while already
+    // stalled is no new trip (it neither logs nor restarts the recovery). The episode ends by itself, see waitbound::Episode.
+    void NoteStall(const char* what)
+    {
+        stallTripped.store(true, std::memory_order_relaxed);
+        if (!stall.Stalled() && stall.Trip() && g_log)
+            g_log("sink: waits: %s for %u ms without an answer - frames that time out are dropped, the rest are shown (back to normal by itself)",
+                  what, waitbound::kGpuWaitMs);
+    }
+    void NoteGood()
+    {
+        if (stallTripped.exchange(false, std::memory_order_relaxed))
+            return;
+        if (stall.Good() && g_log)
+            g_log("sink: waits: the stall is over");
     }
 
     void ReleaseSlots()
@@ -834,8 +861,14 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     // Staging texture `a` (frame `n`) into the real chain's current back buffer, on the chain's queue.
     bool CopyToBackBuffer(UINT a, uint64_t n)
     {
-        if (allocFence[a])
-            WaitFence(allocFence[a]);
+        copySkipped = false;
+        if (allocFence[a] && !WaitFence(allocFence[a], waitbound::kGpuWaitMs))
+        {
+            // The copy that last used this slot's allocator is still running: not reset. The frame is not shown (the next one is).
+            NoteStall("a copy's allocator was still in use by the GPU");
+            copySkipped = true;
+            return false;
+        }
         if (probePending[a])
         {
             void* p = nullptr;
@@ -980,12 +1013,12 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             if (copied && it.sched)
             {
                 const LONGLONG w0 = Now();
-                WaitFence(allocFence[it.slot]);
+                WaitFence(allocFence[it.slot], waitbound::kGpuWaitMs);
                 const LONGLONG w1 = Now();
                 lateMs = (std::min)(static_cast<double>(w1 - w0) * 1000.0 / Freq(), (std::max)(0.0, static_cast<double>(w1 - target) * 1000.0 / Freq()));
             }
             if (!copied)
-                hr = DXGI_ERROR_INVALID_CALL;
+                hr = copySkipped ? S_OK : DXGI_ERROR_INVALID_CALL;     // (a frame dropped by the bound is not an error for the library)
             else
             {
                 const LONGLONG p0 = scproxy::Qpc();
@@ -1054,10 +1087,12 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         }
     }
 
-    void Drain()
+    // True when the pacer has nothing left: an item stays in q until its copy and present are done (it is popped last), so an empty q is
+    // an idle pacer. 10 s, long on purpose: what follows (ResizeBuffers) frees the slots the pacer may be using. False on a timeout.
+    bool Drain()
     {
         std::unique_lock<std::mutex> l(mu);
-        cvSpace.wait(l, [&] { return q.empty(); });
+        return waitbound::WaitFor(l, cvSpace, waitbound::kIdleWaitMs, [&] { return q.empty() || stop; });
     }
 
     // The GPU stamp watcher (see the top), as the own generator's (xefg_own.h, StartPresenter): a thread of its own, so a busy pacer does
@@ -1270,7 +1305,21 @@ public:
             ++fullWaits;
             blockedInBurst = true;
         }
-        cvSpace.wait(l, [&] { return stop || q.size() < kMaxQueue; });
+        // The short slice while stalled (a stuck pacer must not cost the game three full bounds per Enqueue).
+        const unsigned bound = waitbound::GameBound(stall.Stalled(), waitbound::kGpuWaitMs);
+        if (!waitbound::WaitFor(l, cvSpace, bound, [&] { return stop || q.size() < kMaxQueue; }))
+        {
+            // The pacer does not release (a stuck present or copy): the frame is dropped, not queued. The library's buffer index goes on as
+            // after a normal Enqueue (stable buffers: it takes its textures in turn, `in` must stay in step with it; the texture it draws
+            // into next may then still be waiting in the queue, which shows as a glitch in the frame that was held up, in a stalled
+            // episode only). Without stable buffers the slot is ours to hand out, and the next frame simply gets the same one.
+            NoteStall("the queue had no room");
+            if (stable)
+                ++in;
+            const HRESULT h0 = lastHr;
+            lastHr = S_OK;
+            return h0;
+        }
         const bool direct = NoteRelease(sync, flags);
         if (!direct)
             Observe(arrived);
@@ -1290,17 +1339,24 @@ public:
             // The library draws the next frame into texture in % appBuffers as soon as this returns: the frame that held it last
             // (appBuffers frames back) must be out of the queue and its copy done on the GPU.
             cvItem.notify_one();
-            cvSpace.wait(l, [&] { return stop || q.size() < appBuffers; });
+            // (bounded: the frame is queued already, so on a timeout the library goes on - at worst it draws over a texture still to be shown)
+            if (!waitbound::WaitFor(l, cvSpace, bound, [&] { return stop || q.size() < appBuffers; }))
+                NoteStall("the queue did not release the library's next texture");
             const UINT64 v = allocFence[in % appBuffers];
             l.unlock();
             if (v && fence->GetCompletedValue() < v)
             {
-                fence->SetEventOnCompletion(v, libEvent);
-                WaitForSingleObject(libEvent, 2000);
+                if (!WaitFenceOn(v, bound, libEvent))
+                {
+                    l.lock();
+                    NoteStall("the copy of the library's last texture");
+                    l.unlock();
+                }
             }
             l.lock();
         }
         lastReturn = Now();
+        NoteGood();
         l.unlock();
         cvItem.notify_one();
         return h;           // a failed real Present is reported on the library's next one
@@ -1343,7 +1399,13 @@ public:
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT c, UINT w, UINT h, DXGI_FORMAT f, UINT fl) override
     {
         scproxy::Log("SINK.ResizeBuffers", "count %u %ux%u", c, w, h);
-        Drain();
+        if (!Drain())
+        {
+            // The pacer is still on a frame (a stuck copy or present): the slots stay as they are, nothing is freed under it.
+            if (g_log)
+                g_log("sink: ResizeBuffers refused - the frame queue did not drain within %u ms (a stuck copy or present)", waitbound::kIdleWaitMs);
+            return E_FAIL;
+        }
         std::lock_guard<std::mutex> l(mu);
         ReleaseSlots();
         const HRESULT hr = r->ResizeBuffers(c, w, h, f, fl);

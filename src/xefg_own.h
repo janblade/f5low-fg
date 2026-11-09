@@ -55,6 +55,7 @@
 #include "oob_driver.h"
 #include "pace_sched.h"
 #include "timer_raise.h"
+#include "wait_bound.h"
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
 #include "xefg_formats.h"
@@ -494,6 +495,33 @@ public:
     // except with DriverPacing=1 (automatic), where PacingStep sets it (presenter thread) and the application's thread and RealPresent read it.
     std::atomic<bool> pacingActive { true };
     uint32_t appJobs = 2;                       // AppJobs= in f5low.ini (low-level): frames that may wait for the presenter before the game's Present blocks
+    // Bounded waits (wait_bound.h): no wait on the presenter / generator path may hang the game. WaitBoundMs= (GPU fence and allocator
+    // waits) and GameWaitMs= (the game's Present waiting for room in the presenter's queue) in f5low.ini; a timeout stops generating
+    // for this context (the game's frames pass through) until kGoodToRecover frames in a row had none.
+    unsigned waitBoundMs = waitbound::kGpuWaitMs;
+    unsigned gameWaitMs = waitbound::kGameWaitMs;
+    waitbound::Episode stall;
+    // Diagnostics, off by default (TestStallFrame= in f5low.ini, docs/ROBUSTNESS.md): one artificial stall at an app frame, to run the
+    // bounds and the spare allocators for real in a game. Kind 0 = the presenter thread sleeps TestStallMs, 1 = the generation lane's
+    // queue waits on a private fence that a helper thread signals after TestStallMs, 2 = the same for the present lane.
+    uint64_t testStallFrame = 0;
+    unsigned testStallMs = 1500;
+    int testStallKind = 0;
+    std::atomic<bool> testFired { false };
+    std::atomic<uint64_t> testFrameNow { 0 };       // the app frame the presenter / generation thread is on (TestStall)
+    ID3D12Fence* testFence = nullptr;
+    std::thread testThread;
+    // The presenter's catch-up (CatchUp): pass-through frames older than the newest appJobs + kCatchUpMargin are consumed unshown. The
+    // margin lets a slow presenter keep a short queue without losing frames; it is no memory cap - what a stuck presenter can pile up
+    // is limited by the game itself (its next frame waits on consumedFence, which only the presenter raises), so no hard cap is added.
+    static constexpr size_t kCatchUpMargin = 2;
+    std::atomic<uint64_t> statCaughtUp { 0 };
+    std::atomic<bool> rebuildBusy { false };    // RebuildForSizes is running (Rebuilding)
+    std::atomic<bool> testQuit { false };       // ends the diagnostics helper's sleep (StopPresenter)
+    std::vector<ID3D12CommandAllocator*> parkedAllocs;   // allocators the GPU still used after the long wait (FreshAllocator): freed at teardown
+    std::atomic<bool> frameTripped { false };   // a wait ran into its bound since the last present (the game thread reads and clears it)
+    std::atomic<uint64_t> statGpuWaitTimeouts { 0 };    // WaitGpu calls that ran out (200 ms etc.): the result for the late-frame decision
+    std::atomic<bool> lastGpuWaitOk { true };
     bool retireWait = true;                     // RetireWait=0 in f5low.ini (low-level): the game's Present does not wait for the frame before last on the GPU
     bool oobMarkers = false;                    // OobMarkers=1 in f5low.ini: out of band present markers around our Presents (RealPresent)
     std::atomic<uint32_t> presentId { 0 };      // xefgSwapChainSetPresentId: the frame id of the game's markers, taken at its Present
@@ -597,6 +625,10 @@ public:
     ~Own()
     {
         XLog("context freed");  // Destroy plus the app's last Release of its swap chain: nothing of it is left
+        if (testThread.joinable())
+            testThread.join();
+        if (testFence)
+            testFence->Release();
         DriverFgStop(false);
         if (driverFgQueue)
             driverFgQueue->Release();
@@ -635,6 +667,12 @@ public:
         for (auto& a : genAlloc)
             if (a)
                 a->Release();
+        for (auto* a : parkedAllocs)
+            if (a)
+                a->Release();
+        ReleaseSpares(genSpare);
+        ReleaseSpares(hostSpare);
+        ReleaseSpares(pqSpare);
         if (genEvent)
             CloseHandle(genEvent);
         if (retireEvent)
@@ -929,6 +967,7 @@ public:
     bool CreateGenLane()
     {
         const D3D12_COMMAND_LIST_TYPE t = genMode == "direct" ? D3D12_COMMAND_LIST_TYPE_DIRECT : D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        genListType = t;
         // Normal priority with the gate: the frame's passes go to the lane at once, and at high priority that block (~15 ms
         // in NBA 2K27) kept the compositor off the GPU - the generated frames released during it were dropped (run G: 39% /
         // 21% of the first two, 2-3% of the rest).
@@ -1285,7 +1324,8 @@ public:
                 XLog("present: %s", inFullscreen ? "exclusive fullscreen - passing frames through (as Intel)" : "left exclusive fullscreen");
             }
             j.uiMode = UiMode(hudless, haveUi);
-            j.usable = enabled && built && haveMv && haveDepth && fmtOk && j.uiMode > 0 && !inFullscreen;
+            // A stalled context (a wait ran into its bound, see wait_bound.h) shows the game's frames as they are until it recovers.
+            j.usable = enabled && built && haveMv && haveDepth && fmtOk && j.uiMode > 0 && !inFullscreen && !stall.Stalled();
             j.hudless = j.uiMode >= 3;
             const bool camCut = CameraCut();
             j.reset = constants.resetHistory != 0;
@@ -1388,7 +1428,23 @@ public:
         {
             // Bounded latency: at most appJobs frames wait for the presenter.
             std::unique_lock<std::mutex> l(pm);
-            pcv.wait(l, [this] { return pjobs.size() + gjobs.size() + (gBusy ? 1 : 0) < appJobs || pQuit; });
+            // The wait is bounded (GameWaitMs): a presenter that does not drain must not hold the game. On a timeout the frame goes
+            // to the presenter as it is (no generation); the queue then holds one over its limit per bound that ran out.
+            // A resize / rebuild under way holds the presenter legitimately: the long bound, no fault line, no trip.
+            const bool rebuilding = Rebuilding();
+            const waitbound::Admit adm = waitbound::AdmitFrame(
+                l, pcv, rebuilding ? waitbound::kIdleWaitMs : gameWaitMs, false, stall,
+                [this] { return pjobs.size() + gjobs.size() + (gBusy ? 1 : 0) < appJobs || pQuit; }, rebuilding);
+            if (adm.firstTrip)
+                NoteStall("the game's Present waited for room in the presenter's queue", gameWaitMs);
+            if (!adm.room)
+            {
+                j.usable = false;
+                j.passes = false;
+                frameTripped.store(true, std::memory_order_relaxed);
+            }
+            else if (!frameTripped.exchange(false, std::memory_order_relaxed) && stall.Good())
+                XLog("waits: the stall is over - generating again");
             // GenBlock: the game's next frame waits on the GPU for this frame's passes, which the generation thread records as soon as
             // it takes the frame (GenAhead), so the wait is the passes' GPU time, not our pacing. Only when nothing is queued for the
             // presenter and its set is free on the GPU: else its passes would wait for the present lane (aheadRead), and the frame goes
@@ -1746,6 +1802,7 @@ private:
             for (;;)
             {
                 Job j;
+                bool skip = false;
                 {
                     std::unique_lock<std::mutex> l(pm);
                     if (early.valid)
@@ -1757,10 +1814,20 @@ private:
                             return;
                         j = pjobs.front();
                         pjobs.pop_front();
+                        // Catch-up after a stall: older pass-through frames beyond the newest few are not shown (a long burst of stale
+                        // frames after the stall would be worse than skipping them); the newest are kept.
+                        skip = !early.valid && !j.usable && !j.pre && pjobs.size() > appJobs + kCatchUpMargin && !Rebuilding();
                     }
                     pBusy = true;
                 }
                 pcv.notify_all();
+                if (skip)
+                {
+                    CatchUp(j);
+                    std::lock_guard<std::mutex> l(pm);
+                    pBusy = early.valid;
+                    continue;
+                }
                 if (resizePending && j.frame >= resizeFrame)
                     RebuildForSizes("presenter thread");
                 Present(j);
@@ -1771,6 +1838,22 @@ private:
                 pcv.notify_all();
             }
         });
+    }
+    // A pass-through frame the catch-up leaves out: nothing is copied or presented, but every signal the frame owes is sent, in order -
+    // its inputs taken (the game's next frame may go on), retired, and GenBlock / GenAhead's fences moved on (Present's tail).
+    void CatchUp(const Job& j)
+    {
+        ID3D12CommandQueue* on = pq ? pq : queue;
+        on->Wait(appFence, j.frame + 1);        // (the game's GPU work for the frame is done before it is called taken, as when it is shown)
+        Consumed(j, on);
+        hasPrev = false;
+        queue->Signal(retireFence, j.frame + 1);
+        if (ahead)
+            queue->Signal(aheadRead, j.frame + 1);
+        else
+            BlockDone(j, queue);
+        if (statCaughtUp.fetch_add(1, std::memory_order_relaxed) == 0)
+            XLog("waits: catching up after a stall - older pass-through frames are left out, the newest are shown");
     }
     // Waits until the presenter has nothing left (the caller produces no new frames meanwhile).
     void DrainPresenter()
@@ -1793,6 +1876,9 @@ private:
         if (resizePending.exchange(false))
             rebuildOnInit = true;
         StopGate();
+        testQuit = true;
+        if (testThread.joinable())
+            testThread.join();
         wQuit = true;
         if (watcher.joinable())
             watcher.join();
@@ -1818,13 +1904,134 @@ private:
     }
 
     // Waits on the CPU until a fence reaches a value; false after ms (200 by default: a lost device, a stuck queue).
+    // The result is kept (lastGpuWaitOk, statGpuWaitTimeouts) for the late-frame decision of the presenter; nothing is reset on it here.
     bool WaitGpu(ID3D12Fence* f, UINT64 v, DWORD ms = 200)
     {
         if (f->GetCompletedValue() >= v)
             return true;
         f->SetEventOnCompletion(v, gpuEvent);
-        return WaitForSingleObject(gpuEvent, ms) == WAIT_OBJECT_0;
+        const bool ok = WaitForSingleObject(gpuEvent, ms) == WAIT_OBJECT_0;
+        lastGpuWaitOk.store(ok, std::memory_order_relaxed);
+        if (!ok)
+            statGpuWaitTimeouts.fetch_add(1, std::memory_order_relaxed);
+        return ok;
     }
+
+    // A wait ran into its bound: the first of an episode is logged (what, how long); generation stops until the stall clears.
+    void NoteStall(const char* what, unsigned ms)
+    {
+        XLog("waits: %s for %u ms without an answer - not generating for now, the game's frames are shown as they are (back on by itself "
+             "once the stall has cleared)", what, ms);
+    }
+
+    // Diagnostics (testStallFrame): fires once, on the first call at or after the frame. `kind` is the caller's: 0 presenter thread (sleeps),
+    // 1 / 2 a queue (generation / present lane) that waits on a private fence a helper thread signals after testStallMs.
+    void TestStall(int kind, ID3D12CommandQueue* q = nullptr)
+    {
+        if (!testStallFrame || kind != testStallKind || testFrameNow.load(std::memory_order_relaxed) < testStallFrame || testFired.load())
+            return;
+        if (kind != 0 && !q)
+            return;
+        if (testFired.exchange(true))
+            return;
+        static const char* const names[] = { "presenter", "genlane", "presentlane" };
+        XLog("TestStall: %s stalls for %u ms at app frame %llu (diagnostics)", names[kind], testStallMs,
+             static_cast<unsigned long long>(testFrameNow.load()));
+        if (kind == 0)
+        {
+            Sleep(testStallMs);
+            return;
+        }
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&testFence))))
+            return;
+        q->Wait(testFence, 1);
+        testThread = std::thread([this] {
+            for (unsigned t = 0; t < testStallMs && !testQuit.load(); t += 20)
+                Sleep(20);
+            testFence->Signal(1);
+        });
+    }
+
+    // A command allocator for a lane whose own one is still in flight after the bound: never reset while the GPU may use it. A spare
+    // takes its place for this list (created on first need, reused once its own fence value is reached). Null if none could be had.
+    struct SpareLane
+    {
+        ID3D12CommandAllocator* a[waitbound::kSpares] {};
+        UINT64 fv[waitbound::kSpares] {};
+        unsigned next = 0;
+        int cur = -1;                   // the spare the open list is recorded on, -1 = the lane's own allocator
+    };
+    ID3D12CommandAllocator* TakeSpare(SpareLane& sp, D3D12_COMMAND_LIST_TYPE type, ID3D12Fence* fence, HANDLE ev)
+    {
+        for (unsigned round = 0; round < 20; ++round)       // bounded slices: 20 x WaitBoundMs, then give up (a lost device)
+        {
+            for (unsigned k = 0; k < waitbound::kSpares; ++k)
+            {
+                const unsigned i = (sp.next + k) % waitbound::kSpares;
+                if (!sp.a[i] && FAILED(dev->CreateCommandAllocator(type, IID_PPV_ARGS(&sp.a[i]))))
+                    continue;
+                if (fence->GetCompletedValue() >= sp.fv[i])
+                {
+                    sp.next = i + 1;
+                    sp.cur = static_cast<int>(i);
+                    return sp.a[i];
+                }
+            }
+            // All spares in flight: wait for the oldest in a bounded slice.
+            const unsigned o = sp.next % waitbound::kSpares;
+            WaitBounded(fence, sp.fv[o], ev);
+        }
+        return nullptr;
+    }
+    static void ReleaseSpares(SpareLane& sp)
+    {
+        for (auto& a : sp.a)
+            if (a)
+                a->Release();
+        sp = SpareLane {};
+    }
+
+    // Waits for `v` on `fence` within `ms` (default WaitBoundMs); true when it was reached (a removed device reads UINT64_MAX, which is
+    // reached too). The loop is waitbound::WaitReached: a late event of an earlier registration must not end it, nor count as a timeout.
+    bool WaitBounded(ID3D12Fence* fence, UINT64 v, HANDLE ev, unsigned ms = 0)
+    {
+        return waitbound::WaitReached(
+            v, ms ? ms : waitBoundMs, [&] { return fence->GetCompletedValue(); }, [&](uint64_t x) { fence->SetEventOnCompletion(x, ev); },
+            [&](unsigned w) { WaitForSingleObject(ev, w); });
+    }
+
+    // No spare allocator could be had: wait for the lane's own allocator's value (10 s, looping). If it still is not reached, the busy
+    // allocator is NOT reset: it is parked until teardown and a fresh one takes its slot (its fence value starts again at 0). If even
+    // that cannot be created, this keeps waiting in 10 s slices (the fence reads as reached once the device is removed) - a reset of an
+    // allocator in flight would be worse than a stall.
+    void FreshAllocator(ID3D12Fence* fence, UINT64& v, HANDLE ev, const char* what, ID3D12CommandAllocator*& slot, D3D12_COMMAND_LIST_TYPE type)
+    {
+        if (WaitBounded(fence, v, ev, waitbound::kIdleWaitMs))
+            return;
+        ID3D12CommandAllocator* a = nullptr;
+        if (SUCCEEDED(dev->CreateCommandAllocator(type, IID_PPV_ARGS(&a))))
+        {
+            XLog("waits: %s - no spare allocator and the busy one still in use after %u ms: parked, a fresh one takes its place", what,
+                 waitbound::kIdleWaitMs);
+            parkedAllocs.push_back(slot);
+            slot = a;
+            v = 0;
+            return;
+        }
+        XLog("waits: %s - the busy allocator is still in use and no fresh one could be created: waiting on", what);
+        while (!WaitBounded(fence, v, ev, waitbound::kIdleWaitMs))
+        {
+        }
+    }
+    // A wait on the GPU ran into its bound: counts as a stall unless a resize / rebuild is under way (those hold the presenter legitimately).
+    void TripGpu(const char* what)
+    {
+        frameTripped.store(true, std::memory_order_relaxed);
+        if (!Rebuilding() && !stall.Stalled() && stall.Trip())
+            NoteStall(what, waitBoundMs);
+    }
+    // A resize, a rebuild for new sizes or the deferred first build is running: the presenter is busy for a good while, no fault.
+    bool Rebuilding() const { return resizePending.load() || rebuildBusy.load() || deferBusy.load(std::memory_order_acquire); }
 
     // The first failed Present of the real swap chain, once, with what is needed to tell a lost device (and why) from a
     // plain failure, and which path (pass-through or generating, sizes against the pack) was running.
@@ -2054,6 +2261,9 @@ private:
     }
     void Present(const Job& j)
     {
+        testFrameNow.store(j.frame, std::memory_order_relaxed);
+        if (testStallFrame)
+            TestStall(0);
         PresentPaths(j);
         if (ahead)
             queue->Signal(aheadRead, j.frame + 1);  // GenAhead: the present lane is done reading this frame's set
@@ -3496,13 +3706,27 @@ private:
     // The present lane's command list (Begin / End for our queue).
     ID3D12GraphicsCommandList* BeginP()
     {
+        TestStall(2, pq);
         const size_t i = pqNext++ % kAllocs;
+        pqSpare.cur = -1;
         if (pqFence->GetCompletedValue() < pqAllocFence[i])
         {
             const long long b0 = Now();
-            pqFence->SetEventOnCompletion(pqAllocFence[i], pqEvent);
-            WaitForSingleObject(pqEvent, 10000);
+            const bool ok = WaitBounded(pqFence, pqAllocFence[i], pqEvent);
             statLaneBlock += static_cast<double>(Now() - b0) * 1000.0 / freq();
+            if (!ok)
+            {
+                // Still in flight: not reset. A spare takes its place (the allocator's stamps are read when it is free again).
+                TripGpu("the present lane's allocator was still in use by the GPU");
+                if (ID3D12CommandAllocator* sa = TakeSpare(pqSpare, D3D12_COMMAND_LIST_TYPE_DIRECT, pqFence, pqEvent))
+                {
+                    sa->Reset();
+                    pqList->Reset(sa, nullptr);
+                    pqCur = i;
+                    return pqList;
+                }
+                FreshAllocator(pqFence, pqAllocFence[i], pqEvent, "the present lane", pqAlloc[i], D3D12_COMMAND_LIST_TYPE_DIRECT);
+            }
         }
         ReadLaneCopyStamp(i);
         pqAlloc[i]->Reset();
@@ -3523,7 +3747,9 @@ private:
         }
         Submit(pq, pqList, "present lane");
         pq->Signal(pqFence, ++pqValue);
-        pqAllocFence[pqCur] = pqValue;
+        pqAllocFence[pqCur] = pqValue;      // (also covers the lane's own allocator that a spare stood in for)
+        if (pqSpare.cur >= 0)
+            pqSpare.fv[pqSpare.cur] = pqValue;
     }
 
     void InitLaneCopyProfiling()
@@ -3926,6 +4152,7 @@ private:
     // history ends here, and the presenter shows the frame as it is.
     void GenAhead(Job& j)
     {
+        testFrameNow.store(j.frame, std::memory_order_relaxed);
         if (!j.usable)
         {
             aheadPrev = false;
@@ -4196,12 +4423,25 @@ private:
 
     ID3D12GraphicsCommandList* BeginGen()
     {
+        TestStall(1, genQueue);
         const size_t i = genNext++ % kAllocs;
+        genSpare.cur = -1;
         if (genFence->GetCompletedValue() < genAllocFence[i])
         {
             const long long a0 = Now();
-            genFence->SetEventOnCompletion(genAllocFence[i], genEvent);
-            WaitForSingleObject(genEvent, 10000);
+            const bool reached = WaitBounded(genFence, genAllocFence[i], genEvent);
+            if (!reached)
+            {
+                TripGpu("the generation lane's allocator was still in use by the GPU");
+                if (ID3D12CommandAllocator* sa = TakeSpare(genSpare, genListType, genFence, genEvent))
+                {
+                    sa->Reset();
+                    genList->Reset(sa, nullptr);
+                    genCur = i;
+                    return genList;
+                }
+                FreshAllocator(genFence, genAllocFence[i], genEvent, "the generation lane", genAlloc[i], genListType);
+            }
             // diagnostics: the presenter blocked on the generation lane (its allocators all in flight)
             const double ams = static_cast<double>(Now() - a0) * 1000.0 / freq();
             if (ams > 250.0 && slowGenLogs < 30)
@@ -4225,6 +4465,8 @@ private:
         Submit(genQueue, genList, "generation list");
         genQueue->Signal(genFence, ++genValue);
         genAllocFence[genCur] = genValue;
+        if (genSpare.cur >= 0)
+            genSpare.fv[genSpare.cur] = genValue;
         return genValue;
     }
     void ReleaseRing()
@@ -4397,6 +4639,10 @@ private:
                  statClkHitches, stampsWork ? "from the stream" : "MISSING (half an app frame)");
         statClkDelay = statClkNeed = 0;
         statClkN = statClkSlips = statClkHitches = 0;
+        if (const uint64_t cu = statCaughtUp.exchange(0), gw = statGpuWaitTimeouts.exchange(0); cu || gw)
+            XLog("stats: %llu pass-through frames left out by the catch-up after a stall, %llu GPU waits that ran out (WaitGpu), %llu timeouts "
+                 "of the bounded waits so far", static_cast<unsigned long long>(cu), static_cast<unsigned long long>(gw),
+                 static_cast<unsigned long long>(stall.Trips()));
         if (flipFn)
             XLog("stats: flip metering on for %u of 120 app frames, %.2f ms per batch, status %d, feedback 0x%x, %u calls", statFlipMetered,
                  flipBatchMs, flipStatus, flipFeedback, flipCalls);
@@ -4594,6 +4840,14 @@ private:
         tokenDebt.Forgive();
     }
 
+    // The wait of WaitIdle / WaitApp (resize, teardown): 10 s, longer than the frame waits on purpose - what follows destroys or rebuilds
+    // what the GPU may still use, so giving up early would be worse than waiting. Bounded, and logged when it runs out.
+    void IdleWait(ID3D12Fence* fence, UINT64 v, HANDLE ev, const char* what)
+    {
+        if (!WaitBounded(fence, v, ev, waitbound::kIdleWaitMs))
+            XLog("waits: %s did not finish within %u ms at a resize / teardown - going on (a lost device?)", what, waitbound::kIdleWaitMs);
+    }
+
     // Waits until our queue has finished everything (and the CUDA worker everything posted).
     void WaitIdle()
     {
@@ -4602,29 +4856,17 @@ private:
         {
             GateFlush();
             pq->Signal(pqFence, ++pqValue);
-            if (pqFence->GetCompletedValue() < pqValue)
-            {
-                pqFence->SetEventOnCompletion(pqValue, pqEvent);
-                WaitForSingleObject(pqEvent, 10000);
-            }
+            IdleWait(pqFence, pqValue, pqEvent, "the present lane");
         }
         if (genQueue)
         {
             genQueue->Signal(genFence, ++genValue);
-            if (genFence->GetCompletedValue() < genValue)
-            {
-                genFence->SetEventOnCompletion(genValue, genEvent);
-                WaitForSingleObject(genEvent, 10000);
-            }
+            IdleWait(genFence, genValue, genEvent, "the generation lane");
         }
         if (queue && hostFence)
         {
             queue->Signal(hostFence, ++hostValue);
-            if (hostFence->GetCompletedValue() < hostValue)
-            {
-                hostFence->SetEventOnCompletion(hostValue, hostEvent);
-                WaitForSingleObject(hostEvent, 10000);
-            }
+            IdleWait(hostFence, hostValue, hostEvent, "the present list");
         }
     }
     // Waits until the application's queue has finished what it submitted (its tag copies into staging).
@@ -4633,11 +4875,7 @@ private:
         if (!appQueue || !idleFence)
             return;
         appQueue->Signal(idleFence, ++idleValue);
-        if (idleFence->GetCompletedValue() < idleValue)
-        {
-            idleFence->SetEventOnCompletion(idleValue, hostEvent);
-            WaitForSingleObject(hostEvent, 10000);
-        }
+        IdleWait(idleFence, idleValue, hostEvent, "the application's queue");
     }
 
     // A "pack 2" follows the game's sizes: output from the swap chain, render from the motion-vector or
@@ -4679,12 +4917,14 @@ private:
     {
         const Sizes want = resizeWant;
         const long long t0 = Now();
+        rebuildBusy = true;
         WaitIdle();
         const bool ok = generator->Rebuild(want, BuildArgs());
         resizeFailed = !ok;
         failedSize = want;
         resizePending = false;
         built = ok;
+        rebuildBusy = false;
         XLog("resize to output %ux%u, render %ux%u, interpolation area %s%u,%u %ux%u: %s in %.1f ms (%s)", want.OW,
              want.OH, want.RW, want.RH, want.AW ? "" : "(whole) ", want.AX, want.AY, want.AW ? want.AW : want.OW,
              want.AH ? want.AH : want.OH, ok ? "rebuilt" : "FAILED", static_cast<double>(Now() - t0) * 1000.0 / freq(), where);
@@ -4839,12 +5079,24 @@ private:
     ID3D12GraphicsCommandList* Begin()
     {
         const size_t i = next++ % kAllocs;
+        hostSpare.cur = -1;
         if (hostFence->GetCompletedValue() < allocFence[i])
         {
             const long long w0 = Now();
-            hostFence->SetEventOnCompletion(allocFence[i], hostEvent);
-            WaitForSingleObject(hostEvent, 10000);
+            const bool ok = WaitBounded(hostFence, allocFence[i], hostEvent);
             allocWaitMs += (Now() - w0) * 1000.0 / freq();
+            if (!ok)
+            {
+                TripGpu("the present list's allocator was still in use by the GPU");
+                if (ID3D12CommandAllocator* sa = TakeSpare(hostSpare, D3D12_COMMAND_LIST_TYPE_DIRECT, hostFence, hostEvent))
+                {
+                    sa->Reset();
+                    list->Reset(sa, nullptr);
+                    cur_i = i;
+                    return list;
+                }
+                FreshAllocator(hostFence, allocFence[i], hostEvent, "the present list", alloc[i], D3D12_COMMAND_LIST_TYPE_DIRECT);
+            }
         }
         ReadStamps(i);
         alloc[i]->Reset();
@@ -4857,6 +5109,8 @@ private:
         Submit(queue, list, "present list");
         queue->Signal(hostFence, ++hostValue);
         allocFence[cur_i] = hostValue;
+        if (hostSpare.cur >= 0)
+            hostSpare.fv[hostSpare.cur] = hostValue;
     }
     static void Barrier(ID3D12GraphicsCommandList* g, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
     {
@@ -5133,6 +5387,7 @@ private:
     ID3D12CommandQueue* queue = nullptr;
     ID3D12CommandQueue* appQueue = nullptr;
     ID3D12CommandAllocator* alloc[kAllocs] {};
+    SpareLane hostSpare;                    // bounded waits: stand-ins for allocators still in flight after the bound (Begin)
     UINT64 allocFence[kAllocs] {};
     ID3D12GraphicsCommandList* list = nullptr;
     // Tags valid until present (FlushTags): the frame's latest per type (a reference held), and our list for them on
@@ -5172,6 +5427,8 @@ private:
     // The generation lane (CreateGenLane, PresentGen): its queue, lists, fence and the generated frames' ring.
     ID3D12CommandQueue* genQueue = nullptr;
     ID3D12CommandAllocator* genAlloc[kAllocs] {};
+    SpareLane genSpare;                     // (BeginGen)
+    D3D12_COMMAND_LIST_TYPE genListType = D3D12_COMMAND_LIST_TYPE_DIRECT;
     UINT64 genAllocFence[kAllocs] {};
     ID3D12GraphicsCommandList* genList = nullptr;
     ID3D12Fence* genFence = nullptr;
@@ -5350,6 +5607,7 @@ private:
     ID3D12CommandQueue* pq = nullptr;
     ID3D12GraphicsCommandList* pqList = nullptr;
     ID3D12CommandAllocator* pqAlloc[kAllocs] {};
+    SpareLane pqSpare;                      // (BeginP)
     UINT64 pqAllocFence[kAllocs] {};
     ID3D12Fence* pqFence = nullptr;
     UINT64 pqValue = 0;
