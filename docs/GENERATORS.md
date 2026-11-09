@@ -176,16 +176,16 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   It decides who spaces a batch's frames when the game asks for V-Sync. With `display` the display does: each present goes out as soon as it is
   ready. With `timer` f5low waits for each frame's time itself on the plain schedule (no flip-metering lead, no burst: the driver meters nothing under V-Sync),
   for real V-Sync presents only (sync interval 1 or more; a sync-0 present with other flags such as DO_NOT_WAIT is left alone, and without V-Sync
-  nothing changes). `auto` picks `timer` where flip metering is off for the context (the condition `LateGen=auto` uses, `pacesched::MeterOff`: the GPU or
-  `FlipMetering=0` says off, or the driver path turned out unusable when `InitFlip` tried it; before `InitFlip` a context that wants metering counts as
-  metered, so `display`) and `display` for a context that uses flip metering. Whether that second half is the right rule under V-Sync is still being measured. Why: on a VRR display
-  below its top refresh rate a V-Sync present is shown as soon as it is ready, so leaving the spacing to the display gives uneven frames. The
-  contributor who found this (sqmagellan, PR #16) measured displayed frames alternating 7.3 / 9.7 ms at 2x on an RTX 40 laptop, 120 Hz VRR
-  panel, against 8.30-8.43 ms with the timer. Only the spacing changes: the `LateGen` time rules stay keyed on V-Sync, so a V-Sync batch still
-  drops only after a GPU timeout. Not yet measured on a fixed-refresh V-Sync display, where the display spaces the frames anyway and the timer
-  may add nothing or a little latency; `FixedPacing=display` gives the old behaviour. The effective mode is logged at start and again when
-  `InitFlip` decides (`FixedPacing=auto: timer|display ...`); an invalid value warns and becomes `auto`; with `Gate=1` it is always
-  `display` (logged). The decision is `pacesched::FixedTimer` (host test: `tests/build_fixed_pacing_test.ps1`).
+  nothing changes). `auto` (default) is `timer` for every V-Sync present on every GPU, because the driver never meters a V-Sync batch; with `Gate=1` it is
+  `display` (the gate paces by itself). Why: on a VRR display below its top refresh rate a V-Sync present is shown as soon as it is ready,
+  so leaving the spacing to the display gives uneven frames. The contributor who found this (sqmagellan, PR #16) measured displayed frames
+  alternating 7.3 / 9.7 ms at 2x on a 120 Hz VRR laptop, which became a steady 8.3 ms (8.30-8.43) with the timer. On a 120 Hz fixed-refresh display
+  with V-Sync forced (measured at 2x and 6x) the timer paced equal or smoother (2x: equal spread; 6x: spread 3.81 ms with `display` against 1.85 ms with the
+  timer, the 9-17 refresh holds gone) and the display latency was about 3-8 ms lower (2x 17.7 against 14.5 ms, 6x 22.2 against 14.3 ms); repeated refreshes
+  were the same and no frame was missed. Only the spacing changes: the `LateGen` time rules stay keyed on V-Sync, so a V-Sync batch still
+  drops only after a GPU timeout. `FixedPacing=display` gives the old behaviour. The effective mode is logged at start; an invalid value warns and
+  becomes `auto`; with `Gate=1` it is always `display` (logged). The decision is `pacesched::FixedTimer` (host test:
+  `tests/build_fixed_pacing_test.ps1`).
 - **own** (`src/xefg_own.h`, D3D12 path): a list of ours that fails to close is not executed (`Submit`). The first such failure turns generation
   off (log: `generation off: our GPU work could not be recorded - the game's frames pass through`) and tells XeLL generation is off; the game's own
   frames pass through. A frame whose own list fails to close is not presented at all (its swap chain buffer holds an older picture; presenting it

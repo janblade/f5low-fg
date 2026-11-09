@@ -1747,9 +1747,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         }
         // FixedPacing (XEFG_CUDA_FIXEDPACING): "auto" (default), "display" or "timer": who spaces the frames when the game asks for V-Sync
         // (xefg_own.h fixedMode, pace_sched.h FixedTimer). timer = f5low waits for each frame's time on the plain schedule; display = the
-        // display does. auto = timer where flip metering is off for this context (the condition LateGen=auto uses), display where the
-        // context uses flip metering (the driver meters nothing under V-Sync itself); InitFlip logs again if it turns out unusable. Real V-Sync only
-        // (sync interval >= 1). Not with Gate=1.
+        // display does. auto = timer on every GPU (the driver never meters a V-Sync batch). Real V-Sync only (sync interval >= 1). Not
+        // with Gate=1 (display).
         {
             std::string fp = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "auto");
             if (fp != "auto" && fp != "display" && fp != "timer")
@@ -1769,8 +1768,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                 XLog("FixedPacing=%s: %s", fp.c_str(),
                      o->fixedMode == pacesched::kFixedTimer ? "each frame waits for its time with V-Sync too (the plain schedule)"
                      : o->fixedMode == pacesched::kFixedDisplay ? "with V-Sync the display spaces the frames"
-                     : !o->flipMetering ? "timer: flip metering is off for this GPU, f5low times every frame itself with V-Sync too"
-                                        : "display for now (this context uses flip metering; timer if the driver path turns out unusable, logged then)");
+                     : "timer: f5low times every frame itself with V-Sync (the driver never meters a V-Sync batch)");
         }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");

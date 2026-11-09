@@ -205,23 +205,19 @@ inline bool LateTimeRule(unsigned char mode) { return mode == kLateDrop || mode 
 
 // FixedPacing= values (xefg_own.h fixedMode): who spaces a batch's frames when the game asks for V-Sync. Display: the display does (the
 // frames go out as soon as they are ready). Timer: f5low waits for each frame's time itself on the plain schedule (the LateGen rules stay as
-// they are: only the spacing changes). Auto (default): timer where flip metering is off for this context - the same condition LateGen=auto
-// uses (MeterOff; before InitFlip a context that wants metering counts as metered, so display) - display otherwise. Only a present with
-// a V-Sync interval is affected (the caller checks sync != 0); the timer then uses the plain schedule only (no lead, no burst, no metering:
-// the driver meters nothing under V-Sync). Never with Gate=1 (the gate has its own pacing).
+// they are: only the spacing changes). Auto (default): timer, on every GPU: the driver never meters a V-Sync batch, and the timer paced
+// equal or smoother with 3-8 ms less display latency on a fixed-refresh display (measured) and fixed uneven frames on a VRR one. Only a
+// present with a V-Sync interval is affected (the caller checks sync != 0); the timer uses the plain schedule only (no lead, no burst, no
+// metering). Never with Gate=1 (the gate has its own pacing): display.
 enum FixedMode : unsigned char { kFixedAuto = 0, kFixedDisplay = 1, kFixedTimer = 2 };
-// Flip metering is off for a context (LateGen=auto's and FixedPacing=auto's condition): the settings or the GPU say off (`flipMetering`
+// Flip metering is off for a context (LateGen=auto's condition): the settings or the GPU say off (`flipMetering`
 // false), or it was wanted but InitFlip tried (`flipTried`) and found no usable driver call (`flipFnUsable` false).
 inline bool MeterOff(bool flipMetering, bool flipTried, bool flipFnUsable) { return !flipMetering || (flipTried && !flipFnUsable); }
-inline bool FixedTimer(unsigned char mode, bool gate, bool flipMetering, bool flipTried, bool flipFnUsable)
+inline bool FixedTimer(unsigned char mode, bool gate)
 {
     if (gate)
         return false;
-    if (mode == kFixedTimer)
-        return true;
-    if (mode == kFixedDisplay)
-        return false;
-    return MeterOff(flipMetering, flipTried, flipFnUsable);
+    return mode != kFixedDisplay;
 }
 
 // LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame

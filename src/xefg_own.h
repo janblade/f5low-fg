@@ -490,11 +490,11 @@ public:
     // FixedPacing= in f5low.ini (pacesched::FixedMode): who spaces the frames when the game asks for V-Sync. On a VRR display below its
     // top refresh rate a V-Sync present is shown as soon as it is ready, so leaving the spacing to the display gave uneven frames
     // (World of Warcraft through OptiScaler, RTX 40 laptop, 120 Hz VRR panel: displayed 7.3 / 9.7 ms alternating at 2x, 8.30-8.43 ms
-    // with the timer). auto = timer where flip metering is off for this context (the driver meters nothing under V-Sync, so the
-    // rule keys on the context's metering state, not on V-Sync metering), display otherwise. Real V-Sync only (sync >= 1). PresentReal's paths
-    // only (Show, PresentAhead, PresentGen); not the gate. FixedTimer() is the effective choice.
+    // with the timer; fixed-refresh 120 Hz display, 2x and 6x: equal or smoother, 3-8 ms less display latency). auto = timer on every GPU
+    // (the driver never meters a V-Sync batch), display with Gate=1. Real V-Sync only (sync >= 1). PresentReal's paths only (Show,
+    // PresentAhead, PresentGen); not the gate. FixedTimer() is the effective choice.
     unsigned char fixedMode = pacesched::kFixedAuto;
-    bool FixedTimer() const { return pacesched::FixedTimer(fixedMode, gate, flipMetering, flipTried, flipFn != nullptr); }
+    bool FixedTimer() const { return pacesched::FixedTimer(fixedMode, gate); }
     bool oobQueue = false;                      // OobQueue=1 in f5low.ini: tell NVIDIA's driver our queues run out of band (OobNotify)
     bool oobSwitch = false;                     // OobQueue=switch: present type for the app's frame, render type for a generated one (RealPresent)
     bool flipBurst = false;                     // FlipBurst=1 (or DriverPacing=1 or 2) in f5low.ini, Gate=0: the chain made for the burst; a metered batch's presents after the first are released at once while pacingActive (PresentReal)
@@ -2960,16 +2960,12 @@ private:
             else
                 XLog("flip metering: on while V-Sync is off (NVIDIA driver), frames after a batch's first released %s%u us early",
                      flipLeadAuto ? "up to " : "", flipLeadUs);
-            if (fixedMode == pacesched::kFixedAuto && !gate)
-                XLog("FixedPacing=auto: display (this context uses flip metering; with V-Sync the display spaces the frames)");
             if (flipBurst && !BurstCapable())
                 XLog("burst: off for this swap chain (it is not the one we made, or presents on the game's queue)");
         }
         else
         {
             XLog("flip metering: off - %s", why);
-            if (fixedMode == pacesched::kFixedAuto && flipMetering && !gate)
-                XLog("FixedPacing=auto: timer (flip metering is unusable here, f5low times every frame itself with V-Sync too)");
             if (pacesched::LateNextFrame(lateMode) && flipMetering)
                 XLog("LateGen=%s: flip metering is unusable here, so its rules are active (stale drop, GPU timeout drop%s)",
                      lateMode == pacesched::kLateEarly ? "early" : "auto", pacesched::LateEarlyOut(lateMode) ? ", early-out" : "");
