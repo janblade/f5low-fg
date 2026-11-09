@@ -521,6 +521,7 @@ public:
     int testStallKind = 0;
     std::atomic<bool> testFired { false };
     unsigned testCloseFail = 0;                     // XEFG_CUDA_TESTCLOSEFAIL / TestCloseFail: the n-th Close of our lists counts as failed (0 = off)
+    unsigned testCloseEvery = 0;                    // ...and, if set ("n,every"), every `every`-th Close after it (0 = once)
     std::atomic<unsigned> testCloseCount { 0 };
     std::atomic<uint64_t> testFrameNow { 0 };       // the app frame the presenter / generation thread is on (TestStall)
     ID3D12Fence* testFence = nullptr;
@@ -1240,10 +1241,14 @@ public:
         HRESULT hr = l->Close();
         // Diagnostics (TestCloseFail, XEFG_CUDA_TESTCLOSEFAIL=<n>): the n-th Close of one of our lists counts as failed. The list is closed
         // for real (so it can be Reset as usual) and then left out, as a failed one is.
-        if (testCloseFail && SUCCEEDED(hr) && ++testCloseCount == testCloseFail)
+        if (testCloseFail && SUCCEEDED(hr))
         {
-            XLog("TestCloseFail: Close number %u of our lists (%s) is treated as failed (diagnostics, XEFG_CUDA_TESTCLOSEFAIL)", testCloseFail, what);
-            hr = E_FAIL;
+            const unsigned c = ++testCloseCount;
+            if (c == testCloseFail || (testCloseEvery && c > testCloseFail && (c - testCloseFail) % testCloseEvery == 0))
+            {
+                XLog("TestCloseFail: Close number %u of our lists (%s) is treated as failed (diagnostics, XEFG_CUDA_TESTCLOSEFAIL)", c, what);
+                hr = E_FAIL;
+            }
         }
         if (FAILED(hr))
         {
@@ -3762,7 +3767,10 @@ private:
                     XLog("present: %u frames generated", genCount);
             }
             else
+            {
+                GateSkip(f, k);
                 SkipGenerated(j, k, nGen);
+            }
         }
         {
             ID3D12Resource* rb = RealBuffer();
@@ -3792,7 +3800,10 @@ private:
             LanePresent(f, nGen + 1, j.sync, j.flags);
         }
         else
+        {
+            GateSkip(f, nGen + 1);
             NoteNotPresented();
+        }
         // Retired once its own frame went out (as Show does): signalled on our queue here, the application ran a frame further
         // ahead and its frames waited 22 ms longer to be taken (harness 6x at 30 fps, same rate).
         pq->Signal(retireFence, j.frame + 1);
@@ -3821,6 +3832,29 @@ private:
         {
             std::lock_guard<std::mutex> l(gm);
             gq.push_back({ v, k, content, pqValue, f });
+        }
+        gcv.notify_one();
+    }
+    // A present left out (our recording broke: SkipGenerated / NoteNotPresented) still takes its gate value and opens its slot in order,
+    // exactly as a presented one would: the generation passes already recorded for this frame (PresentGenGated, GenSpread) and the CUDA
+    // stream's (RunCuda) wait on gate values that only the presents hand out; one short of them blocks the generation lane for good (the lane's
+    // wait on genFence then never ends, harness run d4: DEVICE_HUNG). No copy, no Present, no frame-latency wait, nothing on the lane.
+    void GateSkip(const Frame& f, uint32_t k)
+    {
+        const UINT64 v = ++gateValue;
+        if (DisplayPaced(f.j))
+        {
+            GateRelease(v);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> l(gm);
+            GateItem it;
+            it.v = v;
+            it.k = k;
+            it.skip = true;
+            it.f = f;
+            gq.push_back(it);
         }
         gcv.notify_one();
     }
@@ -3939,6 +3973,11 @@ private:
                              static_cast<unsigned long long>(pqValue), static_cast<unsigned long long>(genFence ? genFence->GetCompletedValue() : 0),
                              static_cast<unsigned long long>(genValue));
                     }
+                }
+                if (it.skip)
+                {
+                    GateRelease(it.v);      // left out: its slot opens in order, nothing else (GateSkip)
+                    continue;
                 }
                 const Frame& f = it.f;
                 long long slot = 0;         // its clock time; metered (Meter), let out FlipLead before it
@@ -4726,6 +4765,11 @@ private:
         const uint32_t spread = DisplayPaced(j) ? 0 : genSpread;
         for (uint32_t k = 1; k <= nGen && !j.cut; ++k)
         {
+            // Our recording is broken already (listBroken: a pass above failed to close, or an earlier frame's did): no more passes for
+            // this frame, nothing of it is shown. The lane loop below hands out every gate value of the frame all the same (GateSkip), so the
+            // passes recorded before the failure, which wait on them, still run through.
+            if (listBroken.load(std::memory_order_relaxed))
+                break;
             if (!ringG[set][k - 1] && !(ringG[set][k - 1] = PlainBuffer(pg->Buf(GenSlot::Output).bytes, true)))
             {
                 nGen = k - 1;               // as many as have a buffer
@@ -4758,6 +4802,12 @@ private:
         pq->Wait(genFence, heldAt);
         for (uint32_t k = 1; k <= nGen; ++k)
         {
+            if (listBroken.load(std::memory_order_relaxed))
+            {
+                GateSkip(f, k);             // nothing recorded or copied for it (the passes may not exist), its gate value all the same
+                SkipGenerated(j, k, nGen);
+                continue;
+            }
             if (!j.cut)
                 pq->Wait(genFence, f.done[k - 1]);
             ID3D12Resource* rb = RealBuffer();
@@ -4789,7 +4839,10 @@ private:
                     XLog("present: %u frames generated", genCount);
             }
             else
+            {
+                GateSkip(f, k);
                 SkipGenerated(j, k, nGen);
+            }
         }
         {
             ID3D12Resource* rb = RealBuffer();
@@ -4811,7 +4864,10 @@ private:
             LanePresent(f, nGen + 1, j.sync, j.flags);
         }
         else
+        {
+            GateSkip(f, nGen + 1);
             NoteNotPresented();
+        }
         pq->Signal(retireFence, j.frame + 1);   // retired once its own frame went out (ShowGated)
         Stats(j, nGen);
         showing = nullptr;
@@ -6058,6 +6114,7 @@ private:
         UINT64 content = 0;
         UINT64 copied = 0;                  // pqFence value of its copy into the swap chain's buffer
         Frame f;
+        bool skip = false;                  // a present left out (GateSkip): only its gate value is handed on, in order
     };
     std::deque<GateItem> gq;
     std::mutex gm;
