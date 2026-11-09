@@ -472,7 +472,7 @@ public:
     std::string genMode = "off";                // GenQueue= in f5low.ini: off, direct or compute (see PresentGen)
     std::string genPriority;                    // GenPriority= in f5low.ini: high or normal; empty: normal with the gate, else high
     bool genBlock = false;                      // GenBlock=1 in f5low.ini (blockFence, BlockDone): the game's next frame waits for our passes
-    bool lateDrop = false;                      // LateGen=drop in f5low.ini (pacesched::DropLate, PresentReal): a generated frame that missed its time is left out
+    uint8_t lateMode = 1;                       // LateGen= in f5low.ini: 0 show, 1 auto (a GPU timeout drops, only without flip metering), 2 drop (also the one-step time rule); PresentReal, pacesched::DropLate
     bool presentNormal = false;                 // PresentPriority=normal in f5low.ini (diagnostic only): our present queue at normal priority.
                                                 // It does not imitate an RTX 20 (whose problem is slow switching between queues).
     uint32_t genSpread = 2;                     // GenSpread= in f5low.ini: the D3D12 gate's passes, steps apart (0: at once; PresentGenGated)
@@ -2161,17 +2161,21 @@ private:
         // the stats show the real gap. The clock gets catch-up (lastRelease = its time). The callers' fences (Consumed, BlockDone,
         // aheadRead, retireFence) are signalled after the loop as always. Its copy is already submitted; the next present's copy
         // overwrites it in the same buffer.
+        // LateGen=auto drops on a GPU timeout only and only without flip metering (Meter is a no-op there); with metering it is show.
+        // LateGen=drop adds the time rule, which needs Meter's decision for this batch first (k == 1).
         bool metered_ = false;
-        if (lateDrop && n > 0 && k <= n)
+        if (pacesched::LateActive(lateMode, flipMetering) && n > 0 && k <= n)
         {
-            if (k == 1)
+            if (k == 1 && pacesched::LateTimeRule(lateMode))
             {
                 Meter(j, n);
                 metered_ = true;
             }
-            const bool timed = paced && !Metered(j) && !Burst();
+            const bool timed = pacesched::LateTimeRule(lateMode) && paced && !Metered(j) && !Burst();
             if (pacesched::DropLate(true, true, gpuOk, timed, Now(), rawTarget, step))
             {
+                if (k == 1 && !metered_)
+                    Meter(j, n);
                 ++statDropLate;
                 statDropTimeout += !gpuOk;
                 statDropFirst += k == 1;
@@ -2220,7 +2224,7 @@ private:
             Meter(j, n);
         Removed("our last submission, before our Present");
         // The batch's first present that really goes out carries the out-of-band render start (with LateGen=drop that may not be k == 1).
-        const bool firstOut = lateDrop ? oobStartFrame != j.frame + 1 : k == 1;
+        const bool firstOut = lateMode ? oobStartFrame != j.frame + 1 : k == 1;
         oobStartFrame = j.frame + 1;
         const HRESULT hr = RealPresent(j, sync, flags, k <= n, firstOut);
         if (genCount > 600 && traced < 40)
@@ -4697,9 +4701,9 @@ private:
         if (statLeadFrames)
             XLog("stats: pace lead %.2f ms (%.2f - %.2f over %u app frames, %s, window max %.2f), %u generated frames late", leadState.ms,
                  leadMin, leadMax, statLeadFrames, leadState.automatic ? "auto" : "fixed", leadState.ringMax, statLeadLate);
-        if (lateDrop)
-            XLog("stats: LateGen=drop: %u generated frames left out (%u after a GPU wait ran out, %u of them a batch's first: those are not in the "
-                 "first-frame time above)", statDropLate, statDropTimeout, statDropFirst);
+        if (statDropLate)
+            XLog("stats: LateGen=%s: %u generated frames left out (%u after a GPU wait ran out, %u of them a batch's first: those are not in the "
+                 "first-frame time above)", lateMode == 2 ? "drop" : "auto", statDropLate, statDropTimeout, statDropFirst);
         statDropLate = statDropTimeout = statDropFirst = 0;
         leadMin = 1e9;
         leadMax = 0;

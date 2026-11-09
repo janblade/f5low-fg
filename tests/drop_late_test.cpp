@@ -41,6 +41,17 @@ int main()
     // the real frame is never dropped, whatever the wait or time say
     CHECK(!DropLate(true, false, false, true, raw + 50 * step, raw, step));
     CHECK(!DropLate(true, false, true, true, raw + 50 * step, raw, step));
+    // modes: show nothing; auto a timeout only, only without flip metering, never the time rule; drop both, on every GPU
+    {
+        using namespace pacesched;
+        CHECK(!LateActive(kLateShow, false) && !LateActive(kLateShow, true));
+        CHECK(LateActive(kLateAuto, false) && !LateActive(kLateAuto, true));
+        CHECK(LateActive(kLateDrop, false) && LateActive(kLateDrop, true));
+        CHECK(!LateTimeRule(kLateShow) && !LateTimeRule(kLateAuto) && LateTimeRule(kLateDrop));
+        // auto, not metered: timeout drops, a very late frame with a good wait does not (timed false)
+        CHECK(DropLate(true, true, false, LateTimeRule(kLateAuto), raw, raw, step));
+        CHECK(!DropLate(true, true, true, LateTimeRule(kLateAuto), raw + 50 * step, raw, step));
+    }
     // LateGen=show never drops
     CHECK(!DropLate(false, true, false, true, raw + 50 * step, raw, step));
     CHECK(!DropLate(false, true, true, true, raw + 50 * step, raw, step));

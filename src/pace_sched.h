@@ -188,6 +188,12 @@ struct Lag
 // lead (F5LOW_TEST_SINK_LEAD_MS) is never cut by it - the experiment must run the lead it asks for.
 inline long long LeadCap(long long cap, long long lead, bool fixedTestLead) { return fixedTestLead ? std::max(cap, lead) : cap; }
 
+// LateGen= values (xefg_own.h lateMode) and what each lets PresentReal do. Show: nothing. Auto: a GPU timeout drops, only without flip
+// metering; the time rule never. Drop: both, on every GPU.
+enum LateMode : unsigned char { kLateShow = 0, kLateAuto = 1, kLateDrop = 2 };
+inline bool LateActive(unsigned char mode, bool flipMetering) { return mode == kLateDrop || (mode == kLateAuto && !flipMetering); }
+inline bool LateTimeRule(unsigned char mode) { return mode == kLateDrop; }
+
 // LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
 // (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. Where its time means something
 // (`timed`: the schedule or the clock paces the batch - not V-Sync, not a burst or flip-metered batch, whose later presents never wait
