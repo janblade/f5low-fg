@@ -41,6 +41,10 @@ int main()
     // show does nothing
     CHECK(!LateActive(kLateShow, false) && !LateActive(kLateShow, true));
 
+    // Every time rule above is asked with `timed` = not display-paced (V-Sync), never with the pacer's own "paced" flag: V-Sync stays out
+    // of AutoStale / AutoWaitOver / CompressEarly / CompressDrop even if a timer is later used under V-Sync (xefg_own.h PresentReal).
+    CHECK(!CompressEarly(false, true) && !CompressDrop(true, true, false, true, true));
+
     // ---- compress
     CHECK(LateActive(kLateCompress, false) && LateActive(kLateCompress, true) && LateTimeRule(kLateCompress));
     // next game frame not finished: no early release, no stale drop (as show)

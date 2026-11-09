@@ -2205,6 +2205,8 @@ private:
         if (!rawTarget)
             rawTarget = target;
         const bool paced = n > 0 && !DisplayPaced(j);
+        // The time rules of LateGen (auto, drop, compress) key on !DisplayPaced(j), not on `paced`: V-Sync keeps them off even if `paced` is
+        // ever turned on under V-Sync (a fixed timer pacing option).
         // The burst (DriverPacing / FlipBurst): a metered batch's presents after the first are not waited for (lastRelease below keeps
         // their slots for the clock pacer). Without it they go FlipLead early. Bound (the schedule path) measures from the end of the last
         // burst (lastAnyPresent) and clamps the batch's first present to between half a step and two steps after it: at 3x or more it
@@ -2221,7 +2223,7 @@ private:
         // showing->clock) keeps it too: its release times feed the clock's correction.
         const bool meterOff = !flipMetering || (flipTried && !flipFn);
         const bool gen = n > 0 && k <= n;
-        const bool autoTimed = lateMode == pacesched::kLateAuto && meterOff && n > 0 && paced && !metered && !(showing && showing->clock);
+        const bool autoTimed = lateMode == pacesched::kLateAuto && meterOff && n > 0 && !DisplayPaced(j) && !metered && !(showing && showing->clock);
         if (gen)
             ++statGenPresents;
         // LateGen=compress, the game's next frame finished: a timed batch (its real frame too) does not sleep for its slot (below). The
@@ -2234,7 +2236,7 @@ private:
                 Meter(j, n);
                 metered_ = true;
             }
-            squeeze = pacesched::CompressEarly(paced && !Metered(j) && !Burst(), true);
+            squeeze = pacesched::CompressEarly(n > 0 && !DisplayPaced(j) && !Metered(j) && !Burst(), true);
         }
         // LateGen=auto, timed batch: a generated frame is stale (not presented, no wait) when the game's next frame is finished and its
         // slot is already past (it would be late anyway) or the presenter was already behind when it took the batch (catchUp). An on-time
@@ -2252,14 +2254,14 @@ private:
                 PaceRecord(Now(), showing ? showing->ready : jobBase, target, j.frame, k, n + 1, kPaceDropped);
             return 0.0;
         }
-        bool compressed = false, early = false;
+        bool compressed = false, outEarly = false;
         if (autoTimed)
         {
             // Early-out: the wait for the slot ends when the game's next frame is finished (every frame of the batch, the real one too); the
             // frame then goes out no sooner than MinGap after the last present, so nothing bunches.
             if (WaitSlotOrNext(j, target - lead))
             {
-                early = true;
+                outEarly = true;
                 ++statAutoEarly;
                 WaitUntil(pacesched::CompressAt(Now(), lastShown, step));
             }
@@ -2299,7 +2301,7 @@ private:
                 Meter(j, n);
                 metered_ = true;
             }
-            const bool timed = pacesched::LateTimeRule(lateMode) && paced && !Metered(j) && !Burst();
+            const bool timed = pacesched::LateTimeRule(lateMode) && n > 0 && !DisplayPaced(j) && !Metered(j) && !Burst();
             // compress: only a frame a whole game frame behind (the next game frame and the one after it are both done), or one whose GPU
             // wait ran out; merely late is squeezed above
             const bool drop = lateMode == pacesched::kLateCompress
@@ -2400,7 +2402,7 @@ private:
             lastReal = t;
         if (paceLog)
             PaceRecord(t, showing ? showing->ready : jobBase, target, j.frame, k, n + 1,
-                       static_cast<uint8_t>(compressed ? kPaceCompressed : early ? kPaceEarly : paced && static_cast<double>(t - target) * 1000.0 / freq() > 0.5 ? kPaceLate : 0));
+                       static_cast<uint8_t>(compressed ? kPaceCompressed : outEarly ? kPaceEarly : paced && static_cast<double>(t - target) * 1000.0 / freq() > 0.5 ? kPaceLate : 0));
         return late;
     }
     void Hitch(uint32_t k, uint32_t n, long long before, long long t0, long long target, long long tg, double gpuWaitMs, long long tw0,
