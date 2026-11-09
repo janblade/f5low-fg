@@ -1856,10 +1856,16 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         }
         // Diagnostics (xefg_own.h, Submit): XEFG_CUDA_TESTCLOSEFAIL=<n> (or TestCloseFail= in f5low.ini): the n-th Close of one of our lists counts as
         // failed, to run the failed-list path (generation off until the swap chain is rebuilt) in a game. Debug only.
-        o->testCloseFail = static_cast<unsigned>(std::max(0, atoi(Setting("XEFG_CUDA_TESTCLOSEFAIL", "TestCloseFail", "0").c_str())));
+        // "n" fails the n-th Close once; "n,every" also every `every`-th Close after it (repeated failures).
+        {
+            const std::string v = Setting("XEFG_CUDA_TESTCLOSEFAIL", "TestCloseFail", "0");
+            o->testCloseFail = static_cast<unsigned>(std::max(0, atoi(v.c_str())));
+            const size_t comma = v.find(',');
+            o->testCloseEvery = comma == std::string::npos ? 0u : static_cast<unsigned>(std::max(0, atoi(v.c_str() + comma + 1)));
+        }
         if (o->testCloseFail)
-            XLog("WARNING: XEFG_CUDA_TESTCLOSEFAIL=%u - Close number %u of our lists will be treated as FAILED (debug only; generation then goes off)",
-                 o->testCloseFail, o->testCloseFail);
+            XLog("WARNING: XEFG_CUDA_TESTCLOSEFAIL=%u,%u - Close number %u of our lists will be treated as FAILED%s (debug only; generation then goes off)",
+                 o->testCloseFail, o->testCloseEvery, o->testCloseFail, o->testCloseEvery ? ", then every one after that many more" : "");
         o->gameWaitMs = boundMs("XEFG_CUDA_GAMEWAITMS", "GameWaitMs", "500", 500, 10, 2000);
         o->oobMarkers = have > 0 && Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";      // (no NVIDIA compute device: off with the rest)
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):

@@ -56,4 +56,5 @@ One "TestStall:" line is logged when it fires. There is no forced stall for the 
 
 A forced failed list (debug only): `TestCloseFail=<n>` in f5low.ini, or the environment variable `XEFG_CUDA_TESTCLOSEFAIL=<n>`, makes the n-th Close
 of one of the own generator's lists count as failed (the list is closed for real and then not executed). A "WARNING: ... TestCloseFail" line is logged
-at start and one when it fires; generation then goes off and the game's frames pass through until the swap chain is rebuilt (docs/GENERATORS.md).
+at start and one when it fires; `TestCloseFail=<n>,<every>` (for example `300,200`) fails the n-th Close and then every `every`-th Close after it, to
+run repeated failures, the once-a-second "frames not presented" log and the 3-re-arm cap. Unset costs nothing. Generation then goes off and the game's frames pass through until the swap chain is rebuilt (docs/GENERATORS.md).

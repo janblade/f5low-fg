@@ -63,6 +63,7 @@
 //                   (with the DLL's PaceLog / sink pace lines tests/pacer_ab.ps1 gets latencies from them)
 //   REPRO_MENU=N    two N-frame stretches (from a quarter and from five eighths of the frames on) with frame generation
 //                   still enabled but no tags, no SetPresentId and no frame constants: Cyberpunk's pause menu
+//   REPRO_RESIZE_EVERY=n  a ResizeBuffers every n frames of the frames on (rebuilds in a row)
 //   REPRO_FS=1      exclusive fullscreen from a third of the frames on until two thirds (SetFullscreenState + ResizeBuffers)
 //   REPRO_RECREATE_GEN=name  with REPRO_RECREATE_AT: F5LOW_GENERATOR is set to name before the new context is made
 //                   (own <-> dlssg without a restart)
@@ -457,6 +458,7 @@ int main(int argc, char** argv)
     const bool gbv = EnvInt("REPRO_GBV", 0) == 1, noIdle = EnvInt("REPRO_NOIDLE", 0) == 1, toggle = EnvInt("REPRO_TOGGLE", 0) == 1;
     const bool removeDevice = EnvInt("REPRO_REMOVE", 0) == 1, resizeBuf = EnvInt("REPRO_RESIZEBUF", 0) == 1;
     const bool bar = EnvInt("REPRO_BAR", 0) == 1;
+    const int resizeEvery = EnvInt("REPRO_RESIZE_EVERY", 0);
     const UINT syncInterval = static_cast<UINT>((std::max)(0, (std::min)(4, EnvInt("REPRO_SYNC", 0))));
     const bool fsTest = EnvInt("REPRO_FS", 0) == 1;
     const int appFps = EnvInt("REPRO_FPS", 0);
@@ -1008,6 +1010,15 @@ int main(int argc, char** argv)
         if (xellMarker)
             xellMarker(xell, static_cast<uint32_t>(frame), 5);
         bb->Release();
+        // REPRO_RESIZE_EVERY=n: a ResizeBuffers every n frames of the frames on (swap chain rebuilds one after the other: the failed-list
+        // re-arm cap, TestCloseFail with "n,every").
+        if (resizeEvery > 0 && frame > framesOff && (frame - framesOff) % resizeEvery == 0)
+        {
+            LARGE_INTEGER r0;
+            QueryPerformanceCounter(&r0);
+            const HRESULT rr = sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, sd.Flags);
+            printf("frame %d: ResizeBuffers (every %d) 0x%08lx, %.2f ms\n", frame, resizeEvery, static_cast<unsigned long>(rr), ms(r0));
+        }
         if (resizeBuf && (frame == framesOff || frame == framesOff + 3))
         {
             LARGE_INTEGER r0;

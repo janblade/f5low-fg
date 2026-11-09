@@ -199,7 +199,8 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   only after a real swap chain change (a successful `ResizeBuffers`, which drains the presenter first; a new chain is a new context), not on a pack
   rebuild for a render-size change (dynamic resolution). Log `generation back on after the swap chain was rebuilt (n of 3)`: at most 3 times per
   context, after that generation stays off (logged). XeLL is told again each time.
-  Test switch (debug only, logged loudly): `XEFG_CUDA_TESTCLOSEFAIL=<n>` (or `TestCloseFail=<n>` in f5low.ini) treats the n-th list close as failed,
+  Test switch (debug only, logged loudly): `XEFG_CUDA_TESTCLOSEFAIL=<n>[,<every>]` (or `TestCloseFail=<n>[,<every>]` in f5low.ini) treats the n-th list
+  close as failed and, with `every`, also every `every`-th close after it (repeated failures, the once-a-second "frames not presented" log, the 3-re-arm cap),
   to run this path in a game; the list is really closed and then left out. There is no host test for the Close path (it needs a device).
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
