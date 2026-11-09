@@ -1,7 +1,10 @@
 // Host-only test of the LateGen=auto next-frame rules and LateGen=compress (src/pace_sched.h): no GPU, no Windows API.
 // tests/build_compress_late_test.ps1 builds it. Exit code 0: all checks passed.
 #include "../src/pace_sched.h"
+#include <algorithm>
 #include <cstdio>
+#include <random>
+#include <vector>
 
 static int g_fail = 0;
 #define CHECK(c)                                                                                \
@@ -19,18 +22,17 @@ int main()
     using namespace pacesched;
     const long long step = 1000, raw = 10000;
 
-    // auto stale: the next game frame is finished, on a timed generated frame only
-    CHECK(AutoStale(true, true, true));
-    CHECK(!AutoStale(true, true, false));                           // not finished, or not known
-    CHECK(!AutoStale(false, true, true));                           // the real frame
-    CHECK(!AutoStale(true, false, true));                           // metered, burst or V-Sync
-    // auto early-out: the slot wait ends at the slot, or at once when the next game frame is finished (generated, timed)
-    CHECK(AutoWaitOver(true, true, true, 100, 5000));
-    CHECK(!AutoWaitOver(true, true, false, 100, 5000));
-    CHECK(AutoWaitOver(true, true, false, 5000, 5000));
-    CHECK(!AutoWaitOver(false, true, true, 100, 5000));             // the real frame waits for its slot
-    CHECK(!AutoWaitOver(true, false, true, 100, 5000));             // not timed: no early-out
-    CHECK(AutoWaitOver(true, false, false, 9000, 5000));            // a slot in the past is over
+    // auto early-out: the wait for a slot is over at the slot, or when the next game frame is finished (generated or real frame alike)
+    CHECK(AutoWaitOver(true, 100, 5000));
+    CHECK(!AutoWaitOver(false, 100, 5000));                         // not finished, or not known: waits for the slot
+    CHECK(AutoWaitOver(false, 5000, 5000));
+    CHECK(AutoWaitOver(false, 9000, 5000));
+    // auto stale: only a generated frame, with the next game frame finished AND (its slot already past, or the presenter was behind at Pick)
+    CHECK(AutoStale(true, true, true, false));                      // late anyway
+    CHECK(AutoStale(true, true, false, true));                      // behind when it took the batch
+    CHECK(!AutoStale(true, true, false, false));                    // on time: goes out under the early-out, never dropped
+    CHECK(!AutoStale(true, false, true, true));                     // next frame not finished or not known
+    CHECK(!AutoStale(false, true, true, true));                     // the real frame
     // auto is active only without flip metering; its GPU timeout drop does not need a timed batch (V-Sync included), the time rule is off
     CHECK(LateActive(kLateAuto, false) && !LateActive(kLateAuto, true));
     CHECK(DropLate(true, true, false, LateTimeRule(kLateAuto), raw - 500, raw, step));      // timeout, V-Sync (timed false in the caller)
@@ -88,6 +90,72 @@ int main()
     // a GPU wait that ran out still drops a generated frame: timed or not
     CHECK(CompressDrop(true, false, true, false, false));
     CHECK(CompressDrop(true, false, false, false, false));
+
+    // ---- a jittered game through the schedule rules (xefg_own.h PresentReal's, with its smoothing), counting what auto does
+    for (int variant = 0; variant < 2; ++variant)
+        for (unsigned n : { 1u, 3u, 5u })
+        {
+            const bool ramp = variant == 1;
+            std::mt19937 rng(12345 + n + variant * 100);
+            std::normal_distribution<double> noise(0.0, 0.10);
+            const double us = 1000.0;                                   // ticks: microseconds
+            std::vector<long long> ready;                               // ready stamps of the game frames
+            double t = 1e6;
+            for (int f = 0; f < 6000; ++f)
+            {
+                const double base = ramp ? (f < 600 ? 25.0 + (16.7 - 25.0) * f / 600.0 : 16.7) : 16.7;    // 40 -> 60 fps over 600 frames
+                ready.push_back(static_cast<long long>(t));
+                t += std::max(0.3 * base, base * (1.0 + noise(rng))) * us;
+            }
+            ReadyInterval ri;
+            long long base = 0, lastAny = 0, lastShown = 0, now = 0;
+            unsigned stale = 0, early = 0, gens = 0, tooClose = 0, presents = 0;
+            double lat = 0;
+            for (size_t f = 1; f + 2 < ready.size(); ++f)
+            {
+                ri.Observe(static_cast<double>(ready[f] - ready[f - 1]) / us);
+                const long long iv = static_cast<long long>(ri.ms * us);
+                base = NextBase(base, ready[f], 0, iv);
+                const long long st = iv / (n + 1);
+                now = std::max(now, ready[f]);                          // the presenter takes the frame once it is done
+                const bool behind = ready[f + 1] <= now;
+                for (unsigned k = 1; k <= n + 1; ++k)
+                {
+                    const bool gen = k <= n;
+                    const long long slot = Bound(base + static_cast<long long>(k) * st, st, lastAny);
+                    const bool nextDone = now >= ready[f + 1];
+                    if (gen)
+                        ++gens;
+                    if (AutoStale(gen, nextDone, now >= slot, behind))
+                    {
+                        ++stale;
+                        lastAny = std::max(lastAny, slot);
+                        continue;
+                    }
+                    long long at;
+                    if (now >= slot)
+                        at = now;
+                    else if (AutoWaitOver(nextDone, now, slot))
+                        at = std::max(now, lastShown + MinGap(st)), ++early;
+                    else if (ready[f + 1] < slot)                       // the wait ends when the next game frame does
+                        at = std::max(ready[f + 1], lastShown + MinGap(st)), ++early;
+                    else
+                        at = slot;
+                    now = at;
+                    if (lastShown && at - lastShown < MinGap(st))
+                        ++tooClose;
+                    lastAny = lastShown = at;
+                    ++presents;
+                    if (k == n + 1)
+                        lat += static_cast<double>(at - ready[f]) / us;
+                }
+            }
+            printf("model %s %ux: %u of %u generated frames stale, %u of %u presents released early, %u gaps under the minimum, "
+                   "real frame %.2f ms after its ready stamp on average\n", ramp ? "40->60 fps" : "60 fps", n + 1, stale, gens, early, presents,
+                   tooClose, lat / 5900.0);
+            CHECK(stale == 0);
+            CHECK(tooClose == 0);
+        }
 
     if (g_fail)
         printf("compress_late_test: %d FAILED\n", g_fail);

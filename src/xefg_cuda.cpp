@@ -1739,7 +1739,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                  o->lateMode == 2 ? "generated frames that time out or are over a step late are left out"
                  : o->lateMode == 3 ? "a late batch is squeezed; only a frame a whole game frame behind is left out"
                  : o->lateMode == 0 ? "every generated frame is shown"
-                 : o->flipMetering ? "same as show (flip metering is on for this GPU)"
+                 : o->flipMetering ? "same as show while flip metering is on for this GPU (if the driver path turns out unusable it is logged and the rules apply)"
                                    : "a generated frame whose GPU work timed out or whose game frame is stale is left out, a slot wait ends "
                                      "when the game's next frame is done (flip metering is off)");
         }

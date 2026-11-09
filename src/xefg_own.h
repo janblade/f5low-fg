@@ -679,6 +679,8 @@ public:
             CloseHandle(retireEvent);
         if (gpuEvent)
             CloseHandle(gpuEvent);
+        if (nextEvent)
+            CloseHandle(nextEvent);
         generator->Shutdown();
         if (list)
             list->Release();
@@ -953,6 +955,7 @@ public:
         hostEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         retireEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         gpuEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        nextEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         // GenBlock: its generation lane (direct unless GenQueue=compute) only where the ahead path can run - our own swap chain (the
         // game's queue is not our present queue), Gate=0, the D3D12 path. Elsewhere the default path stays as it was (Show).
         if (genBlock && genMode == "off" && D3d() && !gate && queue != appQueue)
@@ -1704,7 +1707,7 @@ private:
 
     // PaceLog: one record per present of a frame that generates, kept in memory (a log line each would perturb the pacing) and
     // written by PaceDump. t: the present's time (QPC), ready: the app frame's ready stamp, target: the time it was aimed at.
-    enum : uint8_t { kPaceLate = 1, kPaceDropped = 2, kPaceCompressed = 4 };
+    enum : uint8_t { kPaceLate = 1, kPaceDropped = 2, kPaceCompressed = 4, kPaceEarly = 8 };
     static constexpr size_t kPaceMax = 50000;
     struct PaceRec
     {
@@ -1722,7 +1725,7 @@ private:
         else
             ++paceDropped;
     }
-    // "pace: t=<ms> frame=<app frame> k=<present>/<of> ready=<ms> target=<ms> flags=<late|dropped|compressed|->": ms are QPC milliseconds.
+    // "pace: t=<ms> frame=<app frame> k=<present>/<of> ready=<ms> target=<ms> flags=<late|dropped|compressed|early|->": ms are QPC milliseconds.
     void PaceDump()
     {
         std::vector<PaceRec> recs;
@@ -1735,7 +1738,7 @@ private:
         const double q = 1000.0 / freq();
         for (const PaceRec& r : recs)
             XLog("pace: t=%.3f frame=%llu k=%u/%u ready=%.3f target=%.3f flags=%s", r.t * q, static_cast<unsigned long long>(r.frame), r.k,
-                 static_cast<unsigned>(r.n), r.ready * q, r.target * q, r.flags & kPaceDropped ? "dropped," : r.flags & kPaceCompressed ? "compressed," : r.flags & kPaceLate ? "late," : "-");
+                 static_cast<unsigned>(r.n), r.ready * q, r.target * q, r.flags & kPaceDropped ? "dropped," : r.flags & kPaceCompressed ? "compressed," : r.flags & kPaceEarly ? "early," : r.flags & kPaceLate ? "late," : "-");
         if (dropped)
             XLog("pace: %zu records not kept (the first %zu are above)", dropped, kPaceMax);
     }
@@ -2133,12 +2136,59 @@ private:
         const UINT64 done = appFence->GetCompletedValue();
         return done != UINT64_MAX && done >= v;
     }
-    // LateGen=auto: the wait for a slot, in slices of kAutoSliceMs, ends early once the game's next frame is done (pacesched::AutoWaitOver).
-    void WaitSlotOrNext(const Job& j, long long slot)
+    // LateGen=auto: waits for `slot` (QPC) but stops as soon as the game's next frame is finished. True: it stopped for that, before the slot.
+    // Not a spin: the thread sleeps on the next frame's fence event and a high-resolution timer set kAutoSpinMs before the slot, and spins
+    // only for that last stretch (as WaitUntil does), where it looks at the fence in between. Bounded by the slot (the timer is always set,
+    // at most about two steps away: Bound), so a fence that never moves or a removed device (the fence reads UINT64_MAX; a failed
+    // registration) falls back to the plain wait for the slot.
+    bool WaitSlotOrNext(const Job& j, long long slot)
     {
-        const long long slice = static_cast<long long>(pacesched::kAutoSliceMs * freq() / 1000.0);
-        while (!pacesched::AutoWaitOver(true, true, GameFrameDone(j, 1), Now(), slot))
-            WaitUntil(std::min(slot, Now() + slice));
+        static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        const long long spin = static_cast<long long>(pacesched::kAutoSpinMs * freq() / 1000.0);
+        if (Now() >= slot)
+            return false;
+        if (GameFrameDone(j, 1))
+            return true;
+        bool ev = nextEvent && appFence->GetCompletedValue() != UINT64_MAX;
+        if (ev)
+        {
+            ResetEvent(nextEvent);
+            ev = SUCCEEDED(appFence->SetEventOnCompletion(j.frame + 2, nextEvent));     // game frame j.frame + 1 done: fence j.frame + 2
+        }
+        for (;;)
+        {
+            const long long left = slot - Now();
+            if (left <= 0)
+                return false;
+            if (GameFrameDone(j, 1))
+                return true;
+            if (left > spin + spin / 4 && timer)
+            {
+                LARGE_INTEGER due;
+                due.QuadPart = -static_cast<LONGLONG>(static_cast<double>(left - spin) * 10000000.0 / static_cast<double>(freq()));  // relative, 100 ns
+                if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0))
+                {
+                    const HANDLE h[2] = { timer, nextEvent };
+                    const DWORD w = WaitForMultipleObjects(ev ? 2 : 1, h, FALSE, INFINITE);
+                    if (w == WAIT_OBJECT_0 + 1)
+                    {
+                        CancelWaitableTimer(timer);
+                        if (!GameFrameDone(j, 1) && appFence->GetCompletedValue() != UINT64_MAX)
+                        {
+                            ResetEvent(nextEvent);      // a registration of an earlier frame fired: ask again for this one
+                            ev = SUCCEEDED(appFence->SetEventOnCompletion(j.frame + 2, nextEvent));
+                        }
+                        else if (appFence->GetCompletedValue() == UINT64_MAX)
+                            ev = false;
+                    }
+                    continue;
+                }
+            }
+            if (left > 2 * freq() / 1000)
+                Sleep(1);
+            else
+                YieldProcessor();
+        }
     }
     // target: worked out by the caller beforehand (Show, before Early moves the timeline on), else here. Returns how
     // many ms our GPU work held the frame past its target (0 if it was done in time).
@@ -2166,17 +2216,18 @@ private:
         const long long t0 = Now(), before = lastShown;
         bool metered_ = false;
         // Flip metering is off for LateGen=auto when the settings say so (flipMetering, as the GPU resolved it), or when it was wanted but the
-        // driver path turned out unusable (InitFlip tried and left flipFn null - never metered, whatever the settings). Either way Metered(j)
-        // is then false for the batch; the time-based rules still ask for it (a batch the driver meters keeps its pacing).
+        // driver path turned out unusable (InitFlip tried and left flipFn null - never metered, whatever the settings); the batch is then not
+        // metered either (`metered` false), and a batch the driver does meter keeps its pacing. A batch on the clock pacer (CUDA path,
+        // showing->clock) keeps it too: its release times feed the clock's correction.
         const bool meterOff = !flipMetering || (flipTried && !flipFn);
         const bool gen = n > 0 && k <= n;
-        const bool autoTimed = lateMode == pacesched::kLateAuto && meterOff && gen && paced && !metered && !burst && !Metered(j);
-        // LateGen=auto, timed batch: a generated frame whose game frame is stale (the game's next frame is finished on the GPU) is not
-        // presented, whatever its slot: checked before it waits. Same bookkeeping as the drop below. The real frame is never touched.
-        // LateGen=compress, the game's next frame finished: a timed batch does not sleep for its slot (below). The batch's flip metering must
-        // be known for that, so Meter runs now for its first present. `squeeze`: no sleep to the slot.
+        const bool autoTimed = lateMode == pacesched::kLateAuto && meterOff && n > 0 && paced && !metered && !(showing && showing->clock);
+        if (gen)
+            ++statGenPresents;
+        // LateGen=compress, the game's next frame finished: a timed batch (its real frame too) does not sleep for its slot (below). The
+        // batch's flip metering must be known for that, so Meter runs now for its first present. `squeeze`: no sleep to the slot.
         bool squeeze = false;
-        if (lateMode == pacesched::kLateCompress && gen && GameFrameDone(j, 1))
+        if (lateMode == pacesched::kLateCompress && n > 0 && GameFrameDone(j, 1))
         {
             if (k == 1 && !metered_)
             {
@@ -2185,20 +2236,35 @@ private:
             }
             squeeze = pacesched::CompressEarly(paced && !Metered(j) && !Burst(), true);
         }
-        if (pacesched::AutoStale(gen, autoTimed, GameFrameDone(j, 1)))
+        // LateGen=auto, timed batch: a generated frame is stale (not presented, no wait) when the game's next frame is finished and its
+        // slot is already past (it would be late anyway) or the presenter was already behind when it took the batch (catchUp). An on-time
+        // frame is never dropped. Same bookkeeping as the drop below, but the dropped frame's slot is the schedule's, so Bound cannot pull
+        // the batch's later frames earlier than the early-out allows. The real frame is never dropped.
+        if (autoTimed && pacesched::AutoStale(gen, GameFrameDone(j, 1), Now() >= target - lead, showing ? showing->catchUp : catchUp))
         {
             ++statDropLate;
             ++statDropStale;
             statDropFirst += k == 1;
             lastRealRelease = Now();
             lastRelease = target;
-            lastAnyPresent = std::max(lastAnyPresent, std::min(target, Now()));
+            lastAnyPresent = std::max(lastAnyPresent, target);
             if (paceLog)
                 PaceRecord(Now(), showing ? showing->ready : jobBase, target, j.frame, k, n + 1, kPaceDropped);
             return 0.0;
         }
-        bool compressed = false;
-        if (squeeze && !burst)
+        bool compressed = false, early = false;
+        if (autoTimed)
+        {
+            // Early-out: the wait for the slot ends when the game's next frame is finished (every frame of the batch, the real one too); the
+            // frame then goes out no sooner than MinGap after the last present, so nothing bunches.
+            if (WaitSlotOrNext(j, target - lead))
+            {
+                early = true;
+                ++statAutoEarly;
+                WaitUntil(pacesched::CompressAt(Now(), lastShown, step));
+            }
+        }
+        else if (squeeze && !burst)
         {
             // Out as soon as the spacing limit allows (never bunched with the last present), not at its slot: the schedule is a game frame
             // behind. The batch's real frame goes the same way, so the gap before it stays as even as the others.
@@ -2207,8 +2273,6 @@ private:
             statCompressed += compressed;
             WaitUntil(at);
         }
-        else if (autoTimed && !burst)
-            WaitSlotOrNext(j, target - lead);
         else if (paced && !burst)
             WaitUntil(target - lead);
         const long long tg = Now();
@@ -2336,7 +2400,7 @@ private:
             lastReal = t;
         if (paceLog)
             PaceRecord(t, showing ? showing->ready : jobBase, target, j.frame, k, n + 1,
-                       static_cast<uint8_t>(compressed ? kPaceCompressed : paced && static_cast<double>(t - target) * 1000.0 / freq() > 0.5 ? kPaceLate : 0));
+                       static_cast<uint8_t>(compressed ? kPaceCompressed : early ? kPaceEarly : paced && static_cast<double>(t - target) * 1000.0 / freq() > 0.5 ? kPaceLate : 0));
         return late;
     }
     void Hitch(uint32_t k, uint32_t n, long long before, long long t0, long long target, long long tg, double gpuWaitMs, long long tw0,
@@ -2775,7 +2839,11 @@ private:
                 XLog("burst: off for this swap chain (it is not the one we made, or presents on the game's queue)");
         }
         else
+        {
             XLog("flip metering: off - %s", why);
+            if (lateMode == pacesched::kLateAuto && flipMetering)
+                XLog("LateGen=auto: flip metering is unusable here, so the next-frame rules are active (stale drop, early-out, GPU timeout drop)");
+        }
     }
 
     // ---- out of band notices (oob_driver.h) -------------------------------------------------------------
@@ -4770,13 +4838,14 @@ private:
         if (statLeadFrames)
             XLog("stats: pace lead %.2f ms (%.2f - %.2f over %u app frames, %s, window max %.2f), %u generated frames late", leadState.ms,
                  leadMin, leadMax, statLeadFrames, leadState.automatic ? "auto" : "fixed", leadState.ringMax, statLeadLate);
-        if (statDropLate)
-            XLog("stats: LateGen=%s: %u generated frames left out (%u after a GPU wait ran out, %u stale: the game's next frame was done; %u of "
-                 "all of them a batch's first: those are not in the first-frame time above)", lateMode == pacesched::kLateDrop ? "drop" : lateMode == pacesched::kLateCompress ? "compress" : "auto",
-                 statDropLate, statDropTimeout, statDropStale, statDropFirst);
+        if (statDropLate || statAutoEarly)
+            XLog("stats: LateGen=%s: %u of %u generated frames left out (%u after a GPU wait ran out, %u stale: the game's next frame was done and "
+                 "the slot past; %u of all of them a batch's first: those are not in the first-frame time above), %u presents released early "
+                 "(the game's next frame was done before their slot)", lateMode == pacesched::kLateDrop ? "drop" : lateMode == pacesched::kLateCompress ? "compress" : "auto",
+                 statDropLate, statGenPresents, statDropTimeout, statDropStale, statDropFirst, statAutoEarly);
         if (statCompressed)
             XLog("stats: LateGen=compress: %u presents released early (the game's next frame was done)", statCompressed);
-        statDropLate = statDropTimeout = statDropFirst = statDropStale = statCompressed = 0;
+        statDropLate = statDropTimeout = statDropFirst = statDropStale = statCompressed = statAutoEarly = statGenPresents = 0;
         leadMin = 1e9;
         leadMax = 0;
         statLeadLate = statLeadFrames = 0;
@@ -5545,6 +5614,7 @@ private:
     ID3D12Fence* retireFence = nullptr;     // frame f and its generated frames done on the GPU: f + 1
     HANDLE retireEvent = nullptr;
     HANDLE gpuEvent = nullptr;              // presenter: GPU waits (WaitGpu)
+    HANDLE nextEvent = nullptr;             // presenter: the game's next frame done on the GPU (WaitSlotOrNext)
     std::atomic<bool> latencyAsked { false };
     ID3D12Fence* idleFence = nullptr;       // WaitApp
     HANDLE hostEvent = nullptr;
@@ -5648,6 +5718,7 @@ private:
     double statGap = 0, statGap2 = 0, statGapMax = 0, statAppCall = 0, statAppWait = 0;
     unsigned statGaps = 0, statFrames = 0, statLate = 0, statEarly = 0, traced = 0;
     unsigned statCompressed = 0;            // LateGen=compress: presents released early (PresentReal)
+    unsigned statAutoEarly = 0, statGenPresents = 0;    // LateGen=auto: presents released early by the next game frame, and generated presents (PresentReal)
     unsigned statDropStale = 0;             // LateGen=auto: generated frames left out as stale (PresentReal), also in statDropLate
     unsigned statDropLate = 0, statDropTimeout = 0, statDropFirst = 0;    // LateGen=drop: generated frames left out (PresentReal), and those after a GPU wait that ran out
     bool catchUp = false;               // presenter: the next app frame was already done on the GPU when this one started

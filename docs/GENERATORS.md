@@ -136,14 +136,16 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   others (with `DriverPacing=0`: 30 every run). D3D12 path with our own swap chain and `Gate=0` only.
   `PresentPriority=normal` (diagnostic only, not for players) puts our present queue at normal priority instead of high.
 - **own** (`src/xefg_own.h`, paths that present through `PresentReal`: the per-frame passes, the generation lane and GenBlock; not `Gate=1`):
-  `LateGen=` in f5low.ini (`XEFG_CUDA_LATEGEN`): `auto` (default), `show`, `drop`. `auto` leaves out a generated frame whose own GPU work
+  `LateGen=` in f5low.ini (`XEFG_CUDA_LATEGEN`): `auto` (default), `show`, `drop`, `compress` (experiment). `auto` leaves out a generated frame whose own GPU work
   did not finish in its wait (200 ms), and only where f5low times every frame itself (flip metering off for the context: RTX 20/30/40 or
-  `FlipMetering=0`); with flip metering on it behaves as `show`. There is no time rule in `auto`, but on a timed batch (not V-Sync, burst or
-  metered) it looks at whether the game's NEXT frame is already finished on the GPU (read from the game's frame fence without waiting; a
-  frame the game has not presented yet counts as not finished): a generated frame of an older game frame is not presented (stale), and the wait
-  for a generated frame's slot ends as soon as the next game frame is finished (checked every half millisecond), so the frame goes out at
-  once. The real frame is never dropped or cut short: after a stale batch it goes out at its own slot, which is then past. A GPU timeout drops
-  with or without V-Sync. Host test: `tests/build_compress_late_test.ps1`. `show` presents every generated frame on any
+  `FlipMetering=0`); with flip metering on it behaves as `show`. There is no one-step time rule in `auto`, but on a timed batch (not V-Sync, burst, flip-metered, or on the clock pacer) it looks at
+  whether the game's NEXT frame is already finished on the GPU (read from the game's frame fence without waiting; a frame the game has not
+  presented yet counts as not finished). Once it is, the frames of the batch still waiting for their slots - the real frame included - stop
+  waiting and go out, no sooner than half a step after the last present that went out (so nothing bunches): the picture on the screen is a game
+  frame behind and a slot would only make it older. The wait sleeps on the fence and a timer and spins only the last half millisecond. A
+  generated frame is not presented (stale) when the next game frame is finished and its slot is already past, or the presenter was already
+  behind when it took the batch; a frame on time is never dropped. The real frame is never dropped. A GPU timeout drops with or without
+  V-Sync. Host tests: `tests/build_compress_late_test.ps1` (decisions, and a model of a jittered game with the same schedule rules). `show` presents every generated frame on any
   GPU. `drop` (an experiment) adds the time rule: it leaves out a generated frame that is late by more than a step instead of showing it
   (frames up to one step late are still shown), on every GPU. With `drop` a frame is dropped when its GPU work timed out, or a frame that at the moment of its present is more than one step past its time on its own schedule
   (the time before the clamp that keeps a late frame from bunching with the next, the step it was computed with). The time rule applies
@@ -154,9 +156,9 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   pacer catches up from it, the batch's out-of-band render start goes with the first present that does go out, and every fence the batch
   signals (consumed, game release, present-lane read, retire) still advances. Its copy into the swap chain's buffer is already submitted
   and is overwritten by the next present's. The presented-frame counts reported to the game (GetLastPresentStatus, XeLL) still say the
-  full batch: they are decided at the game's Present. The stats line `LateGen=auto|drop: N generated frames left out (M after a GPU wait ran out,
-  K a batch's first ...)` counts them (a dropped first frame is not in the first-frame time); the presenter's gap statistics measure from the
-  last present that really went out; `PaceLog` marks them `flags=dropped` (tests/pacer_stats.py leaves them out of the gaps and reports
+  full batch: they are decided at the game's Present. The stats line `LateGen=auto|drop|compress: N of G generated frames left out (M after a GPU wait ran out,
+  S stale, K a batch's first ...), E presents released early` counts them (a dropped first frame is not in the first-frame time); the presenter's gap statistics measure from the
+  last present that really went out; `PaceLog` marks them `flags=dropped` and an early release `flags=early` (tests/pacer_stats.py leaves them out of the gaps and reports
   `drop_pct`). The decision is `pacesched::DropLate` (host test: `tests/build_drop_late_test.ps1`). Run in NBA 2K27 with `FlipMetering=0`
   (desktop-composed, so inconclusive); not run with hardware flip metering. The time rule of `drop` stays an experiment until an A/B shows a win. Invalid values warn and become `auto`.
   `LateGen=compress` (experiment, same paths as `drop`, any GPU) squeezes a late batch instead of dropping from it: while the game's NEXT
