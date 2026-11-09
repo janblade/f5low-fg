@@ -5,6 +5,7 @@
 // (unbounded): the test proves it hangs, with a guard that gives up after a second, then shows the bounded one returns in time,
 // reports pass-through, and recovers once the presenter drains.
 #include "../src/wait_bound.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -104,44 +105,57 @@ int main()
         CHECK(generated == 2);                  // the queue's room (appJobs)
         CHECK(passed == 6);
         CHECK(m.ep.Stalled());
-        CHECK(m.ep.Trips() == 6);
+        CHECK(m.ep.Trips() == 1);               // a slice timeout while stalled is no new trip
         // The stall episode logs once: only the first trip reports it.
         waitbound::Episode e2;
         CHECK(e2.Trip());
         CHECK(!e2.Trip());
         CHECK(!e2.Trip());
-        // 3. Recovery: the presenter drains, frames find room again, and after kGoodToRecover of them the episode ends (once).
-        int ended = 0;
+        // 3. Recovery: the presenter drains, frames find room again; the episode ends once, after kGoodToRecover frames with room and
+        // kRecoverMs (synthetic time here: 20 ms a frame).
+        int ended = 0, endedAt = -1;
+        const int64_t base = waitbound::NowMs();
         for (int f = 0; f < 60; ++f)
         {
-            m.Drain1();
-            m.Drain1();
-            m.Drain1();                         // (the queue is over its limit by the pass-through frames)
-            m.Drain1();
-            m.Drain1();
-            m.Drain1();
-            m.Drain1();
-            m.Drain1();
+            for (int k = 0; k < 8; ++k)
+                m.Drain1();                     // (the queue is over its limit by the pass-through frames)
             const waitbound::Admit a = m.Push(100 + f, false, 100);
-            if (a.room && m.ep.Good())
+            if (a.room && m.ep.Good(base + 20 * f))
+            {
                 ++ended;
+                endedAt = f;
+            }
         }
         CHECK(ended == 1);
+        CHECK(endedAt >= 7 && endedAt <= 17);   // not before the 8th good frame, not after the time floor (the trip was ~250 ms ago)
         CHECK(!m.ep.Stalled());
     }
-    // 4. A flapping stall: one good frame between timeouts does not end the episode.
+    // 4. A flapping stall does not end the episode; the good count and the time floor both apply.
     {
         waitbound::Episode e;
-        e.Trip();
+        e.Trip(1000);
         for (int i = 0; i < 10; ++i)
         {
             for (unsigned k = 0; k + 1 < waitbound::kGoodToRecover; ++k)
-                CHECK(!e.Good());
-            e.Trip();
+                CHECK(!e.Good(1400 + i));
+            e.Trip(1400 + i);
         }
         CHECK(e.Stalled());
+        // the count alone is not enough while the time floor is not reached ...
+        waitbound::Episode f;
+        f.Trip(5000);
+        for (unsigned k = 0; k < waitbound::kGoodToRecover + 3; ++k)
+            CHECK(!f.Good(5000 + 100));
+        CHECK(f.Stalled());
+        // ... and once it is, the next frame with room ends it (once)
+        CHECK(f.Good(5000 + waitbound::kRecoverMs));
+        CHECK(!f.Good(5000 + waitbound::kRecoverMs + 20));
+        // the time alone is not enough either
+        waitbound::Episode g;
+        g.Trip(0);
+        CHECK(!g.Good(10000));
     }
-    // 5. A fence that never completes: WaitFor returns false within the bound (the GPU waits use the same call).
+    // 5. A fence that never completes: WaitFor returns false within the bound.
     {
         std::mutex mu;
         std::condition_variable cv;
@@ -151,6 +165,39 @@ int main()
         const double ms = Ms(t0, Clock::now());
         CHECK(!ok);
         CHECK(ms >= waitbound::kGpuWaitMs - 5 && ms < waitbound::kGpuWaitMs + 100);
+    }
+    // 6. A fence wait with a stale event (WaitReached, used by the GPU waits and the resize / teardown waits): an event armed for an
+    // earlier value fires at once while the fence has not reached the value - the wait must go on to the deadline, not end early or report
+    // a timeout early; and it ends as soon as the value is reached.
+    {
+        std::atomic<uint64_t> done { 5 };
+        int arms = 0, waits = 0;
+        // never reached, stale wakes only: a timeout at the deadline, after several re-arms
+        const auto t0 = Clock::now();
+        bool ok = waitbound::WaitReached(
+            9, 120, [&] { return done.load(); }, [&](uint64_t) { ++arms; },
+            [&](unsigned ms) {
+                ++waits;
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::min(ms, 10u)));
+            });
+        const double ms = Ms(t0, Clock::now());
+        CHECK(!ok);
+        CHECK(ms >= 115 && ms < 250);
+        CHECK(arms > 3 && waits == arms);
+        // reached after a few stale wakes: true, at once
+        int n = 0;
+        ok = waitbound::WaitReached(
+            9, 1000, [&] { return done.load(); }, [&](uint64_t) {},
+            [&](unsigned) {
+                if (++n == 3)
+                    done = 9;
+            });
+        CHECK(ok && n == 3);
+        // already reached: no arm, no wait
+        arms = 0;
+        CHECK(waitbound::WaitReached(
+            9, 1000, [&] { return done.load(); }, [&](uint64_t) { ++arms; }, [&](unsigned) { arms += 100; }));
+        CHECK(arms == 0);
     }
     printf(g_fail ? "stall_test: %d FAILED\n" : "stall_test: PASS\n", g_fail);
     return g_fail ? 1 : 0;

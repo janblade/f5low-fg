@@ -1,4 +1,4 @@
-# Builds tests\stall_test.exe into build\ (host-only: the schedule pieces of src\pace_sched.h) and runs it; throws if it fails.
+# Builds tests\stall_test.exe into build\ (host-only: the bounded waits of src\wait_bound.h) and runs it; throws if it fails.
 param([string]$VsPath = 'D:\DEV\VS2022')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)

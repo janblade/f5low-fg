@@ -736,35 +736,32 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     // keeps the longer 2 s (what follows frees the slots).
     bool WaitFence(UINT64 v, DWORD ms = 2000)
     {
-        // Until the deadline, re-checking the fence after every wake: an event armed for an earlier value can fire late and must not end
-        // this wait (nor count as a timeout, which would restart the recovery count).
-        const LONGLONG end = Now() + static_cast<LONGLONG>(ms) * Freq() / 1000;
-        for (;;)
-        {
-            if (fence->GetCompletedValue() >= v)
-                return true;
-            const LONGLONG left = end - Now();
-            if (left <= 0)
-                return false;
-            fence->SetEventOnCompletion(v, fenceEvent);
-            WaitForSingleObject(fenceEvent, static_cast<DWORD>((left * 1000 + Freq() - 1) / Freq()));
-        }
+        return WaitFenceOn(v, ms, fenceEvent);
+    }
+    // (the loop is waitbound::WaitReached: a late event of an earlier registration must not end it)
+    bool WaitFenceOn(UINT64 v, DWORD ms, HANDLE ev)
+    {
+        return waitbound::WaitReached(
+            v, ms, [&] { return fence->GetCompletedValue(); }, [&](uint64_t x) { fence->SetEventOnCompletion(x, ev); },
+            [&](unsigned w) { WaitForSingleObject(ev, w); });
     }
 
-    // A wait ran into its bound (wait_bound.h): logged once per episode; a frame is dropped rather than the thread held. The episode ends
-    // by itself after kGoodToRecover frames in a row that waited for nothing.
+    // A wait ran into its bound (wait_bound.h; the sink's bounds are fixed, 500 ms or the short slice while stalled, not WaitBoundMs): logged
+    // once per episode; the frame that timed out is dropped (or goes on without its wait), the thread is not held. A timeout while already
+    // stalled is no new trip (it neither logs nor restarts the recovery). The episode ends by itself, see waitbound::Episode.
     void NoteStall(const char* what)
     {
         stallTripped.store(true, std::memory_order_relaxed);
-        if (stall.Trip() && g_log)
-            g_log("sink: waits: %s for %u ms without an answer - dropping frames until it clears (back on by itself)", what, waitbound::kGpuWaitMs);
+        if (!stall.Stalled() && stall.Trip() && g_log)
+            g_log("sink: waits: %s for %u ms without an answer - frames that time out are dropped, the rest are shown (back to normal by itself)",
+                  what, waitbound::kGpuWaitMs);
     }
     void NoteGood()
     {
         if (stallTripped.exchange(false, std::memory_order_relaxed))
             return;
         if (stall.Good() && g_log)
-            g_log("sink: waits: the stall is over (%u frames in a row without a timeout)", waitbound::kGoodToRecover);
+            g_log("sink: waits: the stall is over");
     }
 
     void ReleaseSlots()
@@ -1090,12 +1087,12 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         }
     }
 
-    void Drain()
+    // True when the pacer has nothing left: an item stays in q until its copy and present are done (it is popped last), so an empty q is
+    // an idle pacer. 10 s, long on purpose: what follows (ResizeBuffers) frees the slots the pacer may be using. False on a timeout.
+    bool Drain()
     {
         std::unique_lock<std::mutex> l(mu);
-        // Bounded (a resize must not hang the game): the queue empties at the pace of the schedule, a few frames' time at most
-        if (!waitbound::WaitFor(l, cvSpace, 2000, [&] { return q.empty() || stop; }))
-            NoteStall("the queue did not drain at a resize");
+        return waitbound::WaitFor(l, cvSpace, waitbound::kIdleWaitMs, [&] { return q.empty() || stop; });
     }
 
     // The GPU stamp watcher (see the top), as the own generator's (xefg_own.h, StartPresenter): a thread of its own, so a busy pacer does
@@ -1308,11 +1305,17 @@ public:
             ++fullWaits;
             blockedInBurst = true;
         }
-        if (!waitbound::WaitFor(l, cvSpace, waitbound::kGpuWaitMs, [&] { return stop || q.size() < kMaxQueue; }))
+        // The short slice while stalled (a stuck pacer must not cost the game three full bounds per Enqueue).
+        const unsigned bound = waitbound::GameBound(stall.Stalled(), waitbound::kGpuWaitMs);
+        if (!waitbound::WaitFor(l, cvSpace, bound, [&] { return stop || q.size() < kMaxQueue; }))
         {
-            // The pacer does not release (a stuck present or copy): the frame is dropped, not queued (nothing to undo: `in` and the slot
-            // stay, the library draws its next frame into the same one). The game's thread comes back.
+            // The pacer does not release (a stuck present or copy): the frame is dropped, not queued. The library's buffer index goes on as
+            // after a normal Enqueue (stable buffers: it takes its textures in turn, `in` must stay in step with it; the texture it draws
+            // into next may then still be waiting in the queue, which shows as a glitch in the frame that was held up, in a stalled
+            // episode only). Without stable buffers the slot is ours to hand out, and the next frame simply gets the same one.
             NoteStall("the queue had no room");
+            if (stable)
+                ++in;
             const HRESULT h0 = lastHr;
             lastHr = S_OK;
             return h0;
@@ -1337,22 +1340,13 @@ public:
             // (appBuffers frames back) must be out of the queue and its copy done on the GPU.
             cvItem.notify_one();
             // (bounded: the frame is queued already, so on a timeout the library goes on - at worst it draws over a texture still to be shown)
-            if (!waitbound::WaitFor(l, cvSpace, waitbound::kGpuWaitMs, [&] { return stop || q.size() < appBuffers; }))
+            if (!waitbound::WaitFor(l, cvSpace, bound, [&] { return stop || q.size() < appBuffers; }))
                 NoteStall("the queue did not release the library's next texture");
             const UINT64 v = allocFence[in % appBuffers];
             l.unlock();
             if (v && fence->GetCompletedValue() < v)
             {
-                const LONGLONG end = Now() + static_cast<LONGLONG>(waitbound::kGpuWaitMs) * Freq() / 1000;
-                bool reached = false;
-                for (;;)         // (re-check after every wake: a stale event must not end it early)
-                {
-                    if ((reached = fence->GetCompletedValue() >= v) || end - Now() <= 0)
-                        break;
-                    fence->SetEventOnCompletion(v, libEvent);
-                    WaitForSingleObject(libEvent, static_cast<DWORD>(((end - Now()) * 1000 + Freq() - 1) / Freq()));
-                }
-                if (!reached)
+                if (!WaitFenceOn(v, bound, libEvent))
                 {
                     l.lock();
                     NoteStall("the copy of the library's last texture");
@@ -1405,7 +1399,13 @@ public:
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT c, UINT w, UINT h, DXGI_FORMAT f, UINT fl) override
     {
         scproxy::Log("SINK.ResizeBuffers", "count %u %ux%u", c, w, h);
-        Drain();
+        if (!Drain())
+        {
+            // The pacer is still on a frame (a stuck copy or present): the slots stay as they are, nothing is freed under it.
+            if (g_log)
+                g_log("sink: ResizeBuffers refused - the frame queue did not drain within %u ms (a stuck copy or present)", waitbound::kIdleWaitMs);
+            return E_FAIL;
+        }
         std::lock_guard<std::mutex> l(mu);
         ReleaseSlots();
         const HRESULT hr = r->ResizeBuffers(c, w, h, f, fl);

@@ -1791,7 +1791,12 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         o->retireWait = Setting("XEFG_CUDA_RETIREWAIT", "RetireWait", "1") != "0";
         // WaitBoundMs= / GameWaitMs= (XEFG_CUDA_WAITBOUNDMS, XEFG_CUDA_GAMEWAITMS): the bounds of the presenter path's waits (wait_bound.h): GPU fence
         // and allocator waits (default 500 ms), the game's Present waiting for room in the presenter's queue (default 500 ms).
-        o->waitBoundMs = std::clamp(static_cast<unsigned>(atoi(Setting("XEFG_CUDA_WAITBOUNDMS", "WaitBoundMs", "500").c_str())), 50u, 5000u);
+        // (not a number, 0 or negative: the default, not a clamp end)
+        const auto boundMs = [&](const char* env, const char* key, int def, int lo, int hi) {
+            const int v = atoi(Setting(env, key, std::to_string(def)).c_str());
+            return static_cast<unsigned>(v <= 0 ? def : std::clamp(v, lo, hi));
+        };
+        o->waitBoundMs = boundMs("XEFG_CUDA_WAITBOUNDMS", "WaitBoundMs", 500, 50, 5000);
         // Diagnostics (xefg_own.h, TestStall): TestStallFrame=<app frame, 0 = off>, TestStallMs=<ms>, TestStallKind=presenter|genlane|presentlane.
         o->testStallFrame = static_cast<uint64_t>(std::max(0LL, atoll(Setting("XEFG_CUDA_TESTSTALLFRAME", "TestStallFrame", "0").c_str())));
         o->testStallMs = std::clamp(static_cast<unsigned>(atoi(Setting("XEFG_CUDA_TESTSTALLMS", "TestStallMs", "1500").c_str())), 50u, 20000u);
@@ -1799,7 +1804,7 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             const std::string k = Setting("XEFG_CUDA_TESTSTALLKIND", "TestStallKind", "presenter");
             o->testStallKind = k == "genlane" ? 1 : k == "presentlane" ? 2 : 0;
         }
-        o->gameWaitMs = std::clamp(static_cast<unsigned>(atoi(Setting("XEFG_CUDA_GAMEWAITMS", "GameWaitMs", "500").c_str())), 10u, 2000u);
+        o->gameWaitMs = boundMs("XEFG_CUDA_GAMEWAITMS", "GameWaitMs", 500, 10, 2000);
         o->oobMarkers = have > 0 && Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";      // (no NVIDIA compute device: off with the rest)
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):
         // 2500 us, less at a high rate - never more than 0.45 of the frame spacing (xefg_own.h, FlipLead). Not used while the burst is on.
