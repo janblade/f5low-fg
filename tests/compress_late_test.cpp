@@ -32,6 +32,10 @@ int main()
     CHECK(!AutoStale(true, true, false));                           // on time: goes out under the early-out, never dropped
     CHECK(!AutoStale(true, false, true));                           // next frame not finished or not known
     CHECK(!AutoStale(false, true, true));                           // the real frame
+    // modes: auto and early act only without flip metering and differ only in the early-out; compress and drop act on every GPU
+    CHECK(LateNextFrame(kLateAuto) && LateNextFrame(kLateEarly) && !LateNextFrame(kLateShow) && !LateNextFrame(kLateDrop));
+    CHECK(!LateEarlyOut(kLateAuto) && LateEarlyOut(kLateEarly) && !LateEarlyOut(kLateCompress));
+    CHECK(LateActive(kLateEarly, false) && !LateActive(kLateEarly, true) && LateActive(kLateCompress, true));
     // auto is active only without flip metering; its GPU timeout drop does not need a timed batch (V-Sync included), the time rule is off
     CHECK(LateActive(kLateAuto, false) && !LateActive(kLateAuto, true));
     CHECK(DropLate(true, true, false, LateTimeRule(kLateAuto), raw - 500, raw, step));      // timeout, V-Sync (timed false in the caller)
@@ -94,7 +98,7 @@ int main()
     CHECK(CompressDrop(true, false, true, false, false));
     CHECK(CompressDrop(true, false, false, false, false));
 
-    // ---- a jittered game through the schedule rules (xefg_own.h PresentReal's, with its smoothing), counting what auto does
+    // ---- a jittered game through the schedule rules (xefg_own.h PresentReal's, with its smoothing), counting what LateGen=early does
     // variant 2: steady 60 fps, the presenter starts one game frame behind (the next frame is already done when the first batch starts)
     for (int variant = 0; variant < 3; ++variant)
         for (unsigned n : { 1u, 3u, 5u })

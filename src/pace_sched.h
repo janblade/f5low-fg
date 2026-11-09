@@ -193,13 +193,15 @@ struct Lag
 inline long long LeadCap(long long cap, long long lead, bool fixedTestLead) { return fixedTestLead ? std::max(cap, lead) : cap; }
 
 // LateGen= values (xefg_own.h lateMode) and what each lets PresentReal do. Show: nothing. Auto, only without flip metering: a GPU timeout
-// drops; on a timed batch the frames stop waiting for their slots once the game's next frame is finished (AutoWaitOver) and a generated
-// frame that is stale is not presented (AutoStale); never the one-step time rule. Drop: the timeout and the one-step time rule, on every
-// GPU. Compress (experiment, every GPU): a timed batch is squeezed while the game's next frame is finished (CompressEarly / CompressAt)
-// and only a frame a whole game frame behind is dropped (CompressDrop); LateTimeRule is true for it too (it uses the batch's time).
-enum LateMode : unsigned char { kLateShow = 0, kLateAuto = 1, kLateDrop = 2, kLateCompress = 3 };
-inline bool LateActive(unsigned char mode, bool flipMetering) { return mode >= kLateDrop || (mode == kLateAuto && !flipMetering); }
-inline bool LateTimeRule(unsigned char mode) { return mode >= kLateDrop; }
+// drops, and on a timed batch a stale generated frame is not presented (AutoStale); the slot waits are as in show. Early (experiment, same
+// condition): auto plus the early-out (AutoWaitOver). Drop: the timeout and the one-step time rule, on every GPU. Compress (experiment,
+// every GPU): a timed batch is squeezed while the game's next frame is finished (CompressEarly / CompressAt) and only a frame a whole game
+// frame behind is dropped (CompressDrop); LateTimeRule is true for it too (it uses the batch's time).
+enum LateMode : unsigned char { kLateShow = 0, kLateAuto = 1, kLateDrop = 2, kLateCompress = 3, kLateEarly = 4 };
+inline bool LateNextFrame(unsigned char mode) { return mode == kLateAuto || mode == kLateEarly; }      // the stale drop (and the timeout drop)
+inline bool LateEarlyOut(unsigned char mode) { return mode == kLateEarly; }
+inline bool LateActive(unsigned char mode, bool flipMetering) { return mode == kLateDrop || mode == kLateCompress || (LateNextFrame(mode) && !flipMetering); }
+inline bool LateTimeRule(unsigned char mode) { return mode == kLateDrop || mode == kLateCompress; }
 
 // LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
 // (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. Where its time means something
@@ -217,17 +219,16 @@ inline bool DropLate(bool enabled, bool generated, bool gpuOk, bool timed, long 
     return timed && now - rawTarget > step;
 }
 
-// LateGen=auto, where no flip metering paces the batch (xefg_own.h PresentReal), on a timed batch (not V-Sync, flip-metered, burst or on
+// LateGen=auto and early, where no flip metering paces the batch (xefg_own.h PresentReal), on a timed batch (not V-Sync, flip-metered, burst or on
 // the clock pacer). `nextDone`: the game frame after the batch's own is finished on the GPU (false when not known). A GPU timeout drops
 // with or without a timed batch (DropLate). The batch's real frame is never dropped.
-// Early-out: once the next game frame is finished, the frames still waiting for their slots - the real frame included - stop waiting: the
+// Early-out (LateGen=early only, an experiment): once the next game frame is finished, the frames still waiting for their slots - the real frame included - stop waiting: the
 // picture on the screen is then a game frame behind and a slot only makes it older. Each goes out no sooner than MinGap after the last
 // present that went out (CompressAt), so the batch never bunches. The wait for a slot ends here (the caller checks in between).
 inline bool AutoWaitOver(bool nextDone, long long now, long long slot) { return nextDone || now >= slot; }
-// Stale: a GENERATED frame is not presented when the next game frame is finished and the frame would be late anyway (`slotPassed`: its slot
-// is past when the presenter gets to it). A frame that is on time is never dropped: it goes out under the early-out. A presenter that is
-// behind (the next game frame was finished before the batch started) is not a reason of its own: the early-out releases the rest of the
-// batch at the MinGap floor, and a frame whose slot has passed is dropped by this rule.
+// Stale (LateGen=auto and early): a GENERATED frame is not presented when the next game frame is finished and the frame would be late
+// anyway (`slotPassed`: its slot is past when the presenter gets to it). A frame that is on time is never dropped. A presenter that is
+// behind (the next game frame was finished before the batch started) is not a reason of its own.
 inline bool AutoStale(bool generated, bool nextDone, bool slotPassed)
 {
     return generated && nextDone && slotPassed;

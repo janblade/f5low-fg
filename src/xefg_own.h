@@ -472,7 +472,7 @@ public:
     std::string genMode = "off";                // GenQueue= in f5low.ini: off, direct or compute (see PresentGen)
     std::string genPriority;                    // GenPriority= in f5low.ini: high or normal; empty: normal with the gate, else high
     bool genBlock = false;                      // GenBlock=1 in f5low.ini (blockFence, BlockDone): the game's next frame waits for our passes
-    uint8_t lateMode = 1;                       // LateGen= in f5low.ini (pacesched::LateMode): show, auto (without flip metering: a GPU timeout drops, a timed batch's stale frames drop and its slot waits end when the game's next frame is done), drop (also the one-step time rule), compress (experiment: a late batch is squeezed, drop only a whole game frame behind); PresentReal
+    uint8_t lateMode = 1;                       // LateGen= in f5low.ini (pacesched::LateMode): show, auto (without flip metering: a GPU timeout drops, and a timed batch's stale generated frames), early (experiment: auto plus the early-out: slot waits end when the game's next frame is done), drop (also the one-step time rule), compress (experiment: a late batch is squeezed, drop only a whole game frame behind); PresentReal
     bool presentNormal = false;                 // PresentPriority=normal in f5low.ini (diagnostic only): our present queue at normal priority.
                                                 // It does not imitate an RTX 20 (whose problem is slow switching between queues).
     uint32_t genSpread = 2;                     // GenSpread= in f5low.ini: the D3D12 gate's passes, steps apart (0: at once; PresentGenGated)
@@ -2223,7 +2223,7 @@ private:
         // showing->clock) keeps it too: its release times feed the clock's correction.
         const bool meterOff = !flipMetering || (flipTried && !flipFn);
         const bool gen = n > 0 && k <= n;
-        const bool autoTimed = lateMode == pacesched::kLateAuto && meterOff && n > 0 && !DisplayPaced(j) && !metered && !(showing && showing->clock);
+        const bool autoTimed = pacesched::LateNextFrame(lateMode) && meterOff && n > 0 && !DisplayPaced(j) && !metered && !(showing && showing->clock);
         if (gen)
             ++statGenPresents;
         // LateGen=compress, the game's next frame finished: a timed batch (its real frame too) does not sleep for its slot (below). The
@@ -2255,9 +2255,9 @@ private:
             return 0.0;
         }
         bool compressed = false, outEarly = false;
-        if (autoTimed)
+        if (autoTimed && pacesched::LateEarlyOut(lateMode))
         {
-            // Early-out: the wait for the slot ends when the game's next frame is finished (every frame of the batch, the real one too); the
+            // Early-out (LateGen=early): the wait for the slot ends when the game's next frame is finished (every frame of the batch, the real one too); the
             // frame then goes out no sooner than MinGap after the last present, so nothing bunches.
             if (WaitSlotOrNext(j, target - lead))
             {
@@ -2843,8 +2843,9 @@ private:
         else
         {
             XLog("flip metering: off - %s", why);
-            if (lateMode == pacesched::kLateAuto && flipMetering)
-                XLog("LateGen=auto: flip metering is unusable here, so the next-frame rules are active (stale drop, early-out, GPU timeout drop)");
+            if (pacesched::LateNextFrame(lateMode) && flipMetering)
+                XLog("LateGen=%s: flip metering is unusable here, so its rules are active (stale drop, GPU timeout drop%s)",
+                     lateMode == pacesched::kLateEarly ? "early" : "auto", pacesched::LateEarlyOut(lateMode) ? ", early-out" : "");
         }
     }
 
@@ -4843,7 +4844,7 @@ private:
         if (statDropLate || statAutoEarly)
             XLog("stats: LateGen=%s: %u of %u generated frames left out (%u after a GPU wait ran out, %u stale: the game's next frame was done and "
                  "the slot past; %u of all of them a batch's first: those are not in the first-frame time above), %u presents released early "
-                 "(the game's next frame was done before their slot)", lateMode == pacesched::kLateDrop ? "drop" : lateMode == pacesched::kLateCompress ? "compress" : "auto",
+                 "(the game's next frame was done before their slot)", lateMode == pacesched::kLateDrop ? "drop" : lateMode == pacesched::kLateCompress ? "compress" : lateMode == pacesched::kLateEarly ? "early" : "auto",
                  statDropLate, statGenPresents, statDropTimeout, statDropStale, statDropFirst, statAutoEarly);
         if (statCompressed)
             XLog("stats: LateGen=compress: %u presents released early (the game's next frame was done)", statCompressed);
