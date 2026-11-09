@@ -1721,8 +1721,9 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             XLog("GenBlock=%s: %s", gb.c_str(), o->genBlock ? "wanted" : off ? "off" : "off (flip metering is on for this GPU)");
         }
         // LateGen (XEFG_CUDA_LATEGEN): "show" (default) presents every generated frame, late or not; "drop" leaves a generated frame out
-        // when its own GPU work did not finish in time, or it is more than one step past its time or the batch's real frame is due
-        // (xefg_own.h PresentReal). The real frame is always shown. Paths that present through PresentReal (not Gate=1).
+        // when its own GPU work did not finish in time, or it is more than one step past its time (not on a metered, burst or V-Sync
+        // batch: there only a GPU timeout drops; xefg_own.h PresentReal). The real frame is always shown. Paths that present through
+        // PresentReal (not Gate=1).
         {
             const std::string lg = Setting("XEFG_CUDA_LATEGEN", "LateGen", "show");
             if (lg != "show" && lg != "drop")

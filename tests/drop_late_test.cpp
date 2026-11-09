@@ -17,33 +17,34 @@ static int g_fail = 0;
 int main()
 {
     using pacesched::DropLate;
-    const long long step = 1000, target = 10000;
-    // frame k of 3 generated: the real frame is due (3 + 1 - k) steps after its time
-    const long long real = target + 3 * step;
+    const long long step = 1000, raw = 10000;
 
     // on time (before and exactly at its time): shown
-    CHECK(!DropLate(true, true, true, true, target - 500, target, step, real));
-    CHECK(!DropLate(true, true, true, true, target, target, step, real));
+    CHECK(!DropLate(true, true, true, true, raw - 500, raw, step));
+    CHECK(!DropLate(true, true, true, true, raw, raw, step));
     // late within the margin (up to one step): shown
-    CHECK(!DropLate(true, true, true, true, target + 400, target, step, real));
-    CHECK(!DropLate(true, true, true, true, target + step, target, step, real));
+    CHECK(!DropLate(true, true, true, true, raw + 400, raw, step));
+    CHECK(!DropLate(true, true, true, true, raw + step, raw, step));
     // late past one step: dropped
-    CHECK(DropLate(true, true, true, true, target + step + 1, target, step, real));
-    // the real frame is already due: dropped (the last generated frame: due one step after its own time)
-    CHECK(DropLate(true, true, true, true, target + step, target, step, target + step));
-    CHECK(DropLate(true, true, true, true, real, target, step, real));
-    // GPU wait timed out: dropped even when the time says it is early
-    CHECK(DropLate(true, true, false, true, target - 500, target, step, real));
-    CHECK(DropLate(true, true, false, false, target - 500, target, step, real));     // display-paced too
-    // display-paced (no schedule): only the wait result counts, never the time
-    CHECK(!DropLate(true, true, true, false, target + 50 * step, target, step, real));
+    CHECK(DropLate(true, true, true, true, raw + step + 1, raw, step));
+    // the time is the raw one: a clamped target in the past (after a stutter) is not what is passed, so a frame on its new schedule is shown
+    {
+        const long long clamped = raw - 5 * step, now = raw + step / 2;
+        CHECK(now - clamped > step);                                                  // the clamped time would have dropped it
+        CHECK(!DropLate(true, true, true, true, now, raw, step));
+    }
+    // GPU wait timed out: dropped even when the time says it is early, and where the time rule is off
+    CHECK(DropLate(true, true, false, true, raw - 500, raw, step));
+    CHECK(DropLate(true, true, false, false, raw - 500, raw, step));
+    // time rule off (V-Sync, metered or burst batch): only the wait result counts, never the time
+    CHECK(!DropLate(true, true, true, false, raw + 50 * step, raw, step));
     // the real frame is never dropped, whatever the wait or time say
-    CHECK(!DropLate(true, false, false, true, target + 50 * step, target, step, real));
-    CHECK(!DropLate(true, false, true, true, target + 50 * step, target, step, real));
+    CHECK(!DropLate(true, false, false, true, raw + 50 * step, raw, step));
+    CHECK(!DropLate(true, false, true, true, raw + 50 * step, raw, step));
     // LateGen=show never drops
-    CHECK(!DropLate(false, true, false, true, target + 50 * step, target, step, real));
-    CHECK(!DropLate(false, true, true, true, real + 50 * step, target, step, real));
-    CHECK(!DropLate(false, false, false, true, real + 50 * step, target, step, real));
+    CHECK(!DropLate(false, true, false, true, raw + 50 * step, raw, step));
+    CHECK(!DropLate(false, true, true, true, raw + 50 * step, raw, step));
+    CHECK(!DropLate(false, false, false, true, raw + 50 * step, raw, step));
 
     if (g_fail)
         printf("drop_late_test: %d FAILED\n", g_fail);
