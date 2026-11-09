@@ -1723,19 +1723,21 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         // LateGen (XEFG_CUDA_LATEGEN): "auto" (default): where f5low times every frame itself (flip metering off for this context: RTX
         // 20/30/40, or FlipMetering=0) a generated frame whose own GPU work did not finish in its wait is left out; on a timed batch (not
         // V-Sync) one whose game frame is stale (the game's next frame is finished on the GPU) is left out, and the wait for a slot
-        // ends as soon as that frame is finished; with flip metering on it is "show". "show": every generated frame is presented, late or not. "drop" (experiment): also leaves out a
+        // ends as soon as that frame is finished; with flip metering on it is "show". "show": every generated frame is presented, late or not. "compress" (experiment): while the game's next frame is finished a timed batch's presents go out at half-step spacing instead of at
+        // their slots, and only a frame a whole game frame behind (the next two frames finished) is left out. "drop" (experiment): also leaves out a
         // frame more than one step past its time (not on a metered, burst or V-Sync batch: there only a GPU timeout drops). The real
         // frame is always shown. Paths that present through PresentReal (xefg_own.h; not Gate=1).
         {
             std::string lg = Setting("XEFG_CUDA_LATEGEN", "LateGen", "auto");
-            if (lg != "show" && lg != "drop" && lg != "auto")
+            if (lg != "show" && lg != "drop" && lg != "auto" && lg != "compress")
             {
-                XLog("warning: LateGen=%s is not auto, show or drop - taken as auto", lg.c_str());
+                XLog("warning: LateGen=%s is not auto, show, drop or compress - taken as auto", lg.c_str());
                 lg = "auto";
             }
-            o->lateMode = lg == "show" ? 0 : lg == "drop" ? 2 : 1;
+            o->lateMode = lg == "show" ? 0 : lg == "drop" ? 2 : lg == "compress" ? 3 : 1;
             XLog("LateGen=%s: %s", lg.c_str(),
                  o->lateMode == 2 ? "generated frames that time out or are over a step late are left out"
+                 : o->lateMode == 3 ? "a late batch is squeezed; only a frame a whole game frame behind is left out"
                  : o->lateMode == 0 ? "every generated frame is shown"
                  : o->flipMetering ? "same as show (flip metering is on for this GPU)"
                                    : "a generated frame whose GPU work timed out or whose game frame is stale is left out, a slot wait ends "

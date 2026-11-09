@@ -57,11 +57,15 @@ inline long long NextBase(long long base, long long ready, long long lag, long l
     return !base || std::llabs(want - due) > interval ? want : due + (want - due) / 5;
 }
 
+// The least time between two presents of a batch that the schedule allows: half a step. Bound's lower limit, and the spacing LateGen=compress
+// squeezes a late batch to.
+inline long long MinGap(long long step) { return step / 2; }
+
 // Half a step after the last present at the soonest, two steps after it at the latest: a frame the game handed over after a stutter has
 // its schedule set from that late frame; and a late frame is followed by the next no sooner than half a step (no bunch).
 inline long long Bound(long long target, long long step, long long last)
 {
-    return last ? std::clamp(target, last + step / 2, last + 2 * step) : target;
+    return last ? std::clamp(target, last + MinGap(step), last + 2 * step) : target;
 }
 
 // The sink's choice of the application Present a burst belongs to (sink/sink.h, Plan). `stamps`: the unmatched Present times, oldest
@@ -190,9 +194,11 @@ inline long long LeadCap(long long cap, long long lead, bool fixedTestLead) { re
 
 // LateGen= values (xefg_own.h lateMode) and what each lets PresentReal do. Show: nothing. Auto: a GPU timeout drops, only without flip
 // metering; the time rule never. Drop: both, on every GPU.
-enum LateMode : unsigned char { kLateShow = 0, kLateAuto = 1, kLateDrop = 2 };
-inline bool LateActive(unsigned char mode, bool flipMetering) { return mode == kLateDrop || (mode == kLateAuto && !flipMetering); }
-inline bool LateTimeRule(unsigned char mode) { return mode == kLateDrop; }
+// Compress (experiment): like drop on every GPU, but a late batch is squeezed (CompressEarly / CompressAt) and only a frame a whole game
+// frame behind is dropped (CompressDrop) instead of the one-step time rule; LateTimeRule is true for it too (it uses the batch's time).
+enum LateMode : unsigned char { kLateShow = 0, kLateAuto = 1, kLateDrop = 2, kLateCompress = 3 };
+inline bool LateActive(unsigned char mode, bool flipMetering) { return mode >= kLateDrop || (mode == kLateAuto && !flipMetering); }
+inline bool LateTimeRule(unsigned char mode) { return mode >= kLateDrop; }
 
 // LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
 // (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. Where its time means something
@@ -222,4 +228,31 @@ inline bool AutoWaitOver(bool generated, bool timed, bool nextDone, long long no
     return now >= slot || (generated && timed && nextDone);
 }
 constexpr double kAutoSliceMs = 0.5;
+
+// LateGen=compress (xefg_own.h, PresentReal): instead of dropping a late generated frame, squeeze the batch into the time left, using
+// whether the game's NEXT frame is already finished on the GPU. `nextDone`: the frame after this batch's game frame is finished;
+// `afterNextDone`: the one after that too. Both are read without waiting and are false when not known.
+
+// Whether a present of a timed batch (`timed`, as in DropLate) is released without waiting for its slot: the next game frame is done, so
+// holding this one for its slot only makes the picture older. Not timed (V-Sync, flip-metered or burst batch): never.
+inline bool CompressEarly(bool timed, bool nextDone) { return timed && nextDone; }
+
+// When an early release goes out: now, but no sooner than MinGap after the last present that really went out (`lastShown`, 0: none), so
+// the frames of a squeezed batch keep their order and an even spacing and never bunch. Ticks.
+inline long long CompressAt(long long now, long long lastShown, long long step)
+{
+    return lastShown ? std::max(now, lastShown + MinGap(step)) : now;
+}
+
+// Whether a generated frame is dropped with LateGen=compress. Never the real frame (`generated` false). A GPU wait that ran out (`gpuOk`
+// false) drops as in LateGen=drop, timed or not. Otherwise only a frame a whole game frame behind on a timed batch: the next game frame and
+// the one after it are both finished on the GPU. Merely late is squeezed, not dropped.
+inline bool CompressDrop(bool generated, bool gpuOk, bool timed, bool nextDone, bool afterNextDone)
+{
+    if (!generated)
+        return false;
+    if (!gpuOk)
+        return true;
+    return timed && nextDone && afterNextDone;
+}
 } // namespace pacesched

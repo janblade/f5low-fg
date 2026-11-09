@@ -159,6 +159,14 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   last present that really went out; `PaceLog` marks them `flags=dropped` (tests/pacer_stats.py leaves them out of the gaps and reports
   `drop_pct`). The decision is `pacesched::DropLate` (host test: `tests/build_drop_late_test.ps1`). Run in NBA 2K27 with `FlipMetering=0`
   (desktop-composed, so inconclusive); not run with hardware flip metering. The time rule of `drop` stays an experiment until an A/B shows a win. Invalid values warn and become `auto`.
+  `LateGen=compress` (experiment, same paths as `drop`, any GPU) squeezes a late batch instead of dropping from it: while the game's NEXT
+  frame is already finished on the GPU, a present of a timed batch does not sleep for its slot but goes out as soon as at least half a step
+  has passed since the last present that went out (the same lower limit the schedule's clamp keeps), so the batch's frames, its own frame
+  included, keep their order and an even spacing and never bunch. A generated frame is dropped only when it is a whole game frame behind (the
+  next frame and the one after it are both finished), or after a GPU timeout; the real frame is never dropped. A flip-metered, burst or V-Sync
+  batch keeps the `show` rules (only a GPU timeout drops); with the next frame not finished it behaves as `show`. The stats line counts the
+  early releases and `PaceLog` marks one `flags=compressed`. The decisions are `pacesched::CompressEarly`, `CompressAt` and `CompressDrop`.
+  Not run in a game yet.
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
   before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say
