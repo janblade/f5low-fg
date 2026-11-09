@@ -3755,8 +3755,8 @@ private:
             if (j.dbgTag)
                 DrawTags(g, rb, ox);
             Barrier(g, rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-            // The lane's list failed to close, or an earlier one did (listBroken): this frame is not presented (GateWait and LanePresent go
-            // together; the fences stay as they are).
+            // The lane's list failed to close, or an earlier one did (listBroken): this frame is not presented. It still takes its gate value
+            // (GateSkip instead of GateWait + LanePresent), so the passes recorded earlier that wait on the gate resolve; the fences stay as they are.
             const bool closed = EndP() && !listBroken.load(std::memory_order_relaxed);
             rb->Release();
             if (closed)
@@ -3774,7 +3774,7 @@ private:
         }
         {
             ID3D12Resource* rb = RealBuffer();
-            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut ? pg->RingFrame(f.set, nGen - 1) : frame;
+            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut && pg->RingFrame(f.set, nGen - 1) ? pg->RingFrame(f.set, nGen - 1) : frame;
             ID3D12GraphicsCommandList* g = BeginP();
             Barrier(g, rb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
             BeginLaneCopy(g, j.frame, nGen + 1, false);
@@ -3845,6 +3845,8 @@ private:
         if (DisplayPaced(f.j))
         {
             GateRelease(v);
+            std::lock_guard<std::mutex> l(clkMu);
+            clkLast = 0;                    // off the clock: set it anew (ClockTarget), as GateWait does
             return;
         }
         {
@@ -3964,7 +3966,7 @@ private:
                     gq.pop_front();
                     // diagnostics: the release thread idle, nothing queued by the presenter for that long (FG on only)
                     const double ims = static_cast<double>(Now() - i0) * 1000.0 / freq();
-                    if (ims > 250.0 && it.f.nGen && slowIdleLogs < 30)
+                    if (ims > 250.0 && it.f.nGen && !it.skip && slowIdleLogs < 30)
                     {
                         ++slowIdleLogs;
                         XLog("gate: release thread idle %.0f ms before present %llu (k %u of %u): the presenter queued nothing; "
@@ -3976,7 +3978,9 @@ private:
                 }
                 if (it.skip)
                 {
-                    GateRelease(it.v);      // left out: its slot opens in order, nothing else (GateSkip)
+                    // Left out: its slot opens in order, nothing else (GateSkip). Not counted in the release statistics: `last` below stays
+                    // the last real release, so the next present's interval includes the skipped time.
+                    GateRelease(it.v);
                     continue;
                 }
                 const Frame& f = it.f;
@@ -4827,8 +4831,8 @@ private:
             if (j.dbgTag)
                 DrawTags(g, rb, ox);
             Barrier(g, rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-            // The lane's list failed to close, or an earlier one did (listBroken): this frame is not presented (GateWait and LanePresent go
-            // together; the fences stay as they are).
+            // The lane's list failed to close, or an earlier one did (listBroken): this frame is not presented. It still takes its gate value
+            // (GateSkip instead of GateWait + LanePresent), so the passes recorded earlier that wait on the gate resolve; the fences stay as they are.
             const bool closed = EndP() && !listBroken.load(std::memory_order_relaxed);
             rb->Release();
             if (closed)
@@ -4846,7 +4850,7 @@ private:
         }
         {
             ID3D12Resource* rb = RealBuffer();
-            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut ? ringG[set][nGen - 1] : frame;
+            ID3D12Resource* src = j.dbgOnly && nGen && !j.cut && ringG[set][nGen - 1] ? ringG[set][nGen - 1] : frame;
             ID3D12GraphicsCommandList* g = BeginP();
             Barrier(g, rb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
             BeginLaneCopy(g, j.frame, nGen + 1, false);
