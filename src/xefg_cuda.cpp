@@ -1789,6 +1789,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
         // AppJobs= / RetireWait=0 (XEFG_CUDA_APPJOBS, XEFG_CUDA_RETIREWAIT): low-level, where the game's Present blocks (xefg_own.h, OnPresent).
         o->appJobs = std::clamp(static_cast<uint32_t>(atoi(Setting("XEFG_CUDA_APPJOBS", "AppJobs", "2").c_str())), 1u, 6u);
         o->retireWait = Setting("XEFG_CUDA_RETIREWAIT", "RetireWait", "1") != "0";
+        // WaitBoundMs= / GameWaitMs= (XEFG_CUDA_WAITBOUNDMS, XEFG_CUDA_GAMEWAITMS): the bounds of the presenter path's waits (wait_bound.h): GPU fence
+        // and allocator waits (default 500 ms), the game's Present waiting for room in the presenter's queue (default 100 ms).
+        o->waitBoundMs = std::clamp(static_cast<unsigned>(atoi(Setting("XEFG_CUDA_WAITBOUNDMS", "WaitBoundMs", "500").c_str())), 50u, 5000u);
+        o->gameWaitMs = std::clamp(static_cast<unsigned>(atoi(Setting("XEFG_CUDA_GAMEWAITMS", "GameWaitMs", "100").c_str())), 10u, 2000u);
         o->oobMarkers = have > 0 && Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";      // (no NVIDIA compute device: off with the rest)
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):
         // 2500 us, less at a high rate - never more than 0.45 of the frame spacing (xefg_own.h, FlipLead). Not used while the burst is on.

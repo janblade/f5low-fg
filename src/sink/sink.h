@@ -71,6 +71,7 @@
 #include "../pace_lead.h"
 #include "../pace_sched.h"
 #include "release_rule.h"
+#include "../wait_bound.h"
 
 #include <d3d12.h>
 
@@ -362,6 +363,9 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     std::condition_variable cvItem, cvSpace;
     std::deque<Item> q;
     bool stop = false;
+    waitbound::Episode stall;           // bounded waits (wait_bound.h)
+    bool stallTripped = false;          // a wait ran out since the last Enqueue (under mu, but the copy path sets it on the pacer thread)
+    bool copySkipped = false;           // the pacer's last CopyToBackBuffer was skipped by the bound
     uint64_t in = 0;                    // frames accepted from the library
     uint64_t presented = 0;             // frames released on the real chain
     uint32_t burst = 1;
@@ -728,13 +732,31 @@ class SinkSwapChain final : public scproxy::LogSwapChain
         lastBurstStart = t;
     }
 
-    void WaitFence(UINT64 v)
+    // Waits for the copy fence within `ms`; false when it ran out (the caller must not touch what the GPU may still use). The teardown
+    // keeps the longer 2 s (what follows frees the slots).
+    bool WaitFence(UINT64 v, DWORD ms = 2000)
     {
-        if (fence->GetCompletedValue() < v)
-        {
-            fence->SetEventOnCompletion(v, fenceEvent);
-            WaitForSingleObject(fenceEvent, 2000);
-        }
+        if (fence->GetCompletedValue() >= v)
+            return true;
+        fence->SetEventOnCompletion(v, fenceEvent);
+        WaitForSingleObject(fenceEvent, ms);
+        return fence->GetCompletedValue() >= v;
+    }
+
+    // A wait ran into its bound (wait_bound.h): logged once per episode; a frame is dropped rather than the thread held. The episode ends
+    // by itself after kGoodToRecover frames in a row that waited for nothing.
+    void NoteStall(const char* what)
+    {
+        stallTripped = true;
+        if (stall.Trip() && g_log)
+            g_log("sink: waits: %s for %u ms without an answer - dropping frames until it clears (back on by itself)", what, waitbound::kGpuWaitMs);
+    }
+    void NoteGood()
+    {
+        if (stallTripped)
+            stallTripped = false;
+        else if (stall.Good() && g_log)
+            g_log("sink: waits: the stall is over (%u frames in a row without a timeout)", waitbound::kGoodToRecover);
     }
 
     void ReleaseSlots()
@@ -834,8 +856,14 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     // Staging texture `a` (frame `n`) into the real chain's current back buffer, on the chain's queue.
     bool CopyToBackBuffer(UINT a, uint64_t n)
     {
-        if (allocFence[a])
-            WaitFence(allocFence[a]);
+        copySkipped = false;
+        if (allocFence[a] && !WaitFence(allocFence[a], waitbound::kGpuWaitMs))
+        {
+            // The copy that last used this slot's allocator is still running: not reset. The frame is not shown (the next one is).
+            NoteStall("a copy's allocator was still in use by the GPU");
+            copySkipped = true;
+            return false;
+        }
         if (probePending[a])
         {
             void* p = nullptr;
@@ -980,12 +1008,12 @@ class SinkSwapChain final : public scproxy::LogSwapChain
             if (copied && it.sched)
             {
                 const LONGLONG w0 = Now();
-                WaitFence(allocFence[it.slot]);
+                WaitFence(allocFence[it.slot], waitbound::kGpuWaitMs);
                 const LONGLONG w1 = Now();
                 lateMs = (std::min)(static_cast<double>(w1 - w0) * 1000.0 / Freq(), (std::max)(0.0, static_cast<double>(w1 - target) * 1000.0 / Freq()));
             }
             if (!copied)
-                hr = DXGI_ERROR_INVALID_CALL;
+                hr = copySkipped ? S_OK : DXGI_ERROR_INVALID_CALL;     // (a frame dropped by the bound is not an error for the library)
             else
             {
                 const LONGLONG p0 = scproxy::Qpc();
@@ -1057,7 +1085,9 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     void Drain()
     {
         std::unique_lock<std::mutex> l(mu);
-        cvSpace.wait(l, [&] { return q.empty(); });
+        // Bounded (a resize must not hang the game): the queue empties at the pace of the schedule, a few frames' time at most
+        if (!waitbound::WaitFor(l, cvSpace, 2000, [&] { return q.empty() || stop; }))
+            NoteStall("the queue did not drain at a resize");
     }
 
     // The GPU stamp watcher (see the top), as the own generator's (xefg_own.h, StartPresenter): a thread of its own, so a busy pacer does
@@ -1270,7 +1300,15 @@ public:
             ++fullWaits;
             blockedInBurst = true;
         }
-        cvSpace.wait(l, [&] { return stop || q.size() < kMaxQueue; });
+        if (!waitbound::WaitFor(l, cvSpace, waitbound::kGpuWaitMs, [&] { return stop || q.size() < kMaxQueue; }))
+        {
+            // The pacer does not release (a stuck present or copy): the frame is dropped, not queued (nothing to undo: `in` and the slot
+            // stay, the library draws its next frame into the same one). The game's thread comes back.
+            NoteStall("the queue had no room");
+            const HRESULT h0 = lastHr;
+            lastHr = S_OK;
+            return h0;
+        }
         const bool direct = NoteRelease(sync, flags);
         if (!direct)
             Observe(arrived);
@@ -1290,17 +1328,25 @@ public:
             // The library draws the next frame into texture in % appBuffers as soon as this returns: the frame that held it last
             // (appBuffers frames back) must be out of the queue and its copy done on the GPU.
             cvItem.notify_one();
-            cvSpace.wait(l, [&] { return stop || q.size() < appBuffers; });
+            // (bounded: the frame is queued already, so on a timeout the library goes on - at worst it draws over a texture still to be shown)
+            if (!waitbound::WaitFor(l, cvSpace, waitbound::kGpuWaitMs, [&] { return stop || q.size() < appBuffers; }))
+                NoteStall("the queue did not release the library's next texture");
             const UINT64 v = allocFence[in % appBuffers];
             l.unlock();
             if (v && fence->GetCompletedValue() < v)
             {
                 fence->SetEventOnCompletion(v, libEvent);
-                WaitForSingleObject(libEvent, 2000);
+                if (WaitForSingleObject(libEvent, waitbound::kGpuWaitMs) != WAIT_OBJECT_0 && fence->GetCompletedValue() < v)
+                {
+                    l.lock();
+                    NoteStall("the copy of the library's last texture");
+                    l.unlock();
+                }
             }
             l.lock();
         }
         lastReturn = Now();
+        NoteGood();
         l.unlock();
         cvItem.notify_one();
         return h;           // a failed real Present is reported on the library's next one
