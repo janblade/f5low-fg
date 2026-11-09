@@ -1720,6 +1720,16 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             // What a context then does (on, or off and why) is logged when its presenter starts (xefg_own.h StartGenAhead).
             XLog("GenBlock=%s: %s", gb.c_str(), o->genBlock ? "wanted" : off ? "off" : "off (flip metering is on for this GPU)");
         }
+        // LateGen (XEFG_CUDA_LATEGEN): "show" (default) presents every generated frame, late or not; "drop" leaves a generated frame out
+        // when its own GPU work did not finish in time, or it is more than one step past its time or the batch's real frame is due
+        // (xefg_own.h PresentReal). The real frame is always shown. Paths that present through PresentReal (not Gate=1).
+        {
+            const std::string lg = Setting("XEFG_CUDA_LATEGEN", "LateGen", "show");
+            if (lg != "show" && lg != "drop")
+                XLog("warning: LateGen=%s is not show or drop - taken as show", lg.c_str());
+            o->lateDrop = lg == "drop";
+            XLog("LateGen=%s: %s", lg.c_str(), o->lateDrop ? "generated frames that miss their time are dropped" : "every generated frame is shown");
+        }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
         o->oobQueue = oobQueue == "1";

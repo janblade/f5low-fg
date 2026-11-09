@@ -472,6 +472,7 @@ public:
     std::string genMode = "off";                // GenQueue= in f5low.ini: off, direct or compute (see PresentGen)
     std::string genPriority;                    // GenPriority= in f5low.ini: high or normal; empty: normal with the gate, else high
     bool genBlock = false;                      // GenBlock=1 in f5low.ini (blockFence, BlockDone): the game's next frame waits for our passes
+    bool lateDrop = false;                      // LateGen=drop in f5low.ini (pacesched::DropLate, PresentReal): a generated frame that missed its time is left out
     bool presentNormal = false;                 // PresentPriority=normal in f5low.ini (diagnostic only): our present queue at normal priority.
                                                 // It does not imitate an RTX 20 (whose problem is slow switching between queues).
     uint32_t genSpread = 2;                     // GenSpread= in f5low.ini: the D3D12 gate's passes, steps apart (0: at once; PresentGenGated)
@@ -1704,7 +1705,7 @@ private:
 
     // PaceLog: one record per present of a frame that generates, kept in memory (a log line each would perturb the pacing) and
     // written by PaceDump. t: the present's time (QPC), ready: the app frame's ready stamp, target: the time it was aimed at.
-    enum : uint8_t { kPaceLate = 1 };
+    enum : uint8_t { kPaceLate = 1, kPaceDropped = 2 };
     static constexpr size_t kPaceMax = 50000;
     struct PaceRec
     {
@@ -1722,7 +1723,7 @@ private:
         else
             ++paceDropped;
     }
-    // "pace: t=<ms> frame=<app frame> k=<present>/<of> ready=<ms> target=<ms> flags=<late|->": ms are QPC milliseconds.
+    // "pace: t=<ms> frame=<app frame> k=<present>/<of> ready=<ms> target=<ms> flags=<late|dropped|->": ms are QPC milliseconds.
     void PaceDump()
     {
         std::vector<PaceRec> recs;
@@ -1735,7 +1736,7 @@ private:
         const double q = 1000.0 / freq();
         for (const PaceRec& r : recs)
             XLog("pace: t=%.3f frame=%llu k=%u/%u ready=%.3f target=%.3f flags=%s", r.t * q, static_cast<unsigned long long>(r.frame), r.k,
-                 static_cast<unsigned>(r.n), r.ready * q, r.target * q, r.flags & kPaceLate ? "late," : "-");
+                 static_cast<unsigned>(r.n), r.ready * q, r.target * q, r.flags & kPaceDropped ? "dropped," : r.flags & kPaceLate ? "late," : "-");
         if (dropped)
             XLog("pace: %zu records not kept (the first %zu are above)", dropped, kPaceMax);
     }
@@ -2140,12 +2141,32 @@ private:
         if (paced && !burst)
             WaitUntil(target - lead);
         const long long tg = Now();
-        WaitGpu(hostFence, hostValue);
+        const bool gpuOk = WaitGpu(hostFence, hostValue);
         const double gpuWaitMs = static_cast<double>(Now() - tg) * 1000.0 / freq();
         // Only what our own GPU work held it past its target: a frame the game handed over late is past its target too, and
         // counted whole it raised the lag after each game stutter and the next frame then slept that long (NBA 2K27).
         const double late = paced ? std::min(gpuWaitMs, std::max(0.0, static_cast<double>(Now() - target) * 1000.0 / freq())) : 0.0;
         statGpuWait += gpuWaitMs;
+        // LateGen=drop: a generated frame whose work did not finish, or that is too late to be worth showing, is left out - not
+        // presented, no token or swap chain wait. What its slot gives the schedule stays (the next frames are timed as if it went
+        // out at its slot: lastAnyPresent, lastRelease), the batch's metering decision is still made, and the callers' fences
+        // (Consumed, BlockDone, aheadRead, retireFence) are signalled after the loop as always. Its copy is already submitted; the
+        // next present's copy overwrites it in the same buffer.
+        const long long dropStep = static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0);
+        // The batch's real frame is due the remaining steps after this frame's time (the same spacing for the schedule and the clock).
+        if (n > 0 && pacesched::DropLate(lateDrop, k <= n, gpuOk, paced, Now(), target, dropStep,
+                                         target + static_cast<long long>(n + 1 - k) * dropStep))
+        {
+            ++statDropLate;
+            statDropTimeout += !gpuOk;
+            if (k == 1)
+                Meter(j, n);
+            lastRelease = std::max(Now(), target);
+            lastAnyPresent = std::max(lastAnyPresent, std::min(target, Now()));
+            if (paceLog)
+                PaceRecord(Now(), showing ? showing->ready : jobBase, target, j.frame, k, n + 1, kPaceDropped);
+            return late;
+        }
         const long long tw0 = Now();
         if (realWait)
         {
@@ -4650,6 +4671,9 @@ private:
         if (statLeadFrames)
             XLog("stats: pace lead %.2f ms (%.2f - %.2f over %u app frames, %s, window max %.2f), %u generated frames late", leadState.ms,
                  leadMin, leadMax, statLeadFrames, leadState.automatic ? "auto" : "fixed", leadState.ringMax, statLeadLate);
+        if (lateDrop)
+            XLog("stats: LateGen=drop: %u generated frames left out for being late (%u of them after a GPU wait ran out)", statDropLate, statDropTimeout);
+        statDropLate = statDropTimeout = 0;
         leadMin = 1e9;
         leadMax = 0;
         statLeadLate = statLeadFrames = 0;
@@ -5517,6 +5541,7 @@ private:
     std::atomic<double> interval { 16.7 };
     double statGap = 0, statGap2 = 0, statGapMax = 0, statAppCall = 0, statAppWait = 0;
     unsigned statGaps = 0, statFrames = 0, statLate = 0, statEarly = 0, traced = 0;
+    unsigned statDropLate = 0, statDropTimeout = 0;    // LateGen=drop: generated frames left out (PresentReal), and those after a GPU wait that ran out
     bool catchUp = false;               // presenter: the next app frame was already done on the GPU when this one started
     double allocWaitMs = 0;
     // Presenter, GPU timeline: when the app's frame was done on the GPU (QPC), and the smoothed interval between those.

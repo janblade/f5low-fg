@@ -135,6 +135,16 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   Not on by default with metering: there, with the automatic driver pacing, NBA 2K27 ran at 27.7 fps in some runs and sat at 14 in
   others (with `DriverPacing=0`: 30 every run). D3D12 path with our own swap chain and `Gate=0` only.
   `PresentPriority=normal` (diagnostic only, not for players) puts our present queue at normal priority instead of high.
+- **own** (`src/xefg_own.h`, paths that present through `PresentReal`: the per-frame passes, the generation lane and GenBlock; not `Gate=1`):
+  `LateGen=` in f5low.ini (`XEFG_CUDA_LATEGEN`): `show` (default) presents every generated frame, `drop` leaves out a generated frame that
+  missed its time instead of showing it late. Dropped: a frame whose own GPU work did not finish in its wait (200 ms), and, with the
+  schedule in use (not with V-Sync), a frame that at the moment of its present is more than one step past its time or whose batch's
+  real frame is already due. The real frame is never dropped. A dropped frame is not presented (no swap chain wait, no token); the next
+  frames are timed as if it had gone out at its slot, and every fence the batch signals (consumed, game release, present-lane read,
+  retire) still advances. Its copy into the swap chain's buffer is already submitted and is overwritten by the next present's. The stats line
+  `LateGen=drop: N generated frames left out for being late (M of them after a GPU wait ran out)` counts them; `PaceLog` marks them
+  `flags=dropped`. The decision is `pacesched::DropLate` (host test: `tests/build_drop_late_test.ps1`). Not game-run yet; `show` stays the default
+  until an A/B shows a win.
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
   before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say

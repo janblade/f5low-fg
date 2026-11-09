@@ -187,4 +187,18 @@ struct Lag
 // The cap of the lead (ticks) a batch is planned with: `cap` (a step, or n steps with the wide-cap test) for the lead rule; a fixed test
 // lead (F5LOW_TEST_SINK_LEAD_MS) is never cut by it - the experiment must run the lead it asks for.
 inline long long LeadCap(long long cap, long long lead, bool fixedTestLead) { return fixedTestLead ? std::max(cap, lead) : cap; }
+
+// LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
+// (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. With the schedule in use
+// (`timed`: not display-paced) a frame is also dropped when, at the moment it would go out, it is more than one step past its time,
+// or the batch's real frame is already due: showing it then would put it right in front of the real frame, or behind it in time.
+// Within a step of its time it goes out as before. `enabled` false (LateGen=show) never drops. Ticks.
+inline bool DropLate(bool enabled, bool generated, bool gpuOk, bool timed, long long now, long long target, long long step, long long realTarget)
+{
+    if (!enabled || !generated)
+        return false;
+    if (!gpuOk)
+        return true;
+    return timed && (now - target > step || now >= realTarget);
+}
 } // namespace pacesched
