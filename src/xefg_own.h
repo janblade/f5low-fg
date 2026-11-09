@@ -2136,13 +2136,14 @@ private:
         const UINT64 done = appFence->GetCompletedValue();
         return done != UINT64_MAX && done >= v;
     }
-    // LateGen=auto: waits for `slot` (QPC) but stops as soon as the game's next frame is finished. True: it stopped for that, before the slot.
+    // LateGen=early: waits for `slot` (QPC) but stops as soon as the game's next frame is finished. True: it stopped for that, before the slot.
     // Not a spin: the thread sleeps on the next frame's fence event and a high-resolution timer set kAutoSpinMs before the slot, and spins
     // only for that last stretch (as WaitUntil does), where it looks at the fence in between. Bounded by the slot (the timer is always set,
     // at most about two steps away: Bound), so a fence that never moves or a removed device (the fence reads UINT64_MAX; a failed
     // registration) falls back to the plain wait for the slot.
     bool WaitSlotOrNext(const Job& j, long long slot)
     {
+        // One timer handle per presenter thread (this runs on it only), kept for the thread's life like WaitUntil's: the process closes it at exit.
         static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         const long long spin = static_cast<long long>(pacesched::kAutoSpinMs * freq() / 1000.0);
         if (Now() >= slot)
@@ -2238,11 +2239,11 @@ private:
             }
             squeeze = pacesched::CompressEarly(n > 0 && !DisplayPaced(j) && !Metered(j) && !Burst(), true);
         }
-        // LateGen=auto, timed batch: a generated frame is stale (not presented, no wait) when the game's next frame is finished and its
-        // slot is already past (it would be late anyway). An on-time frame is never dropped (a presenter that is behind catches up under the
-        // early-out). Same bookkeeping as the drop below, but the dropped frame's slot is the schedule's, so Bound cannot pull
-        // the batch's later frames earlier than the early-out allows. The real frame is never dropped.
-        if (autoTimed && pacesched::AutoStale(gen, GameFrameDone(j, 1), Now() >= target - lead))
+        // LateGen=auto and early, timed batch: a generated frame is stale (not presented, no wait) when the game's next frame is finished and
+        // the presenter is at least half a step past its slot (it would be late anyway; a hair late is still shown). An on-time frame is
+        // never dropped. Same bookkeeping as the drop below, but the dropped frame's slot is the schedule's, so Bound cannot pull the
+        // batch's later frames earlier. The real frame is never dropped.
+        if (autoTimed && pacesched::AutoStale(gen, GameFrameDone(j, 1), Now(), target - lead, step))
         {
             ++statDropLate;
             ++statDropStale;

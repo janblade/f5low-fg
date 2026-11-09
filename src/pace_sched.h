@@ -222,16 +222,16 @@ inline bool DropLate(bool enabled, bool generated, bool gpuOk, bool timed, long 
 // LateGen=auto and early, where no flip metering paces the batch (xefg_own.h PresentReal), on a timed batch (not V-Sync, flip-metered, burst or on
 // the clock pacer). `nextDone`: the game frame after the batch's own is finished on the GPU (false when not known). A GPU timeout drops
 // with or without a timed batch (DropLate). The batch's real frame is never dropped.
-// Early-out (LateGen=early only, an experiment): once the next game frame is finished, the frames still waiting for their slots - the real frame included - stop waiting: the
-// picture on the screen is then a game frame behind and a slot only makes it older. Each goes out no sooner than MinGap after the last
-// present that went out (CompressAt), so the batch never bunches. The wait for a slot ends here (the caller checks in between).
-inline bool AutoWaitOver(bool nextDone, long long now, long long slot) { return nextDone || now >= slot; }
-// Stale (LateGen=auto and early): a GENERATED frame is not presented when the next game frame is finished and the frame would be late
-// anyway (`slotPassed`: its slot is past when the presenter gets to it). A frame that is on time is never dropped. A presenter that is
-// behind (the next game frame was finished before the batch started) is not a reason of its own.
-inline bool AutoStale(bool generated, bool nextDone, bool slotPassed)
+// Early-out (LateGen=early only, an experiment, in xefg_own.h's WaitSlotOrNext): once the next game frame is finished, the frames still
+// waiting for their slots - the real frame included - stop waiting; each goes out no sooner than MinGap after the last present that went
+// out (CompressAt), so the batch never bunches.
+// Stale (LateGen=auto and early): a GENERATED frame is not presented when the next game frame is finished and the presenter is at least
+// MinGap (half a step) past the frame's slot when it gets to it: a frame show would put out a hair late (an allocator wait, recording, a
+// preempted thread) is not dropped, which would leave a two-step hole. A frame on time is never dropped. A presenter that is behind
+// (the next game frame was finished before the batch started) is not a reason of its own. Ticks.
+inline bool AutoStale(bool generated, bool nextDone, long long now, long long slot, long long step)
 {
-    return generated && nextDone && slotPassed;
+    return generated && nextDone && now >= slot + MinGap(step);
 }
 // How long the wait for a slot spins at its end instead of sleeping (ms): the timer is set to the slot less this.
 constexpr double kAutoSpinMs = 0.5;
@@ -244,7 +244,7 @@ constexpr double kAutoSpinMs = 0.5;
 // holding this one for its slot only makes the picture older. Not timed (V-Sync, flip-metered or burst batch): never.
 inline bool CompressEarly(bool timed, bool nextDone) { return timed && nextDone; }
 
-// When an early release goes out (LateGen=compress, and LateGen=auto's early-out): now, but no sooner than MinGap after the last present that really went out (`lastShown`, 0: none), so
+// When an early release goes out (LateGen=compress, and LateGen=early's early-out): now, but no sooner than MinGap after the last present that really went out (`lastShown`, 0: none), so
 // the frames of a squeezed batch keep their order and an even spacing and never bunch. Ticks.
 inline long long CompressAt(long long now, long long lastShown, long long step)
 {
