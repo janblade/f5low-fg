@@ -85,6 +85,13 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_drop_late_test.ps1 -VsPath $vs
 
+      # LateGen=auto's next-frame rules and LateGen=compress (src/pace_sched.h): no GPU
+      - name: Next frame pacing test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_compress_late_test.ps1 -VsPath $vs
+
       # The out of band queue and marker rules (src/oob_driver.h): no GPU
       - name: Out of band driver test
         shell: pwsh

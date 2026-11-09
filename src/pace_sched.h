@@ -209,4 +209,17 @@ inline bool DropLate(bool enabled, bool generated, bool gpuOk, bool timed, long 
         return true;
     return timed && now - rawTarget > step;
 }
+
+// LateGen=auto, where no flip metering paces the batch (xefg_own.h PresentReal). Two rules on a timed batch's GENERATED frames (`timed` as in
+// DropLate: not V-Sync, flip-metered or burst); `nextDone`: the game frame after the frame's own is finished on the GPU (false when not
+// known). The real frame is never dropped and never cut short. A GPU timeout drops with or without `timed` (DropLate).
+// Stale: the frame's game frame is older than the newest one finished on the GPU, so it is not presented. Checked before its slot wait.
+inline bool AutoStale(bool generated, bool timed, bool nextDone) { return generated && timed && nextDone; }
+// Early-out: the wait for the frame's slot ends as soon as the next game frame is finished (the frame then goes out at once). Checked in
+// slices of the wait (kAutoSliceMs).
+inline bool AutoWaitOver(bool generated, bool timed, bool nextDone, long long now, long long slot)
+{
+    return now >= slot || (generated && timed && nextDone);
+}
+constexpr double kAutoSliceMs = 0.5;
 } // namespace pacesched

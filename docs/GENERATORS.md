@@ -138,7 +138,12 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
 - **own** (`src/xefg_own.h`, paths that present through `PresentReal`: the per-frame passes, the generation lane and GenBlock; not `Gate=1`):
   `LateGen=` in f5low.ini (`XEFG_CUDA_LATEGEN`): `auto` (default), `show`, `drop`. `auto` leaves out a generated frame whose own GPU work
   did not finish in its wait (200 ms), and only where f5low times every frame itself (flip metering off for the context: RTX 20/30/40 or
-  `FlipMetering=0`); with flip metering on it behaves as `show`. There is no time rule in `auto`. `show` presents every generated frame on any
+  `FlipMetering=0`); with flip metering on it behaves as `show`. There is no time rule in `auto`, but on a timed batch (not V-Sync, burst or
+  metered) it looks at whether the game's NEXT frame is already finished on the GPU (read from the game's frame fence without waiting; a
+  frame the game has not presented yet counts as not finished): a generated frame of an older game frame is not presented (stale), and the wait
+  for a generated frame's slot ends as soon as the next game frame is finished (checked every half millisecond), so the frame goes out at
+  once. The real frame is never dropped or cut short: after a stale batch it goes out at its own slot, which is then past. A GPU timeout drops
+  with or without V-Sync. Host test: `tests/build_compress_late_test.ps1`. `show` presents every generated frame on any
   GPU. `drop` (an experiment) adds the time rule: it leaves out a generated frame that is late by more than a step instead of showing it
   (frames up to one step late are still shown), on every GPU. With `drop` a frame is dropped when its GPU work timed out, or a frame that at the moment of its present is more than one step past its time on its own schedule
   (the time before the clamp that keeps a late frame from bunching with the next, the step it was computed with). The time rule applies

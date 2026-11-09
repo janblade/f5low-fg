@@ -1720,9 +1720,10 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             // What a context then does (on, or off and why) is logged when its presenter starts (xefg_own.h StartGenAhead).
             XLog("GenBlock=%s: %s", gb.c_str(), o->genBlock ? "wanted" : off ? "off" : "off (flip metering is on for this GPU)");
         }
-        // LateGen (XEFG_CUDA_LATEGEN): "auto" (default): a generated frame whose own GPU work did not finish in its wait is left out, but
-        // only where f5low times every frame itself (flip metering off for this context: RTX 20/30/40, or FlipMetering=0); with flip
-        // metering on it is "show". "show": every generated frame is presented, late or not. "drop" (experiment): also leaves out a
+        // LateGen (XEFG_CUDA_LATEGEN): "auto" (default): where f5low times every frame itself (flip metering off for this context: RTX
+        // 20/30/40, or FlipMetering=0) a generated frame whose own GPU work did not finish in its wait is left out; on a timed batch (not
+        // V-Sync) one whose game frame is stale (the game's next frame is finished on the GPU) is left out, and the wait for a slot
+        // ends as soon as that frame is finished; with flip metering on it is "show". "show": every generated frame is presented, late or not. "drop" (experiment): also leaves out a
         // frame more than one step past its time (not on a metered, burst or V-Sync batch: there only a GPU timeout drops). The real
         // frame is always shown. Paths that present through PresentReal (xefg_own.h; not Gate=1).
         {
@@ -1737,7 +1738,8 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                  o->lateMode == 2 ? "generated frames that time out or are over a step late are left out"
                  : o->lateMode == 0 ? "every generated frame is shown"
                  : o->flipMetering ? "same as show (flip metering is on for this GPU)"
-                                   : "a generated frame whose GPU work timed out is left out (flip metering is off)");
+                                   : "a generated frame whose GPU work timed out or whose game frame is stale is left out, a slot wait ends "
+                                     "when the game's next frame is done (flip metering is off)");
         }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");

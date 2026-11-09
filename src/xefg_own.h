@@ -472,7 +472,7 @@ public:
     std::string genMode = "off";                // GenQueue= in f5low.ini: off, direct or compute (see PresentGen)
     std::string genPriority;                    // GenPriority= in f5low.ini: high or normal; empty: normal with the gate, else high
     bool genBlock = false;                      // GenBlock=1 in f5low.ini (blockFence, BlockDone): the game's next frame waits for our passes
-    uint8_t lateMode = 1;                       // LateGen= in f5low.ini: 0 show, 1 auto (a GPU timeout drops, only without flip metering), 2 drop (also the one-step time rule); PresentReal, pacesched::DropLate
+    uint8_t lateMode = 1;                       // LateGen= in f5low.ini (pacesched::LateMode): show, auto (without flip metering: a GPU timeout drops, a timed batch's stale frames drop and its slot waits end when the game's next frame is done), drop (also the one-step time rule); PresentReal
     bool presentNormal = false;                 // PresentPriority=normal in f5low.ini (diagnostic only): our present queue at normal priority.
                                                 // It does not imitate an RTX 20 (whose problem is slow switching between queues).
     uint32_t genSpread = 2;                     // GenSpread= in f5low.ini: the D3D12 gate's passes, steps apart (0: at once; PresentGenGated)
@@ -2120,6 +2120,26 @@ private:
         const double step = ri.ms / static_cast<double>(n + 1) * freq() / 1000.0;
         return Bound(schedBase + static_cast<long long>(k * step), static_cast<long long>(step));
     }
+    // Whether the game frame `after` frames after j's (1: the next one) is finished on the GPU, read without waiting. Game frames are
+    // numbered one by one (Job::frame = appFrame at the game's Present) and frame f is done when appFence reaches f + 1, so the frame is
+    // done when the fence is at j.frame + after + 1 or more. A frame the game has not presented yet (submitted counts the frames handed
+    // over; the fence value is signalled in that same call) is not finished, and a removed device (UINT64_MAX) is not "finished". Only
+    // read: PresentGen, PresentAhead (GenBlock) and Show all pace j on the presenter thread against this same game fence.
+    bool GameFrameDone(const Job& j, uint64_t after) const
+    {
+        const uint64_t v = j.frame + after + 1;
+        if (submitted.load(std::memory_order_acquire) < v)
+            return false;
+        const UINT64 done = appFence->GetCompletedValue();
+        return done != UINT64_MAX && done >= v;
+    }
+    // LateGen=auto: the wait for a slot, in slices of kAutoSliceMs, ends early once the game's next frame is done (pacesched::AutoWaitOver).
+    void WaitSlotOrNext(const Job& j, long long slot)
+    {
+        const long long slice = static_cast<long long>(pacesched::kAutoSliceMs * freq() / 1000.0);
+        while (!pacesched::AutoWaitOver(true, true, GameFrameDone(j, 1), Now(), slot))
+            WaitUntil(std::min(slot, Now() + slice));
+    }
     // target: worked out by the caller beforehand (Show, before Early moves the timeline on), else here. Returns how
     // many ms our GPU work held the frame past its target (0 if it was done in time).
     // rawTarget, step: LateGen=drop's frame time before the Bound clamp and the step it was computed from (0: from the schedule here).
@@ -2144,7 +2164,29 @@ private:
         const bool burst = oobdriver::BurstNow(Burst(), k, metered);
         const long long lead = !burst && k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
         const long long t0 = Now(), before = lastShown;
-        if (paced && !burst)
+        // Flip metering is off for LateGen=auto when the settings say so (flipMetering, as the GPU resolved it), or when it was wanted but the
+        // driver path turned out unusable (InitFlip tried and left flipFn null - never metered, whatever the settings). Either way Metered(j)
+        // is then false for the batch; the time-based rules still ask for it (a batch the driver meters keeps its pacing).
+        const bool meterOff = !flipMetering || (flipTried && !flipFn);
+        const bool gen = n > 0 && k <= n;
+        const bool autoTimed = lateMode == pacesched::kLateAuto && meterOff && gen && paced && !metered && !burst && !Metered(j);
+        // LateGen=auto, timed batch: a generated frame whose game frame is stale (the game's next frame is finished on the GPU) is not
+        // presented, whatever its slot: checked before it waits. Same bookkeeping as the drop below. The real frame is never touched.
+        if (pacesched::AutoStale(gen, autoTimed, GameFrameDone(j, 1)))
+        {
+            ++statDropLate;
+            ++statDropStale;
+            statDropFirst += k == 1;
+            lastRealRelease = Now();
+            lastRelease = target;
+            lastAnyPresent = std::max(lastAnyPresent, std::min(target, Now()));
+            if (paceLog)
+                PaceRecord(Now(), showing ? showing->ready : jobBase, target, j.frame, k, n + 1, kPaceDropped);
+            return 0.0;
+        }
+        if (autoTimed && !burst)
+            WaitSlotOrNext(j, target - lead);
+        else if (paced && !burst)
             WaitUntil(target - lead);
         const long long tg = Now();
         const bool gpuOk = WaitGpu(hostFence, hostValue);
@@ -2164,7 +2206,7 @@ private:
         // LateGen=auto drops on a GPU timeout only and only without flip metering (Meter is a no-op there); with metering it is show.
         // LateGen=drop adds the time rule, which needs Meter's decision for this batch first (k == 1).
         bool metered_ = false;
-        if (pacesched::LateActive(lateMode, flipMetering) && n > 0 && k <= n)
+        if (pacesched::LateActive(lateMode, !meterOff) && n > 0 && k <= n)
         {
             if (k == 1 && pacesched::LateTimeRule(lateMode))
             {
@@ -4702,9 +4744,10 @@ private:
             XLog("stats: pace lead %.2f ms (%.2f - %.2f over %u app frames, %s, window max %.2f), %u generated frames late", leadState.ms,
                  leadMin, leadMax, statLeadFrames, leadState.automatic ? "auto" : "fixed", leadState.ringMax, statLeadLate);
         if (statDropLate)
-            XLog("stats: LateGen=%s: %u generated frames left out (%u after a GPU wait ran out, %u of them a batch's first: those are not in the "
-                 "first-frame time above)", lateMode == 2 ? "drop" : "auto", statDropLate, statDropTimeout, statDropFirst);
-        statDropLate = statDropTimeout = statDropFirst = 0;
+            XLog("stats: LateGen=%s: %u generated frames left out (%u after a GPU wait ran out, %u stale: the game's next frame was done; %u of "
+                 "all of them a batch's first: those are not in the first-frame time above)", lateMode == pacesched::kLateDrop ? "drop" : "auto",
+                 statDropLate, statDropTimeout, statDropStale, statDropFirst);
+        statDropLate = statDropTimeout = statDropFirst = statDropStale = 0;
         leadMin = 1e9;
         leadMax = 0;
         statLeadLate = statLeadFrames = 0;
@@ -5575,6 +5618,7 @@ private:
     std::atomic<double> interval { 16.7 };
     double statGap = 0, statGap2 = 0, statGapMax = 0, statAppCall = 0, statAppWait = 0;
     unsigned statGaps = 0, statFrames = 0, statLate = 0, statEarly = 0, traced = 0;
+    unsigned statDropStale = 0;             // LateGen=auto: generated frames left out as stale (PresentReal), also in statDropLate
     unsigned statDropLate = 0, statDropTimeout = 0, statDropFirst = 0;    // LateGen=drop: generated frames left out (PresentReal), and those after a GPU wait that ran out
     bool catchUp = false;               // presenter: the next app frame was already done on the GPU when this one started
     double allocWaitMs = 0;
