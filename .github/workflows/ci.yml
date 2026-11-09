@@ -92,6 +92,13 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_compress_late_test.ps1 -VsPath $vs
 
+      # FixedPacing=auto|display|timer decision (src/pace_sched.h): no GPU
+      - name: Fixed pacing test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_fixed_pacing_test.ps1 -VsPath $vs
+
       # The out of band queue and marker rules (src/oob_driver.h): no GPU
       - name: Out of band driver test
         shell: pwsh

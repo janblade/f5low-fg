@@ -172,6 +172,35 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   batch keeps the `show` rules (only a GPU timeout drops); with the next frame not finished it behaves as `show`. The stats line counts the
   early releases and `PaceLog` marks one `flags=compressed`. The decisions are `pacesched::CompressEarly`, `CompressAt` and `CompressDrop`.
   Not run in a game yet.
+- **own** (`src/xefg_own.h`, same paths as `LateGen`; not `Gate=1`): `FixedPacing=` in f5low.ini (`XEFG_CUDA_FIXEDPACING`): `auto` (default), `display`, `timer`.
+  It decides who spaces a batch's frames when the game asks for V-Sync. With `display` the display does: each present goes out as soon as it is
+  ready. With `timer` f5low waits for each frame's time itself on the plain schedule (no flip-metering lead, no burst: the driver meters nothing under V-Sync),
+  for real V-Sync presents only (sync interval 1 or more; a sync-0 present with other flags such as DO_NOT_WAIT is left alone, and without V-Sync
+  nothing changes). `auto` (default) is `timer` for every V-Sync present on every GPU, because the driver never meters a V-Sync batch; with `Gate=1` it is
+  `display` (the gate paces by itself). Why: on a VRR display below its top refresh rate a V-Sync present is shown as soon as it is ready,
+  so leaving the spacing to the display gives uneven frames. The contributor who found this (sqmagellan, PR #16) measured displayed frames
+  alternating 7.3 / 9.7 ms at 2x on a 120 Hz VRR laptop, which became a steady 8.3 ms (8.30-8.43) with the timer. On a 120 Hz fixed-refresh display
+  with V-Sync forced (measured at 2x and 6x) the timer paced equal or smoother (2x: equal spread; 6x: spread 3.81 ms with `display` against 1.85 ms with the
+  timer, the 9-17 refresh holds gone) and the display latency was about 3-8 ms lower (2x 17.7 against 14.5 ms, 6x 22.2 against 14.3 ms); repeated refreshes
+  were the same and no frame was missed. Only the spacing changes: the `LateGen` time rules stay keyed on V-Sync, so a V-Sync batch still
+  drops only after a GPU timeout. `FixedPacing=display` gives the old behaviour. The effective mode is logged at start; an invalid value warns and
+  becomes `auto`; with `Gate=1` it is always `display` (logged). The decision is `pacesched::FixedTimer` (host test:
+  `tests/build_fixed_pacing_test.ps1`).
+- **own** (`src/xefg_own.h`, D3D12 path): a list of ours that fails to close is not executed (`Submit`). The first such failure turns generation
+  off (log: `generation off: our GPU work could not be recorded - the game's frames pass through`) and tells XeLL generation is off; the game's own
+  frames pass through. A frame whose own list fails to close is not presented at all (its swap chain buffer holds an older picture; presenting it
+  ended in an access violation in the driver's Present in World of Warcraft); its fences, retire and statistics still run, so nothing waits on
+  it. This covers the plain and the gated pass-through frame, the generated and real frames of the per-frame path (`Show`), the generation lane
+  (`PresentGen`), GenBlock (`PresentAhead`) and the gate (`ShowGated`, `PresentGenGated`: the lane's `GateWait` and `LanePresent` are skipped
+  together); on the CUDA path a generated frame whose own copy list is fine is still shown (its picture was made on the stream before). Frames
+  not presented are counted and logged once a second while it goes on, with the total when presenting resumes, so a frozen picture shows in the
+  log; generated frames skipped are counted apart (`stats: N generated frames left out after a failed list`) and booked on their schedule slot
+  like a drop (`PaceLog` `flags=dropped`). The failed list is not retried on a timer, because a recording error repeats; generation comes back on
+  only after a real swap chain change (a successful `ResizeBuffers`, which drains the presenter first; a new chain is a new context), not on a pack
+  rebuild for a render-size change (dynamic resolution). Log `generation back on after the swap chain was rebuilt (n of 3)`: at most 3 times per
+  context, after that generation stays off (logged). XeLL is told again each time.
+  Test switch (debug only, logged loudly): `XEFG_CUDA_TESTCLOSEFAIL=<n>` (or `TestCloseFail=<n>` in f5low.ini) treats the n-th list close as failed,
+  to run this path in a game; the list is really closed and then left out. There is no host test for the Close path (it needs a device).
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
   before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say

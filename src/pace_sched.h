@@ -203,6 +203,23 @@ inline bool LateEarlyOut(unsigned char mode) { return mode == kLateEarly; }
 inline bool LateActive(unsigned char mode, bool flipMetering) { return mode == kLateDrop || mode == kLateCompress || (LateNextFrame(mode) && !flipMetering); }
 inline bool LateTimeRule(unsigned char mode) { return mode == kLateDrop || mode == kLateCompress; }
 
+// FixedPacing= values (xefg_own.h fixedMode): who spaces a batch's frames when the game asks for V-Sync. Display: the display does (the
+// frames go out as soon as they are ready). Timer: f5low waits for each frame's time itself on the plain schedule (the LateGen rules stay as
+// they are: only the spacing changes). Auto (default): timer, on every GPU: the driver never meters a V-Sync batch, and the timer paced
+// equal or smoother with 3-8 ms less display latency on a fixed-refresh display (measured) and fixed uneven frames on a VRR one. Only a
+// present with a V-Sync interval is affected (the caller checks sync != 0); the timer uses the plain schedule only (no lead, no burst, no
+// metering). Never with Gate=1 (the gate has its own pacing): display.
+enum FixedMode : unsigned char { kFixedAuto = 0, kFixedDisplay = 1, kFixedTimer = 2 };
+// Flip metering is off for a context (LateGen=auto's condition): the settings or the GPU say off (`flipMetering`
+// false), or it was wanted but InitFlip tried (`flipTried`) and found no usable driver call (`flipFnUsable` false).
+inline bool MeterOff(bool flipMetering, bool flipTried, bool flipFnUsable) { return !flipMetering || (flipTried && !flipFnUsable); }
+inline bool FixedTimer(unsigned char mode, bool gate)
+{
+    if (gate)
+        return false;
+    return mode != kFixedDisplay;
+}
+
 // LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
 // (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. Where its time means something
 // (`timed`: the schedule or the clock paces the batch - not V-Sync, not a burst or flip-metered batch, whose later presents never wait
