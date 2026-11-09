@@ -187,4 +187,26 @@ struct Lag
 // The cap of the lead (ticks) a batch is planned with: `cap` (a step, or n steps with the wide-cap test) for the lead rule; a fixed test
 // lead (F5LOW_TEST_SINK_LEAD_MS) is never cut by it - the experiment must run the lead it asks for.
 inline long long LeadCap(long long cap, long long lead, bool fixedTestLead) { return fixedTestLead ? std::max(cap, lead) : cap; }
+
+// LateGen= values (xefg_own.h lateMode) and what each lets PresentReal do. Show: nothing. Auto: a GPU timeout drops, only without flip
+// metering; the time rule never. Drop: both, on every GPU.
+enum LateMode : unsigned char { kLateShow = 0, kLateAuto = 1, kLateDrop = 2 };
+inline bool LateActive(unsigned char mode, bool flipMetering) { return mode == kLateDrop || (mode == kLateAuto && !flipMetering); }
+inline bool LateTimeRule(unsigned char mode) { return mode == kLateDrop; }
+
+// LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
+// (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. Where its time means something
+// (`timed`: the schedule or the clock paces the batch - not V-Sync, not a burst or flip-metered batch, whose later presents never wait
+// for their time) it is also dropped when, at the moment it would go out, it is more than one step past `rawTarget`, its time on the
+// frame's own schedule before the clamp that keeps a late frame from bunching with the next (Bound) - the clamp moves the time into the
+// past after a game stutter, and a frame on its new schedule is not late. Within a step it goes out as before. `enabled` false
+// (LateGen=show) never drops. Ticks.
+inline bool DropLate(bool enabled, bool generated, bool gpuOk, bool timed, long long now, long long rawTarget, long long step)
+{
+    if (!enabled || !generated)
+        return false;
+    if (!gpuOk)
+        return true;
+    return timed && now - rawTarget > step;
+}
 } // namespace pacesched

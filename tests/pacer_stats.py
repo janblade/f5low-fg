@@ -10,9 +10,11 @@
       reads <outdir>/results.jsonl, writes results.csv and results.md (one table per generator and scenario).
 
 Own generator, from the "pace:" records (t = the present's time, QPC ms; ready = the app frame's ready stamp):
-  gaps      = time between consecutive presents, app frames after --skip, three last left out
+  gaps      = time between consecutive presents, app frames after --skip, three last left out (generated frames the pacer left out
+              with LateGen=drop, flags "dropped", were never presented: they are not in the gaps, so a hole shows as a long gap)
   lat_last  = per app frame: time its LAST present (the app's own frame) went out - its ready stamp
-  lat_first = per app frame: time its FIRST presented generated frame went out - its ready stamp
+  lat_first = per app frame: time its FIRST presented generated frame went out - its ready stamp (dropped ones skipped)
+  drop_pct  = dropped generated frames, percent of all generated-frame records
 dlssg and intel (both present into the sink): the sink lists only present times. Gaps are exact; latency is approximate - presents are grouped in bursts of `mult` and
   matched to the app frames' Present calls (REPRO_PACELOG), the shift chosen so no latency is negative and the mean is smallest,
   and counted from the app's Present CALL, not the ready stamp (a few ms more than the own generator's numbers).
@@ -66,7 +68,7 @@ def own_metrics(text, skip):
         return {"notes": "no pace: lines (PaceLog=1 and XEFG_CUDA_LOG=1; did the own generator run?)"}
     frames = sorted({r[1] for r in recs})
     keep = set(frames[skip:-3]) if len(frames) > skip + 3 else set(frames)
-    shown = sorted((r for r in recs if r[1] in keep), key=lambda r: r[0])
+    shown = sorted((r for r in recs if r[1] in keep and "dropped" not in r[6]), key=lambda r: r[0])
     gaps = [b[0] - a[0] for a, b in zip(shown, shown[1:])]
     out = gap_stats(gaps)
     by = {}
@@ -79,7 +81,7 @@ def own_metrics(text, skip):
         ok = rs
         total = rs[0][3]
         real = [r for r in ok if r[2] == total]
-        gen = sorted((r for r in ok if r[2] < total), key=lambda r: r[2])
+        gen = sorted((r for r in ok if r[2] < total and "dropped" not in r[6]), key=lambda r: r[2])
         if real:
             last.append(real[0][0] - real[0][4])
         if gen:
@@ -87,6 +89,8 @@ def own_metrics(text, skip):
     out.update({"lat_last_mean": mean(last), "lat_last_p99": pct(last, 0.99), "lat_first_mean": mean(first), "lat_first_p99": pct(first, 0.99)})
     kr = [r for r in recs if r[1] in keep]
     out["late_pct"] = 100.0 * sum(1 for r in kr if "late" in r[6]) / max(1, len(kr))
+    kg = [r for r in kr if r[2] < r[3]]
+    out["drop_pct"] = 100.0 * sum(1 for r in kg if "dropped" in r[6]) / max(1, len(kg))
     out["frames"] = len(keep)
     return out
 

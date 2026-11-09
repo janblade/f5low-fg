@@ -78,6 +78,13 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           ./tests/build_pace_sched_test.ps1 -VsPath $vs
 
+      # LateGen=drop's decision (src/pace_sched.h DropLate): no GPU
+      - name: Drop late generated frames test
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          ./tests/build_drop_late_test.ps1 -VsPath $vs
+
       # The out of band queue and marker rules (src/oob_driver.h): no GPU
       - name: Out of band driver test
         shell: pwsh

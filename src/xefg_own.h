@@ -472,6 +472,7 @@ public:
     std::string genMode = "off";                // GenQueue= in f5low.ini: off, direct or compute (see PresentGen)
     std::string genPriority;                    // GenPriority= in f5low.ini: high or normal; empty: normal with the gate, else high
     bool genBlock = false;                      // GenBlock=1 in f5low.ini (blockFence, BlockDone): the game's next frame waits for our passes
+    uint8_t lateMode = 1;                       // LateGen= in f5low.ini: 0 show, 1 auto (a GPU timeout drops, only without flip metering), 2 drop (also the one-step time rule); PresentReal, pacesched::DropLate
     bool presentNormal = false;                 // PresentPriority=normal in f5low.ini (diagnostic only): our present queue at normal priority.
                                                 // It does not imitate an RTX 20 (whose problem is slow switching between queues).
     uint32_t genSpread = 2;                     // GenSpread= in f5low.ini: the D3D12 gate's passes, steps apart (0: at once; PresentGenGated)
@@ -521,7 +522,6 @@ public:
     std::vector<ID3D12CommandAllocator*> parkedAllocs;   // allocators the GPU still used after the long wait (FreshAllocator): freed at teardown
     std::atomic<bool> frameTripped { false };   // a wait ran into its bound since the last present (the game thread reads and clears it)
     std::atomic<uint64_t> statGpuWaitTimeouts { 0 };    // WaitGpu calls that ran out (200 ms etc.): the result for the late-frame decision
-    std::atomic<bool> lastGpuWaitOk { true };
     bool retireWait = true;                     // RetireWait=0 in f5low.ini (low-level): the game's Present does not wait for the frame before last on the GPU
     bool oobMarkers = false;                    // OobMarkers=1 in f5low.ini: out of band present markers around our Presents (RealPresent)
     std::atomic<uint32_t> presentId { 0 };      // xefgSwapChainSetPresentId: the frame id of the game's markers, taken at its Present
@@ -1704,7 +1704,7 @@ private:
 
     // PaceLog: one record per present of a frame that generates, kept in memory (a log line each would perturb the pacing) and
     // written by PaceDump. t: the present's time (QPC), ready: the app frame's ready stamp, target: the time it was aimed at.
-    enum : uint8_t { kPaceLate = 1 };
+    enum : uint8_t { kPaceLate = 1, kPaceDropped = 2 };
     static constexpr size_t kPaceMax = 50000;
     struct PaceRec
     {
@@ -1722,7 +1722,7 @@ private:
         else
             ++paceDropped;
     }
-    // "pace: t=<ms> frame=<app frame> k=<present>/<of> ready=<ms> target=<ms> flags=<late|->": ms are QPC milliseconds.
+    // "pace: t=<ms> frame=<app frame> k=<present>/<of> ready=<ms> target=<ms> flags=<late|dropped|->": ms are QPC milliseconds.
     void PaceDump()
     {
         std::vector<PaceRec> recs;
@@ -1735,7 +1735,7 @@ private:
         const double q = 1000.0 / freq();
         for (const PaceRec& r : recs)
             XLog("pace: t=%.3f frame=%llu k=%u/%u ready=%.3f target=%.3f flags=%s", r.t * q, static_cast<unsigned long long>(r.frame), r.k,
-                 static_cast<unsigned>(r.n), r.ready * q, r.target * q, r.flags & kPaceLate ? "late," : "-");
+                 static_cast<unsigned>(r.n), r.ready * q, r.target * q, r.flags & kPaceDropped ? "dropped," : r.flags & kPaceLate ? "late," : "-");
         if (dropped)
             XLog("pace: %zu records not kept (the first %zu are above)", dropped, kPaceMax);
     }
@@ -1904,14 +1904,13 @@ private:
     }
 
     // Waits on the CPU until a fence reaches a value; false after ms (200 by default: a lost device, a stuck queue).
-    // The result is kept (lastGpuWaitOk, statGpuWaitTimeouts) for the late-frame decision of the presenter; nothing is reset on it here.
+    // Timeouts are counted (statGpuWaitTimeouts); the presenter's late-frame decision (LateGen=drop) takes the return value.
     bool WaitGpu(ID3D12Fence* f, UINT64 v, DWORD ms = 200)
     {
         if (f->GetCompletedValue() >= v)
             return true;
         f->SetEventOnCompletion(v, gpuEvent);
         const bool ok = WaitForSingleObject(gpuEvent, ms) == WAIT_OBJECT_0;
-        lastGpuWaitOk.store(ok, std::memory_order_relaxed);
         if (!ok)
             statGpuWaitTimeouts.fetch_add(1, std::memory_order_relaxed);
         return ok;
@@ -2123,10 +2122,18 @@ private:
     }
     // target: worked out by the caller beforehand (Show, before Early moves the timeline on), else here. Returns how
     // many ms our GPU work held the frame past its target (0 if it was done in time).
-    double PresentReal(const Job& j, uint32_t k, uint32_t n, UINT sync, UINT flags, long long target = 0)
+    // rawTarget, step: LateGen=drop's frame time before the Bound clamp and the step it was computed from (0: from the schedule here).
+    double PresentReal(const Job& j, uint32_t k, uint32_t n, UINT sync, UINT flags, long long target = 0, long long rawTarget = 0, long long step = 0)
     {
+        if (n > 0 && !step)
+            step = static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0);
         if (n > 0 && !target)
+        {
             target = PaceTarget(k, n);
+            rawTarget = schedBase + static_cast<long long>(k) * step;
+        }
+        if (!rawTarget)
+            rawTarget = target;
         const bool paced = n > 0 && !DisplayPaced(j);
         // The burst (DriverPacing / FlipBurst): a metered batch's presents after the first are not waited for (lastRelease below keeps
         // their slots for the clock pacer). Without it they go FlipLead early. Bound (the schedule path) measures from the end of the last
@@ -2136,16 +2143,50 @@ private:
         const bool metered = Metered(j);
         const bool burst = oobdriver::BurstNow(Burst(), k, metered);
         const long long lead = !burst && k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
-        const long long t0 = Now(), before = lastAnyPresent;
+        const long long t0 = Now(), before = lastShown;
         if (paced && !burst)
             WaitUntil(target - lead);
         const long long tg = Now();
-        WaitGpu(hostFence, hostValue);
+        const bool gpuOk = WaitGpu(hostFence, hostValue);
         const double gpuWaitMs = static_cast<double>(Now() - tg) * 1000.0 / freq();
         // Only what our own GPU work held it past its target: a frame the game handed over late is past its target too, and
         // counted whole it raised the lag after each game stutter and the next frame then slept that long (NBA 2K27).
         const double late = paced ? std::min(gpuWaitMs, std::max(0.0, static_cast<double>(Now() - target) * 1000.0 / freq())) : 0.0;
         statGpuWait += gpuWaitMs;
+        // LateGen=drop: a generated frame whose work did not finish, or that is more than a step past its raw time, is left out - not
+        // presented, no token or swap chain wait. The time rule applies only where the frame's time means something: not to a metered
+        // or burst batch (its later presents never wait for their time, and Meter has declared the batch's flips), so Meter runs first
+        // for k == 1 (metered below is the batch before's value until it has). For Bound the dropped frame's slot stays the last
+        // present's time (lastAnyPresent: later frames are not moved earlier); the real last present (lastShown) is not touched, so
+        // the stats show the real gap. The clock gets catch-up (lastRelease = its time). The callers' fences (Consumed, BlockDone,
+        // aheadRead, retireFence) are signalled after the loop as always. Its copy is already submitted; the next present's copy
+        // overwrites it in the same buffer.
+        // LateGen=auto drops on a GPU timeout only and only without flip metering (Meter is a no-op there); with metering it is show.
+        // LateGen=drop adds the time rule, which needs Meter's decision for this batch first (k == 1).
+        bool metered_ = false;
+        if (pacesched::LateActive(lateMode, flipMetering) && n > 0 && k <= n)
+        {
+            if (k == 1 && pacesched::LateTimeRule(lateMode))
+            {
+                Meter(j, n);
+                metered_ = true;
+            }
+            const bool timed = pacesched::LateTimeRule(lateMode) && paced && !Metered(j) && !Burst();
+            if (pacesched::DropLate(true, true, gpuOk, timed, Now(), rawTarget, step))
+            {
+                if (k == 1 && !metered_)
+                    Meter(j, n);
+                ++statDropLate;
+                statDropTimeout += !gpuOk;
+                statDropFirst += k == 1;
+                lastRealRelease = Now();
+                lastRelease = target;
+                lastAnyPresent = std::max(lastAnyPresent, std::min(target, Now()));
+                if (paceLog)
+                    PaceRecord(Now(), showing ? showing->ready : jobBase, target, j.frame, k, n + 1, kPaceDropped);
+                return late;
+            }
+        }
         const long long tw0 = Now();
         if (realWait)
         {
@@ -2178,10 +2219,14 @@ private:
             ++statFirstN;
         }
         lastRelease = burst || lead ? std::max(Now(), target) : Now();   // the clock's release time (ClockTarget): its slot, if let out early
-        if (k == 1)
+        lastRealRelease = lastRelease;
+        if (k == 1 && !metered_)
             Meter(j, n);
         Removed("our last submission, before our Present");
-        const HRESULT hr = RealPresent(j, sync, flags, k <= n, k == 1);
+        // The batch's first present that really goes out carries the out-of-band render start (with LateGen=drop that may not be k == 1).
+        const bool firstOut = lateMode ? oobStartFrame != j.frame + 1 : k == 1;
+        oobStartFrame = j.frame + 1;
+        const HRESULT hr = RealPresent(j, sync, flags, k <= n, firstOut);
         if (genCount > 600 && traced < 40)
         {
             ++traced;
@@ -2190,15 +2235,15 @@ private:
                  "%.2f ms after the target", k, n + 1, showing ? showing->catchUp : catchUp, std::exchange(allocWaitMs, 0.0), gpuWaitMs,
                  (tg - (showing ? showing->pickT : pickT)) * 1000.0 / freq(),
                  (tw1 - tw0) * 1000.0 / freq(), (Now() - tw1) * 1000.0 / freq(),
-                 (tw0 - lastAnyPresent) * 1000.0 / freq(),
+                 (tw0 - lastShown) * 1000.0 / freq(),
                  n ? (tw0 - target) * 1000.0 / freq() : 0.0);
         }
         if (FAILED(hr))
             PresentFailed(hr, j, k, n);
         const long long t = Now();
-        if (lastAnyPresent)
+        if (lastShown)
         {
-            const double ms = static_cast<double>(t - lastAnyPresent) * 1000.0 / freq();
+            const double ms = static_cast<double>(t - lastShown) * 1000.0 / freq();
             statGap += ms;
             statGap2 += ms * ms;
             statGapMax = std::max(statGapMax, ms);
@@ -2217,7 +2262,7 @@ private:
             if (++hitches <= 5)             // a second (with vblank sync the display spaces them: no hitches to look for)
                 Hitch(k, n, before, t0, target, tg, gpuWaitMs, tw0, tw1, t, stepMs);
         }
-        lastAnyPresent = t;
+        lastAnyPresent = lastShown = t;
         if (k == n + 1)
             lastReal = t;
         if (paceLog)
@@ -3212,7 +3257,7 @@ private:
     // Frame k's release time: one spacing after the last release, but no sooner than the delay the generated frames
     // need (clkTarget less the margin: after a game stutter the clock had run ahead of the frames) and no later than
     // MaxDelay app frames behind the ready stamp. Set anew from the ready stamp after a pause.
-    long long ClockTarget(const Frame& f, uint32_t k) const
+    long long ClockTarget(const Frame& f, uint32_t k, long long* raw = nullptr) const
     {
         const double q = freq() / 1000.0;
         const long long now = Now(), batch = static_cast<long long>((clkBatch > 0 ? clkBatch : ri.ms) * q);
@@ -3220,6 +3265,8 @@ private:
         const long long soonest = slot + static_cast<long long>(std::max(0.0, clkTarget - ClockMargin(f.cstep)) * q);
         const long long latest = slot + static_cast<long long>(maxDelay * static_cast<double>(batch));
         long long t = clkLast && now - clkLast < static_cast<long long>(250 * q) ? clkLast + f.cstep : slot + static_cast<long long>(clkTarget * q);
+        if (raw)
+            *raw = t;                       // before the clamps (LateGen=drop compares with it)
         t = std::clamp(t, soonest, std::max(soonest, latest));
         return std::min(t, now + static_cast<long long>(100 * q));
     }
@@ -3314,12 +3361,16 @@ private:
             rb->Release();
             if (!j.cut)
                 DumpOnce(j, k);
-            const double late = PresentReal(j, k, nGen, j.sync, j.flags & DXGI_PRESENT_ALLOW_TEARING, f.clock ? ClockTarget(f, k) : Target(f, k));
+            long long rawT = 0;
+            const long long tgt = f.clock ? ClockTarget(f, k, &rawT) : Target(f, k);
+            if (!f.clock)
+                rawT = f.base + pacelead::Offset(f.lead, f.step, k);
+            const double late = PresentReal(j, k, nGen, j.sync, j.flags & DXGI_PRESENT_ALLOW_TEARING, tgt, rawT, f.clock ? f.cstep : f.step);
             if (f.clock)
             {
                 clkLast = lastRelease;
                 if (k == 1)
-                    firstRelease = lastRelease;
+                    firstRelease = lastRealRelease;
                 statClkSlips += late > 0.5;
             }
             else
@@ -3502,7 +3553,7 @@ private:
         }
         if (FAILED(hr))
             PresentFailed(hr, f.j, k, f.nGen);
-        lastAnyPresent = Now();
+        lastAnyPresent = lastShown = Now();
         if (k == f.nGen + 1)
             lastReal = lastAnyPresent;
     }
@@ -4650,6 +4701,10 @@ private:
         if (statLeadFrames)
             XLog("stats: pace lead %.2f ms (%.2f - %.2f over %u app frames, %s, window max %.2f), %u generated frames late", leadState.ms,
                  leadMin, leadMax, statLeadFrames, leadState.automatic ? "auto" : "fixed", leadState.ringMax, statLeadLate);
+        if (statDropLate)
+            XLog("stats: LateGen=%s: %u generated frames left out (%u after a GPU wait ran out, %u of them a batch's first: those are not in the "
+                 "first-frame time above)", lateMode == 2 ? "drop" : "auto", statDropLate, statDropTimeout, statDropFirst);
+        statDropLate = statDropTimeout = statDropFirst = 0;
         leadMin = 1e9;
         leadMax = 0;
         statLeadLate = statLeadFrames = 0;
@@ -5514,9 +5569,13 @@ private:
     // Pacing and stats. interval is written by the application's thread, read by the presenter.
     int slowCalls = 0;
     long long lastReturn = 0, lastReal = 0, lastAnyPresent = 0, lastRelease = 0, jobBase = 0, schedBase = 0;
+    long long lastShown = 0;                // the last present that really went out (lastAnyPresent is also a dropped frame's slot, for Bound only)
+    long long lastRealRelease = 0;          // lastRelease, but a dropped frame's is the time it was left out (the clock's first release, Show)
+    uint64_t oobStartFrame = 0;             // LateGen=drop: frame + 1 of the batch that has sent its out-of-band render start
     std::atomic<double> interval { 16.7 };
     double statGap = 0, statGap2 = 0, statGapMax = 0, statAppCall = 0, statAppWait = 0;
     unsigned statGaps = 0, statFrames = 0, statLate = 0, statEarly = 0, traced = 0;
+    unsigned statDropLate = 0, statDropTimeout = 0, statDropFirst = 0;    // LateGen=drop: generated frames left out (PresentReal), and those after a GPU wait that ran out
     bool catchUp = false;               // presenter: the next app frame was already done on the GPU when this one started
     double allocWaitMs = 0;
     // Presenter, GPU timeline: when the app's frame was done on the GPU (QPC), and the smoothed interval between those.

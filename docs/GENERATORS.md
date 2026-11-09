@@ -135,6 +135,25 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   Not on by default with metering: there, with the automatic driver pacing, NBA 2K27 ran at 27.7 fps in some runs and sat at 14 in
   others (with `DriverPacing=0`: 30 every run). D3D12 path with our own swap chain and `Gate=0` only.
   `PresentPriority=normal` (diagnostic only, not for players) puts our present queue at normal priority instead of high.
+- **own** (`src/xefg_own.h`, paths that present through `PresentReal`: the per-frame passes, the generation lane and GenBlock; not `Gate=1`):
+  `LateGen=` in f5low.ini (`XEFG_CUDA_LATEGEN`): `auto` (default), `show`, `drop`. `auto` leaves out a generated frame whose own GPU work
+  did not finish in its wait (200 ms), and only where f5low times every frame itself (flip metering off for the context: RTX 20/30/40 or
+  `FlipMetering=0`); with flip metering on it behaves as `show`. There is no time rule in `auto`. `show` presents every generated frame on any
+  GPU. `drop` (an experiment) adds the time rule: it leaves out a generated frame that is late by more than a step instead of showing it
+  (frames up to one step late are still shown), on every GPU. With `drop` a frame is dropped when its GPU work timed out, or a frame that at the moment of its present is more than one step past its time on its own schedule
+  (the time before the clamp that keeps a late frame from bunching with the next, the step it was computed with). The time rule applies
+  only where a frame's time means something: not with V-Sync, and not on a flip-metered or burst batch (its later presents never wait for
+  their time): there a frame is dropped only after a GPU timeout, until a run with hardware flip metering says otherwise. Recovery after a
+  game stutter can still drop frames that really are behind. The real frame is never dropped. A dropped frame is not presented (no swap
+  chain wait, no token). Later frames are not moved earlier (the schedule sees the dropped frame's slot as the last present), the clock
+  pacer catches up from it, the batch's out-of-band render start goes with the first present that does go out, and every fence the batch
+  signals (consumed, game release, present-lane read, retire) still advances. Its copy into the swap chain's buffer is already submitted
+  and is overwritten by the next present's. The presented-frame counts reported to the game (GetLastPresentStatus, XeLL) still say the
+  full batch: they are decided at the game's Present. The stats line `LateGen=auto|drop: N generated frames left out (M after a GPU wait ran out,
+  K a batch's first ...)` counts them (a dropped first frame is not in the first-frame time); the presenter's gap statistics measure from the
+  last present that really went out; `PaceLog` marks them `flags=dropped` (tests/pacer_stats.py leaves them out of the gaps and reports
+  `drop_pct`). The decision is `pacesched::DropLate` (host test: `tests/build_drop_late_test.ps1`). Run in NBA 2K27 with `FlipMetering=0`
+  (desktop-composed, so inconclusive); not run with hardware flip metering. The time rule of `drop` stays an experiment until an A/B shows a win. Invalid values warn and become `auto`.
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
   before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say
