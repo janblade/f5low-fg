@@ -364,7 +364,7 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     std::deque<Item> q;
     bool stop = false;
     waitbound::Episode stall;           // bounded waits (wait_bound.h)
-    bool stallTripped = false;          // a wait ran out since the last Enqueue (under mu, but the copy path sets it on the pacer thread)
+    std::atomic<bool> stallTripped { false };   // a wait ran out since the last Enqueue (the copy path sets it on the pacer thread)
     bool copySkipped = false;           // the pacer's last CopyToBackBuffer was skipped by the bound
     uint64_t in = 0;                    // frames accepted from the library
     uint64_t presented = 0;             // frames released on the real chain
@@ -736,26 +736,34 @@ class SinkSwapChain final : public scproxy::LogSwapChain
     // keeps the longer 2 s (what follows frees the slots).
     bool WaitFence(UINT64 v, DWORD ms = 2000)
     {
-        if (fence->GetCompletedValue() >= v)
-            return true;
-        fence->SetEventOnCompletion(v, fenceEvent);
-        WaitForSingleObject(fenceEvent, ms);
-        return fence->GetCompletedValue() >= v;
+        // Until the deadline, re-checking the fence after every wake: an event armed for an earlier value can fire late and must not end
+        // this wait (nor count as a timeout, which would restart the recovery count).
+        const LONGLONG end = Now() + static_cast<LONGLONG>(ms) * Freq() / 1000;
+        for (;;)
+        {
+            if (fence->GetCompletedValue() >= v)
+                return true;
+            const LONGLONG left = end - Now();
+            if (left <= 0)
+                return false;
+            fence->SetEventOnCompletion(v, fenceEvent);
+            WaitForSingleObject(fenceEvent, static_cast<DWORD>((left * 1000 + Freq() - 1) / Freq()));
+        }
     }
 
     // A wait ran into its bound (wait_bound.h): logged once per episode; a frame is dropped rather than the thread held. The episode ends
     // by itself after kGoodToRecover frames in a row that waited for nothing.
     void NoteStall(const char* what)
     {
-        stallTripped = true;
+        stallTripped.store(true, std::memory_order_relaxed);
         if (stall.Trip() && g_log)
             g_log("sink: waits: %s for %u ms without an answer - dropping frames until it clears (back on by itself)", what, waitbound::kGpuWaitMs);
     }
     void NoteGood()
     {
-        if (stallTripped)
-            stallTripped = false;
-        else if (stall.Good() && g_log)
+        if (stallTripped.exchange(false, std::memory_order_relaxed))
+            return;
+        if (stall.Good() && g_log)
             g_log("sink: waits: the stall is over (%u frames in a row without a timeout)", waitbound::kGoodToRecover);
     }
 
@@ -1335,8 +1343,16 @@ public:
             l.unlock();
             if (v && fence->GetCompletedValue() < v)
             {
-                fence->SetEventOnCompletion(v, libEvent);
-                if (WaitForSingleObject(libEvent, waitbound::kGpuWaitMs) != WAIT_OBJECT_0 && fence->GetCompletedValue() < v)
+                const LONGLONG end = Now() + static_cast<LONGLONG>(waitbound::kGpuWaitMs) * Freq() / 1000;
+                bool reached = false;
+                for (;;)         // (re-check after every wake: a stale event must not end it early)
+                {
+                    if ((reached = fence->GetCompletedValue() >= v) || end - Now() <= 0)
+                        break;
+                    fence->SetEventOnCompletion(v, libEvent);
+                    WaitForSingleObject(libEvent, static_cast<DWORD>(((end - Now()) * 1000 + Freq() - 1) / Freq()));
+                }
+                if (!reached)
                 {
                     l.lock();
                     NoteStall("the copy of the library's last texture");

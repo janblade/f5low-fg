@@ -77,21 +77,30 @@ int main()
         m.pcv.notify_all();
         game.join();
     }
-    // 2. The bounded wait: every push returns within the bound (+ slack), frames beyond the queue's room pass through.
+    // 2. The bounded wait: the first timeout takes the normal bound, the following pushes only the short slice while the context is
+    // stalled; frames beyond the queue's room pass through.
     {
         Model m;
         int passed = 0, generated = 0;
-        double worst = 0;
+        double first = 0, restWorst = 0;
         for (int f = 0; f < 8; ++f)
         {
             const auto t0 = Clock::now();
-            const bool pass = m.Push(f, false, waitbound::kGameWaitMs).passThrough;
-            worst = std::max(worst, Ms(t0, Clock::now()));
+            const bool pass = m.Push(f, false, 100).passThrough;
+            const double ms = Ms(t0, Clock::now());
+            if (f == 2)
+                first = ms;
+            else if (f > 2)
+                restWorst = std::max(restWorst, ms);
             (pass ? passed : generated)++;
         }
-        printf("bounded: worst push %.1f ms, %d generated, %d passed through, %llu trips\n", worst, generated, passed,
+        printf("bounded: first timeout %.1f ms, then at most %.1f ms, %d generated, %d passed through, %llu trips\n", first, restWorst, generated, passed,
                static_cast<unsigned long long>(m.ep.Trips()));
-        CHECK(worst < waitbound::kGameWaitMs + 60);
+        CHECK(first >= 95 && first < 100 + 60);                 // the normal bound
+        CHECK(restWorst < waitbound::kStalledGameWaitMs + 40);  // the short slice while stalled
+        CHECK(waitbound::GameBound(false, 500) == 500 && waitbound::GameBound(true, 500) == waitbound::kStalledGameWaitMs);
+        CHECK(waitbound::GameBound(true, 5) == 5);
+        CHECK(waitbound::kGameWaitMs == 500);
         CHECK(generated == 2);                  // the queue's room (appJobs)
         CHECK(passed == 6);
         CHECK(m.ep.Stalled());
@@ -113,7 +122,7 @@ int main()
             m.Drain1();
             m.Drain1();
             m.Drain1();
-            const waitbound::Admit a = m.Push(100 + f, false, waitbound::kGameWaitMs);
+            const waitbound::Admit a = m.Push(100 + f, false, 100);
             if (a.room && m.ep.Good())
                 ++ended;
         }
