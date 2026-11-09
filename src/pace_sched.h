@@ -203,6 +203,23 @@ inline bool LateEarlyOut(unsigned char mode) { return mode == kLateEarly; }
 inline bool LateActive(unsigned char mode, bool flipMetering) { return mode == kLateDrop || mode == kLateCompress || (LateNextFrame(mode) && !flipMetering); }
 inline bool LateTimeRule(unsigned char mode) { return mode == kLateDrop || mode == kLateCompress; }
 
+// FixedPacing= values (xefg_own.h fixedMode): who spaces a batch's frames when the game asks for V-Sync. Display: the display does (the
+// frames go out as soon as they are ready). Timer: f5low waits for each frame's time itself, as without V-Sync (the LateGen rules stay as
+// they are: only the spacing changes). Auto (default): timer where flip metering is off for this context - the same condition LateGen=auto
+// uses (`meterOff`: the settings or the GPU say off, or InitFlip tried and the driver path is unusable; before InitFlip a context that
+// wants metering counts as metered, so display) - display where the driver meters. Never with Gate=1 (the gate has its own pacing).
+enum FixedMode : unsigned char { kFixedAuto = 0, kFixedDisplay = 1, kFixedTimer = 2 };
+inline bool FixedTimer(unsigned char mode, bool gate, bool flipMetering, bool flipTried, bool flipFnUsable)
+{
+    if (gate)
+        return false;
+    if (mode == kFixedTimer)
+        return true;
+    if (mode == kFixedDisplay)
+        return false;
+    return !flipMetering || (flipTried && !flipFnUsable);
+}
+
 // LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
 // (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. Where its time means something
 // (`timed`: the schedule or the clock paces the batch - not V-Sync, not a burst or flip-metered batch, whose later presents never wait

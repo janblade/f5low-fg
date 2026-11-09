@@ -172,6 +172,29 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   batch keeps the `show` rules (only a GPU timeout drops); with the next frame not finished it behaves as `show`. The stats line counts the
   early releases and `PaceLog` marks one `flags=compressed`. The decisions are `pacesched::CompressEarly`, `CompressAt` and `CompressDrop`.
   Not run in a game yet.
+- **own** (`src/xefg_own.h`, same paths as `LateGen`; not `Gate=1`): `FixedPacing=` in f5low.ini (`XEFG_CUDA_FIXEDPACING`): `auto` (default), `display`, `timer`.
+  It decides who spaces a batch's frames when the game asks for V-Sync. With `display` the display does: each present goes out as soon as it is
+  ready. With `timer` f5low waits for each frame's time itself, as it does without V-Sync. `auto` picks `timer` where flip metering is off for the
+  context (the condition `LateGen=auto` uses: the GPU or `FlipMetering=0` says off, or the driver path turned out unusable when `InitFlip` tried it;
+  before `InitFlip` a context that wants metering counts as metered, so `display`) and `display` where the driver meters. Why: on a VRR display
+  below its top refresh rate a V-Sync present is shown as soon as it is ready, so leaving the spacing to the display gives uneven frames. The
+  contributor who found this (sqmagellan, PR #16) measured displayed frames alternating 7.3 / 9.7 ms at 2x on an RTX 40 laptop, 120 Hz VRR
+  panel, against 8.30-8.43 ms with the timer. Only the spacing changes: the `LateGen` time rules stay keyed on V-Sync, so a V-Sync batch still
+  drops only after a GPU timeout. Not yet measured on a fixed-refresh V-Sync display, where the display spaces the frames anyway and the timer
+  may add nothing or a little latency; `FixedPacing=display` gives the old behaviour. The effective mode is logged at start and again when
+  `InitFlip` decides (`FixedPacing=auto: timer|display ...`); an invalid value warns and becomes `auto`; with `Gate=1` it is always
+  `display` (logged). The decision is `pacesched::FixedTimer` (host test: `tests/build_fixed_pacing_test.ps1`).
+- **own** (`src/xefg_own.h`, D3D12 path): a list of ours that fails to close is not executed (`Submit`). The first such failure turns generation
+  off (log: `generation off: our GPU work could not be recorded - the game's frames pass through`) and tells XeLL generation is off; the game's own
+  frames pass through. A frame whose own list fails to close is not presented at all (its swap chain buffer holds an older picture; presenting it
+  ended in an access violation in the driver's Present in World of Warcraft); its fences, retire and statistics still run, so nothing waits on
+  it. This covers the plain pass-through frame (gated and not), and the generated and real frames of the per-frame path (`Show`), the generation
+  lane (`PresentGen`) and GenBlock (`PresentAhead`); on the CUDA path a generated frame whose own copy list is fine is still shown (its picture
+  was made on the stream before). The failed list is not retried on a timer, because a recording error repeats; generation comes back on only
+  after the swap chain was rebuilt (a successful `ResizeBuffers` or size rebuild: log `generation back on after the swap chain was rebuilt`),
+  and XeLL is told again. A skipped generated frame is booked like a dropped one (`LateGen`'s bookkeeping, `PaceLog` `flags=dropped`).
+  Test switch (debug only, logged loudly): `F5LOW_TEST_CLOSEFAIL=<n>` (or `TestCloseFail=<n>` in f5low.ini) treats the n-th list close as failed,
+  to run this path in a game; the list is really closed and then left out. There is no host test for the Close path (it needs a device).
 - **own** (`src/xefg_own.h`, D3D12 path): `DriverPacing=` in f5low.ini (`XEFG_CUDA_DRIVERPACING`): `0` off, `1` automatic, `2` always on; **the key absent means automatic** when the
   host says it handles the frame markers (OptiScaler 0.1.37 and newer call the export `f5lowHostRoutesMarkers` when they load the library,
   before any context exists; f5low reads that at each context's creation), else off - an explicit `1` or `2` on a host that did not say

@@ -1745,11 +1745,31 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                  : o->lateMode == 4 ? "a generated frame that timed out or is stale is left out, and slot waits end when the game's next frame is done (flip metering is off)"
                                     : "a generated frame that timed out or is stale is left out (flip metering is off)");
         }
-        // FixedPacing=timer (XEFG_CUDA_FIXEDPACING): each frame keeps its own timing with V-Sync too (xefg_own.h fixedTimer).
+        // FixedPacing (XEFG_CUDA_FIXEDPACING): "auto" (default), "display" or "timer": who spaces the frames when the game asks for V-Sync
+        // (xefg_own.h fixedMode, pace_sched.h FixedTimer). timer = f5low waits for each frame's time as without V-Sync; display = the
+        // display does. auto = timer where flip metering is off for this context (the condition LateGen=auto uses), display where the
+        // driver meters; InitFlip logs again if it turns out unusable. Not with Gate=1.
         {
-            o->fixedTimer = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "display") == "timer";
-            if (o->fixedTimer)
-                XLog("FixedPacing=timer: each frame waits for its time even with V-Sync (the display may not pace them; not with Gate=1)");
+            std::string fp = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "auto");
+            if (fp != "auto" && fp != "display" && fp != "timer")
+            {
+                XLog("warning: FixedPacing=%s is not auto, display or timer - taken as auto", fp.c_str());
+                fp = "auto";
+            }
+            o->fixedMode = fp == "timer" ? pacesched::kFixedTimer : fp == "display" ? pacesched::kFixedDisplay : pacesched::kFixedAuto;
+            if (o->gate)
+            {
+                if (o->fixedMode == pacesched::kFixedTimer)
+                    XLog("FixedPacing=timer is not used with Gate=1 (the gate paces by itself) - display");
+                else if (o->fixedMode == pacesched::kFixedAuto)
+                    XLog("FixedPacing=auto: display (Gate=1 paces by itself)");
+            }
+            else
+                XLog("FixedPacing=%s: %s", fp.c_str(),
+                     o->fixedMode == pacesched::kFixedTimer ? "each frame waits for its time with V-Sync too"
+                     : o->fixedMode == pacesched::kFixedDisplay ? "with V-Sync the display spaces the frames"
+                     : !o->flipMetering ? "timer: flip metering is off for this GPU, f5low times every frame itself with V-Sync too"
+                                        : "display for now (flip metering is on for this GPU; timer if the driver path turns out unusable, logged then)");
         }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");
@@ -1835,6 +1855,12 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
             const std::string k = Setting("XEFG_CUDA_TESTSTALLKIND", "TestStallKind", "presenter");
             o->testStallKind = k == "genlane" ? 1 : k == "presentlane" ? 2 : 0;
         }
+        // Diagnostics (xefg_own.h, Submit): F5LOW_TEST_CLOSEFAIL=<n> (or TestCloseFail= in f5low.ini): the n-th Close of one of our lists counts as
+        // failed, to run the failed-list path (generation off until the swap chain is rebuilt) in a game. Debug only.
+        o->testCloseFail = static_cast<unsigned>(std::max(0, atoi(Setting("F5LOW_TEST_CLOSEFAIL", "TestCloseFail", "0").c_str())));
+        if (o->testCloseFail)
+            XLog("WARNING: F5LOW_TEST_CLOSEFAIL=%u - Close number %u of our lists will be treated as FAILED (debug only; generation then goes off)",
+                 o->testCloseFail, o->testCloseFail);
         o->gameWaitMs = boundMs("XEFG_CUDA_GAMEWAITMS", "GameWaitMs", "500", 500, 10, 2000);
         o->oobMarkers = have > 0 && Setting("XEFG_CUDA_OOBMARKERS", "OobMarkers", "0") == "1";      // (no NVIDIA compute device: off with the rest)
         // FlipLeadUs= (XEFG_CUDA_FLIPLEADUS): how early metered frames after a batch's first are released, 0-8000 us. auto (default):
