@@ -38,9 +38,9 @@ interval may be 0 or 1. Frames are generated only between two real frames (no ex
   rules (stale, compress, drop) do not apply to them: missed slots and the late latch handle lateness. A pass whose GPU
   wait ran out is still left out.
 - **Counts.** XeLL is told no frames are generated. The app's `GetLastPresentStatus` count and the Reflex Sync
-  multiplier use the rounded average presents per app frame. In WoW, OptiScaler's low-latency input still held the game
+  multiplier use the rounded average of planned presents per app frame (a present later dropped still counts). In WoW, OptiScaler's low-latency input still held the game
   at refresh / 2 with frame generation on; `LowLatencyInput=off` in OptiScaler.ini removed that cap.
-- **Log** (every 600 app frames, `Log=1`): presents per app frame, real frames shown, planned t histogram, slots
+- **Log** (every 600 app frames, `Log=1`): planned presents per app frame, real frames shown, planned t histogram, slots
   missed, lag, late latches, and gaps over 1.5 slots by cause: the game's frame came late, the presenter was late, our
   GPU work, the swap chain's wait, the Present call, planned so, other. The first five gaps a second are logged with
   every measured part.

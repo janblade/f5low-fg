@@ -1754,6 +1754,7 @@ private:
         bool frac = false, realGen = false;
         bool fracDisp = false;              // TargetFps at the refresh with V-Sync: the display spaces the presents, slots are vblanks
         bool fracTearOn = false;            // TargetPresent=tearing, decided once in FracPlan (FracTearOk): sync, flags and spacing agree
+        double fracRefMs = 0;               // the refresh period its slots were planned with: the tearing spacing uses the same one
         long long at[kMaxInterp + 1] {};
         float t[kMaxInterp + 1] {};
         uint32_t fracMiss = 0;              // slots this frame found already past when planned (the game's frame came late)
@@ -2500,8 +2501,9 @@ private:
         Removed("our last submission, before our Present");
         // TargetPresent=tearing: at least a refresh after the last Present call of any kind (FracTear needs the refresh known).
         const bool fracTimer = showing && showing->frac && !showing->fracDisp;
-        if (fracTimer && FracTear(*showing) && fracLastCall)
-            WaitUntil(fracLastCall + static_cast<long long>(fracRefreshMs * freq() / 1000.0));
+        const long long ts0 = Now();
+        if (fracTimer && showing->fracTearOn && sync == 0 && (flags & DXGI_PRESENT_ALLOW_TEARING) && fracLastCall)
+            WaitUntil(fracLastCall + static_cast<long long>(showing->fracRefMs * freq() / 1000.0));
         // The batch's first present that really goes out carries the out-of-band render start (with LateGen=drop that may not be k == 1).
         const bool firstOut = lateMode ? oobStartFrame != j.frame + 1 : k == 1;
         oobStartFrame = j.frame + 1;
@@ -2539,8 +2541,8 @@ private:
         // the burst's end, or when it is ready), so that gap is judged against the app interval (the presents after it follow at once: a gap
         // there is a real one).
         const double stepMs = showing && showing->frac ? fracPMs : ri.ms / static_cast<double>(n + 1);
-        if (showing && showing->frac && !showing->fracDisp && static_cast<double>(tw1 - target) * 1000.0 / freq() > 1.0)
-            ++fracLate;                 // reached its Present call more than 1 ms after its slot (before any V-Sync wait in it)
+        if (showing && showing->frac && !showing->fracDisp && static_cast<double>(tp0 - target) * 1000.0 / freq() > 1.0)
+            ++fracLate;                 // made its Present call more than 1 ms after its slot (after the tearing spacing, before any V-Sync wait)
         if (showing && showing->fracDisp && fracRefreshMs > 0.0 && k == n + 1)
         {
             // Display-paced: with the queue full the Present returns when the display takes a buffer, so its return less its slot is the
@@ -2559,7 +2561,7 @@ private:
         if (showing && showing->frac && !showing->fracDisp && before)
             FracGap(k, n, static_cast<double>(t - before) * 1000.0 / freq(),
                     static_cast<double>(tg - target) * 1000.0 / freq() + std::exchange(fracPendingLatchMs, 0.0), gpuWaitMs,
-                    static_cast<double>(tw1 - tw0) * 1000.0 / freq(), static_cast<double>(tp1 - tp0) * 1000.0 / freq(), plannedMs);
+                    static_cast<double>(tw1 - tw0) * 1000.0 / freq(), static_cast<double>(tp1 - ts0) * 1000.0 / freq(), plannedMs);
         const bool burstBatch = Burst() && Metered(j);      // read again: Meter (k == 1) has just decided this batch
         if (sync == 0 && n > 0 && before && static_cast<double>(t - before) * 1000.0 / freq() > 3 * (burstBatch && k == 1 ? ri.ms : stepMs))
         {
@@ -2911,7 +2913,9 @@ private:
         return fracTear && fracRefreshMs > 0.0 && (scDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) &&
                !inFullscreen.load(std::memory_order_acquire);
     }
-    bool FracTear(const Frame& f) const { return f.frac && !f.fracDisp && f.fracTearOn; }
+    // Per Present call (Show reads it once for both the sync interval and the flags): the frame's own decision, and not in exclusive
+    // fullscreen now (a switch after FracPlan presents the frame's remaining slots with the game's sync and flags).
+    bool FracTear(const Frame& f) const { return f.frac && !f.fracDisp && f.fracTearOn && !inFullscreen.load(std::memory_order_relaxed); }
     // Late latch (exact t, timer slots): a pass recorded so late that its frame cannot be on screen at its slot takes the time it can be
     // (now + TargetPassMs, and a refresh after the last call with tearing) as both its present time and its t. On VRR a frame is shown
     // when presented, so a late one with the slot's t showed content older than the moment (a spin: ~8 px per ms); presents may then
@@ -2925,7 +2929,7 @@ private:
         const double q = freq() / 1000.0;
         long long ready = Now() + static_cast<long long>(fracPassMs * q);
         if (FracTear(f) && fracLastCall)
-            ready = std::max(ready, fracLastCall + static_cast<long long>(fracRefreshMs * q));
+            ready = std::max(ready, fracLastCall + static_cast<long long>(f.fracRefMs * q));
         if (ready <= f.at[i])
             return -1.0;
         fracPendingLatchMs = static_cast<double>(ready - f.at[i]) / q;     // the presenter's lateness, for FracGap (PresentReal)
@@ -2952,7 +2956,7 @@ private:
             why = "the game's frame came late", ++fracGapGame;
         else if (parts[top] > 1.0)
         {
-            static const char* const names[4] { "the presenter was late", "our GPU work", "the swap chain's wait", "the Present call" };
+            static const char* const names[4] { "the presenter was late", "our GPU work", "the swap chain's wait", "the Present call (and its tearing spacing)" };
             why = names[top];
             ++fracGapPart[top];
         }
@@ -3005,10 +3009,11 @@ private:
         // TargetPresent=tearing holds its presents at least a refresh apart (PresentReal), so its slots are never planned closer: with
         // the game at sync 0 a 240 target on a 120 Hz panel planned 4.17 ms slots that went out 8.33 ms apart.
         const bool tearOn = !disp && FracTearOk();
+        const double refMs = fracRefreshMs;     // a resync below may read a new refresh: this frame keeps the one it was planned with
         double pMs = disp ? fracRefreshMs
                           : f.j.sync >= 1 && fracRefreshMs > 0.0 ? std::max(1000.0 / targetFps, fracRefreshMs / kFracVrrShare) : 1000.0 / targetFps;
         if (tearOn)
-            pMs = std::max(pMs, fracRefreshMs);
+            pMs = std::max(pMs, refMs);
         fracPMs = pMs;
         if (fracOff ? iMs > 1.10 * pMs : iMs < 1.03 * pMs)
         {
@@ -3097,6 +3102,7 @@ private:
         f.frac = true;
         f.fracDisp = disp;
         f.fracTearOn = tearOn;
+        f.fracRefMs = refMs;
         f.fracArriveGap = fracArriveLast;
         f.fracC0 = c0;
         f.fracC1 = c1;
@@ -3117,7 +3123,7 @@ private:
         fracN.store(std::clamp(static_cast<int>(std::lround(fracEma - 1.0)), 0, static_cast<int>(kMaxInterp)), std::memory_order_relaxed);
         if (fracFrames % 600 == 0)
         {
-            XLog("TargetFps %.0f%s%s: %.2f presents per app frame (app interval %.2f ms), real frame shown %llu / generated in its place %llu, "
+            XLog("TargetFps %.0f%s%s: %.2f planned presents per app frame (app interval %.2f ms), real frame shown %llu / generated in its place %llu, "
                  "planned t tenths %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu, resyncs %llu, slots missed %llu, skipped (over %u) %llu, off %llu, "
                  "late > 1 ms (timer) %llu, display-paced returns over half a period late %llu / early %llu, phase error %.2f ms, "
                  "slot %.2f ms, lag %.2f ms (raised %llu times), app interval from its Presents %.2f ms (ready to ready %.2f), "
@@ -3989,7 +3995,8 @@ private:
             const long long tgt = f.frac ? f.at[k - 1] : f.clock ? ClockTarget(f, k, &rawT) : Target(f, k);
             if (!f.frac && !f.clock)
                 rawT = f.base + pacelead::Offset(f.lead, f.step, k);
-            const double late = PresentReal(j, k, nGen, FracTear(f) ? 0 : j.sync, FracTear(f) ? DXGI_PRESENT_ALLOW_TEARING : j.flags & DXGI_PRESENT_ALLOW_TEARING,
+            const bool tear = FracTear(f);
+            const double late = PresentReal(j, k, nGen, tear ? 0 : j.sync, tear ? DXGI_PRESENT_ALLOW_TEARING : j.flags & DXGI_PRESENT_ALLOW_TEARING,
                                             tgt, rawT, f.frac ? 0 : f.clock ? f.cstep : f.step);
             if (f.frac && !f.fracDisp)
                 FracLate(late);
@@ -4026,7 +4033,11 @@ private:
             // TargetFps: no slot landed next to the real frame, so its present shows the generated frame at its slot (pass nGen + 1,
             // before HandOff below: it reads cur and prev).
             if (f.frac && f.realGen && !j.cut && D3d() && FracLatch(f, nGen) >= 1.0 - kFracTol)
+            {
                 f.realGen = false;          // latched next to the real frame: show it (FracPlan's tolerance rule)
+                --fracRealGen;              // FracPlan counted it as generated
+                ++fracRealShown;
+            }
             const bool realGen = f.frac && f.realGen && !j.cut && D3d() && pg->PreparePassAt(f.t[nGen], nGen, f.jc, f.jp, f.mvs);
             ID3D12GraphicsCommandList* g = Begin();
             if (realGen)
@@ -4059,7 +4070,8 @@ private:
         Early();
         if (realShown)
         {
-            const double lateReal = PresentReal(j, nGen + 1, nGen, FracTear(f) ? 0 : j.sync, FracTear(f) ? DXGI_PRESENT_ALLOW_TEARING : j.flags,
+            const bool tear = FracTear(f);
+            const double lateReal = PresentReal(j, nGen + 1, nGen, tear ? 0 : j.sync, tear ? DXGI_PRESENT_ALLOW_TEARING : j.flags,
                                                 f.frac ? f.at[nGen] : f.clock ? ClockTarget(f, nGen + 1) : nGen ? Target(f, nGen + 1) : 0);
             if (f.frac && !f.fracDisp)
                 FracLate(lateReal);
