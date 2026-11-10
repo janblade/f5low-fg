@@ -284,6 +284,16 @@ public:
             SetJitter(jc, jp);
         pack->SetPass(static_cast<float>(k) / static_cast<float>(n + 1), k - 1, mvs[0], mvs[1]);
     }
+    bool PreparePassAt(float t, uint32_t pass, const float jc[2], const float jp[2], const float mvs[2]) override
+    {
+        if (!d3dPath)
+            return false;
+        if (!noPatch)
+            SetJitter(jc, jp);
+        pack->SetPass(t, pass, mvs[0], mvs[1]);
+        return true;
+    }
+    bool PassAtSupported() const override { return d3dPath; }
 
     bool EnsureRing(uint32_t set, uint32_t n) override { return EnsureRingC(set, n); }
     ID3D12Resource* RingFrame(uint32_t set, uint32_t k) const override { return ringC[set][k].res; }
