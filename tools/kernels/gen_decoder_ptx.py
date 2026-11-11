@@ -20,7 +20,9 @@
 # slice pair. Fragments (grp = lane/4, tg = lane%4): a0/a1 = pixel grp / grp+8, K 4tg..4tg+3 - one word of
 # the fused pixel; a2/a3 K 16+4tg..; b0/b1 = output channel grp of the block, the same K - one weight word;
 # d0,d1 = pixel grp, output channels 2tg, 2tg+1; d2,d3 = pixel grp+8. CIN 16 keeps its 20 weight words in
-# registers, the others read them from shared memory.
+# registers, the others read them from global memory (through L1): copied into every block's shared memory (CIN 64:
+# 36 KB) only one to three blocks (an RTX 20, 64 KB of shared memory a processor) or two to five (newer cards) ran
+# on a processor at a time.
 # --sm 75 (an RTX 20): each mma.m16n8k32 as four mma.m8n8k16 on the same registers (mma_emit.py).
 #
 # Usage: python gen_decoder_ptx.py <out.ptx> --cin 16|32|64 [--sm 80|75]
@@ -45,7 +47,6 @@ assert NP % NW == 0
 MW = NP // NW                   # m-tiles a warp
 NB = C // 8                     # n-blocks of 8 output channels
 WREG = CS == 1                  # weights in registers
-WBYTES = 9 * C * C
 L = []
 
 
@@ -87,8 +88,6 @@ for s in ("s0", "s1", "s2", "s3", "s4", "s32", "cb0"):
 w(f") .reqntid {NT}, 1, 1")
 w("{")
 w(f"    .shared .align 16 .b8 fz[{NF * C}];")
-if not WREG:
-    w(f"    .shared .align 16 .b8 wt[{WBYTES}];")
 w("    .reg .pred %p, %pa, %pb, %pc, %pd, %pt, %pq;")
 w("    .reg .b32 %tl, %ox0, %oy0, %W, %H, %i, %lx, %ly, %fx, %fy, %cx, %cy, %ax, %ay, %t, %u, %sl;")
 w("    .reg .b32 %w0, %h0, %n0, %pi0, %w4, %h4, %n4, %pi4, %wo, %ho, %pio;")
@@ -101,6 +100,8 @@ w("    .reg .b32 " + ", ".join(f"%c{nb}_{j}" for nb in range(NB) for j in range(
 w("    .reg .b16 %hv;")
 w("    .reg .f32 %f, %s0, %s1, %g0, %g1;")
 w("    .reg .b64 %P0, %P4, %PO, %PS, %PB, %PC, %r64;")
+if not WREG:
+    w("    .reg .b64 %PW;")
 w()
 w("    mov.u32 %tl, %tid.x;")
 w("    mov.u32 %t, %ctaid.x;")
@@ -115,18 +116,6 @@ for r, s in (("0", "s0"), ("4", "s4")):
     w(f"    ld.param.u32 %n{r}, [p_{s}+24];")
     w(f"    ld.param.u32 %pi{r}, [p_{s}+36];")
 w("    mov.u32 %sf, fz;")
-if not WREG:
-    w("    mov.u32 %sw, wt;")
-    w(f"    // the weights to shared memory: {WBYTES // 16} x 16 bytes")
-    w("    ld.param.u64 %PB, [p_s1+0];")
-    for it in range((WBYTES // 16 + NT - 1) // NT):
-        w(f"    add.u32 %i, %tl, {NT * it};")
-        w(f"    setp.lt.u32 %p, %i, {WBYTES // 16};")
-        w("    mul.wide.u32 %r64, %i, 16;")
-        w("    add.s64 %PS, %PB, %r64;")
-        w("    @%p ld.global.nc.v4.b32 {%V0, %V1, %V2, %V3}, [%PS];")
-        w("    mad.lo.u32 %t, %i, 16, %sw;")
-        w("    @%p st.shared.v4.b32 [%t], {%V0, %V1, %V2, %V3};")
 w()
 
 
@@ -225,8 +214,11 @@ if WREG:
                 else:
                     w(f"    ld.global.nc.b32 %wb{k}_{nb}_{h}, [%PB+{4 * wword(tap, sl, 8 * nb)}];")
 else:
+    w("    // this lane's weight words in global memory: + 16tg + grp")
+    w("    ld.param.u64 %PW, [p_s1+0];")
     w("    mad.lo.u32 %t, %tg, 16, %grp;")
-    w("    mad.lo.u32 %sw, %t, 4, %sw;")
+    w("    mul.wide.u32 %r64, %t, 4;")
+    w("    add.s64 %PW, %PW, %r64;")
 w("    ld.param.u64 %PO, [p_s32+0];")
 w("    ld.param.u32 %wo, [p_s32+16];")
 w("    ld.param.u32 %ho, [p_s32+20];")
@@ -268,7 +260,7 @@ for m in range(MW):
                 bb = f"%wb{k}_{nb}_0, %wb{k}_{nb}_1"
             else:
                 for h, (tap, sl) in enumerate(parts):
-                    w(f"    ld.shared.b32 %b{h}, [%sw+{4 * wword(tap, sl, 8 * nb)}];")
+                    w(f"    ld.global.nc.b32 %b{h}, [%PW+{4 * wword(tap, sl, 8 * nb)}];")
                 bb = "%b0, %b1"
             mma_s8(w, a.sm, c.split(", "), ["%a0", "%a1", "%a2", "%a3"], bb.split(", "),
                    zero={h for h, (tap, _) in enumerate(parts) if tap is None})
