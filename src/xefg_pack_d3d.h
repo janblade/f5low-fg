@@ -20,10 +20,13 @@
 #include <d3d12.h>
 
 #include <cstdio>
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 
 #include <set>
+#include <thread>
 
 namespace xefgpack
 {
@@ -409,6 +412,7 @@ public:
 
     void Release()
     {
+        StopCorun();
         if (dev)
         {
             for (void* h : kernelShaders)
@@ -506,6 +510,134 @@ public:
             coldEach = atoi(TestEnv("XEFG_CUDA_COLDL2_EACH").c_str());
             printf("test knob: XEFG_CUDA_COLDL2 %zu MB, %s\n", coldBytes >> 20, coldEach ? "before every dispatch (x times)" : "before each run");
         }
+    }
+    // XEFG_CUDA_CORUN=<MB>: a second compute queue keeps an int8 tensor kernel running (4096 blocks of 256 threads, 32 KB of
+    // shared memory each, streaming a weight buffer of that many MB through L2), as DLSS Neural Rendering would, and prints
+    // its throughput ("corun: <dispatches per second>") once a second. A test of what our kernels cost a neighbour.
+    std::thread corunThread;
+    std::atomic<bool> corunStop { false };
+    void* corunShader = nullptr;
+    ID3D12Resource *corunW = nullptr, *corunO = nullptr;
+    void StartCorun(unsigned mb)
+    {
+        static const char kCorun[] = R"(.version 7.0
+.target sm_75
+.address_size 64
+.visible .entry corun(.param .u64 pw, .param .u64 po, .param .u32 wmask, .param .u32 iters)
+{
+    .shared .align 16 .b8 sm[32768];
+    .reg .pred %p<2>;
+    .reg .b32 %r<24>;
+    .reg .b64 %d<6>;
+    ld.param.u64 %d1, [pw];
+    ld.param.u64 %d2, [po];
+    ld.param.u32 %r1, [wmask];
+    ld.param.u32 %r2, [iters];
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mad.lo.u32 %r5, %r4, 256, %r3;
+    mov.b32 %r6, 0;
+    mov.b32 %r7, 0;
+    mov.b32 %r8, 0;
+LOOP:
+    mad.lo.u32 %r9, %r8, 40961, %r5;
+    mad.lo.u32 %r9, %r9, 7, %r8;
+    and.b32 %r9, %r9, %r1;
+    mul.wide.u32 %d3, %r9, 16;
+    add.s64 %d3, %d1, %d3;
+    ld.global.nc.v4.b32 {%r10, %r11, %r12, %r13}, [%d3];
+    and.b32 %r14, %r8, 7;
+    mad.lo.u32 %r14, %r14, 4096, 0;
+    mad.lo.u32 %r15, %r3, 16, %r14;
+    st.shared.v4.b32 [%r15], {%r10, %r11, %r12, %r13};
+    bar.sync 0;
+    ld.shared.b32 %r16, [%r15];
+    ld.shared.b32 %r17, [%r15+4];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r16}, {%r17}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r17}, {%r16}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r16}, {%r16}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r17}, {%r17}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r16}, {%r17}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r17}, {%r16}, {%r6, %r7};
+    bar.sync 0;
+    add.u32 %r8, %r8, 1;
+    setp.lt.u32 %p1, %r8, %r2;
+    @%p1 bra LOOP;
+    mul.wide.u32 %d4, %r5, 8;
+    add.s64 %d4, %d2, %d4;
+    st.global.v2.b32 [%d4], {%r6, %r7};
+    ret;
+}
+)";
+        std::vector<uint8_t> bin;
+        if (!Cubin(std::vector<uint8_t>(kCorun, kCorun + sizeof(kCorun)), "corun", bin))
+            return;
+        if (nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), 256, 1, 1, 0, "corun", &corunShader))
+            return;
+        corunW = DeviceBuffer(static_cast<size_t>(mb) << 20);
+        corunO = DeviceBuffer(4096u * 256 * 8);
+        const unsigned wmask = (mb << 20) / 16 - 1;       // mb a power of two
+        corunStop = false;
+        corunThread = std::thread([this, wmask] {
+            ID3D12CommandQueue* q = nullptr;
+            ID3D12CommandAllocator* al = nullptr;
+            ID3D12GraphicsCommandList* cl = nullptr;
+            ID3D12Fence* f = nullptr;
+            D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_COMPUTE };
+            if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) || FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&al))) ||
+                FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, al, nullptr, IID_PPV_ARGS(&cl))) ||
+                FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))))
+                return;
+            cl->Close();
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            struct { uint64_t w, o; uint32_t mask, iters; } a { corunW->GetGPUVirtualAddress(), corunO->GetGPUVirtualAddress(), wmask, 48 };
+            UINT64 v = 0;
+            unsigned n = 0;
+            auto t0 = std::chrono::steady_clock::now();
+            while (!corunStop)
+            {
+                al->Reset();
+                cl->Reset(al, nullptr);
+                if (srvHeap)
+                {
+                    ID3D12DescriptorHeap* heaps[] = { srvHeap, smpHeap };
+                    cl->SetDescriptorHeaps(2, heaps);
+                }
+                for (int d = 0; d < 4; ++d)
+                    nv.LaunchCubin(cl, corunShader, 4096, 1, 1, &a, sizeof(a));
+                cl->Close();
+                ID3D12CommandList* l = cl;
+                q->ExecuteCommandLists(1, &l);
+                q->Signal(f, ++v);
+                f->SetEventOnCompletion(v, ev);
+                WaitForSingleObject(ev, 5000);
+                n += 4;
+                const auto t1 = std::chrono::steady_clock::now();
+                const double sec = std::chrono::duration<double>(t1 - t0).count();
+                if (sec >= 1.0)
+                {
+                    printf("corun: %.1f dispatches per second\n", n / sec);
+                    fflush(stdout);
+                    n = 0;
+                    t0 = t1;
+                }
+            }
+            CloseHandle(ev);
+            f->Release();
+            cl->Release();
+            al->Release();
+            q->Release();
+        });
+        printf("test knob: XEFG_CUDA_CORUN %u MB\n", mb);
+    }
+    void StopCorun()
+    {
+        corunStop = true;
+        if (corunThread.joinable())
+            corunThread.join();
+        if (corunShader && dev)
+            nv.DestroyCubin(dev, corunShader);
+        corunShader = nullptr;
     }
     void Flush(ID3D12GraphicsCommandList* cl)
     {
@@ -1071,6 +1203,8 @@ TAIL:
             return Fail("swaprb: NvAPI_D3D12_CreateCubinComputeShaderEx " + std::to_string(r));
         if (coldBytes && !coldBuf)
             coldBuf = DeviceBuffer(coldBytes);
+        if (const std::string c = TestEnv("XEFG_CUDA_CORUN"); !c.empty() && atoi(c.c_str()) > 0 && !corunThread.joinable())
+            StartCorun(static_cast<unsigned>(atoi(c.c_str())));
         if (TestEnv("XEFG_CUDA_DUMPGRIDS") == "1")
             for (size_t i = 0; i < pack.disp.size(); ++i)
                 printf("grid %zu %s %u %u %u block %u %u %u\n", i, pack.kernels[pack.disp[i].kernel].file.c_str(), pack.disp[i].g[0],
