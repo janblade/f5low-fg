@@ -603,7 +603,7 @@ struct Kernel
 {
     std::string file, module, hash;
     unsigned block[3] = { 8, 8, 1 };
-    unsigned gridScale[3] = { 1, 1, 1 };    // a fallback's: its dispatches' groups times this (an sm_75 kernel that splits a block's work over more blocks)
+    unsigned gridScale[3] = { 1, 1, 1 };    // "gx=N gy=N gz=N" on its manifest line: its dispatches' groups times this (a kernel that splits a block's work over more blocks); the PTX says the same in a "// GRIDSCALE x y z" line
     std::vector<uint8_t> ptx;
     // The pack has no PTX file for this kernel: it is the name of a 'native' line, whose DXBC is all there is (the
     // pack-less pack, which is for the D3D12 path only). Load leaves ptx empty; the CUDA runner refuses such a pack.
@@ -715,6 +715,33 @@ public:
     // `want` (its own captured size when null); a "pack 1" manifest has one size only. A "pack 3" is a pack 2
     // whose "variant <kernel> <file> <block x y z> <key>=<0|1>..." lines swap a kernel when every key matches
     // `var` (inv, ndc, jit, premul, hdr) or the sizes (hires: render size = output size); the first match wins.
+    // A manifest option "gx=N" / "gy=N" / "gz=N" (decimal digits only, 1..kMaxGridScale, each once): 0 = not a grid scale token,
+    // 1 = taken into `sc`, 2 = a bad one (error set).
+    static constexpr unsigned kMaxGridScale = 64;
+    int GridToken(const std::string& t, unsigned (&sc)[3], unsigned& seen, int lineNo)
+    {
+        if (t.size() < 3 || t[0] != 'g' || t[1] < 'x' || t[1] > 'z' || t[2] != '=')
+            return 0;
+        unsigned long v = 0;
+        for (size_t i = 3; i < t.size(); ++i)
+        {
+            if (t[i] < '0' || t[i] > '9' || v > kMaxGridScale)
+            {
+                Fail("line " + std::to_string(lineNo) + ": bad grid scale " + t);
+                return 2;
+            }
+            v = v * 10 + static_cast<unsigned>(t[i] - '0');
+        }
+        const unsigned bit = 1u << (t[1] - 'x');
+        if (t.size() == 3 || v < 1 || v > kMaxGridScale || (seen & bit))
+        {
+            Fail("line " + std::to_string(lineNo) + ": bad or repeated grid scale " + t);
+            return 2;
+        }
+        seen |= bit;
+        sc[t[1] - 'x'] = static_cast<unsigned>(v);
+        return 1;
+    }
     bool Load(const std::string& packDir, const Sizes* want = nullptr, const Variant& var = Variant())
     {
         std::vector<bool> swapped;
@@ -835,9 +862,16 @@ public:
                 unsigned idx = 0;
                 s >> idx >> k.file >> k.block[0] >> k.block[1] >> k.block[2];
                 std::string kw;
+                unsigned seen = 0;
                 while (s >> kw)
+                {
                     if (kw == "hash")
                         s >> k.hash;
+                    else if (const int g = GridToken(kw, k.gridScale, seen, lineNo); g == 2)
+                        return false;
+                    else if (g == 0)
+                        return Fail("line " + std::to_string(lineNo) + ": unknown kernel option " + kw);
+                }
                 // the module name is the file's suffix: k<nn>_<module>.ptx
                 if (const size_t u = k.file.find('_'); u != std::string::npos)
                     k.module = k.file.substr(u + 1, k.file.size() - u - 5);
@@ -872,14 +906,22 @@ public:
                 const bool hires = size.RW == size.OW && size.RH == size.OH;
                 bool match = !swapped[idx];
                 std::string kv;
-                while (match && s >> kv)
+                unsigned seen = 0;
+                while (s >> kv)         // every token is read (and checked) whether or not the variant matches
                 {
+                    if (const int g = GridToken(kv, k.gridScale, seen, lineNo); g == 2)
+                        return false;
+                    else if (g == 1)
+                        continue;
                     const size_t eq = kv.find('=');
                     const std::string key = kv.substr(0, eq);
-                    const bool want1 = eq != std::string::npos && kv.substr(eq + 1) == "1";
+                    const bool known = key == "inv" || key == "ndc" || key == "jit" || key == "premul" || key == "hdr" || key == "hires";
+                    if (!known || eq == std::string::npos || (kv.substr(eq + 1) != "0" && kv.substr(eq + 1) != "1"))
+                        return Fail("line " + std::to_string(lineNo) + ": unknown variant condition " + kv);
+                    const bool want1 = kv.substr(eq + 1) == "1";
                     const bool have = key == "inv" ? var.inv : key == "ndc" ? var.ndc : key == "jit" ? var.jit : key == "premul" ? var.premul
-                                    : key == "hdr" ? var.hdr : key == "hires" ? hires : !want1;
-                    match = have == want1;
+                                    : key == "hdr" ? var.hdr : hires;
+                    match = match && have == want1;
                 }
                 if (match)
                 {
@@ -989,14 +1031,12 @@ public:
                 unsigned idx = 0;
                 Kernel fb;
                 s >> idx >> fb.file >> fb.block[0] >> fb.block[1] >> fb.block[2];
-                for (std::string opt; s >> opt;)       // optional "gx=N" "gy=N" "gz=N": the dispatches' groups times N (dimension of 1 only)
-                    if (opt.size() > 3 && opt[0] == 'g' && opt[1] >= 'x' && opt[1] <= 'z' && opt[2] == '=')
-                        fb.gridScale[opt[1] - 'x'] = static_cast<unsigned>(atoi(opt.c_str() + 3));
-                    else
+                unsigned seen = 0;
+                for (std::string opt; s >> opt;)
+                    if (const int g = GridToken(opt, fb.gridScale, seen, lineNo); g == 2)
+                        return false;
+                    else if (g == 0)
                         return Fail("line " + std::to_string(lineNo) + ": unknown fallback option " + opt);
-                for (unsigned c : fb.gridScale)
-                    if (!c || c > 64)
-                        return Fail("line " + std::to_string(lineNo) + ": fallback grid scale out of range");
                 if (idx >= kernels.size() || fb.file.empty())
                     return Fail("fallback for an unknown kernel");
                 if (const size_t u = fb.file.find('_'); u != std::string::npos)
@@ -1017,30 +1057,13 @@ public:
             {
                 kernels[idx].file = fb.file;
                 kernels[idx].module = fb.module;
-                {
-                    // the generator names the scale its kernel needs ("// GRIDSCALE x y z"); a manifest that disagrees would launch it wrong
-                    const std::vector<uint8_t> text = Slurp(dir + "\\" + fb.file);
-                    const std::string t(text.begin(), text.end());
-                    unsigned want[3] = { 1, 1, 1 };
-                    if (const size_t at = t.find("// GRIDSCALE "); at != std::string::npos)
-                        sscanf_s(t.c_str() + at, "// GRIDSCALE %u %u %u", &want[0], &want[1], &want[2]);
-                    if (!std::equal(want, want + 3, fb.gridScale))
-                        return Fail(fb.file + ": its manifest line scales the grid differently than the kernel needs");
-                }
                 std::copy(fb.block, fb.block + 3, kernels[idx].block);
-                for (Dispatch& d : disp)
-                    if (d.kernel == static_cast<int>(idx))
-                        for (int c = 0; c < 3; ++c)
-                            if (fb.gridScale[c] > 1)
-                            {
-                                if (d.g[c] != 1)
-                                    return Fail("fallback grid scale on a dimension that is not 1");
-                                d.g[c] = fb.gridScale[c];
-                            }
+                std::copy(fb.gridScale, fb.gridScale + 3, kernels[idx].gridScale);     // the fallback's scale, not the kernel line's
                 ++fellBack;
             }
-        for (Kernel& k : kernels)
+        for (size_t ki = 0; ki < kernels.size(); ++ki)
         {
+            Kernel& k = kernels[ki];
             k.ptx = Slurp(dir + "\\" + k.file);
             if (k.ptx.empty())
             {
@@ -1050,6 +1073,29 @@ public:
                     return Fail("cannot read " + k.file);
                 k.nativeOnly = true;
             }
+            // The generator names the grid scale its kernel needs ("// GRIDSCALE x y z", none = 1 1 1); the manifest line must say
+            // the same, both ways, or the kernel would launch with the wrong grid. Then the dispatches' groups are scaled.
+            unsigned need[3] = { 1, 1, 1 };
+            if (!k.nativeOnly)
+            {
+                const std::string t(k.ptx.begin(), k.ptx.end());
+                if (const size_t at = t.find("// GRIDSCALE "); at != std::string::npos &&
+                    sscanf_s(t.c_str() + at, "// GRIDSCALE %u %u %u", &need[0], &need[1], &need[2]) != 3)
+                    return Fail(k.file + ": a garbled GRIDSCALE line");
+            }
+            if (!std::equal(need, need + 3, k.gridScale))
+                return Fail(k.file + ": its manifest line scales the grid (" + std::to_string(k.gridScale[0]) + " " + std::to_string(k.gridScale[1]) +
+                            " " + std::to_string(k.gridScale[2]) + ") differently than the kernel needs (" + std::to_string(need[0]) + " " +
+                            std::to_string(need[1]) + " " + std::to_string(need[2]) + ")");
+            for (Dispatch& d : disp)
+                if (d.kernel == static_cast<int>(ki))
+                    for (int c = 0; c < 3; ++c)
+                        if (k.gridScale[c] > 1)
+                        {
+                            if (d.g[c] != 1)
+                                return Fail(k.file + ": a grid scale on a dimension that is not 1");
+                            d.g[c] = k.gridScale[c];
+                        }
             k.ptx.push_back(0);
             // Parameters after p_desc, in the order dxil2ptx.py declares them.
             const char* q = reinterpret_cast<const char*>(k.ptx.data());
