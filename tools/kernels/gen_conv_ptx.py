@@ -42,11 +42,15 @@ LAYERS = {  # cin, cout, encoder, unsigned, clamp lo, tile w, tile h, threads
     "c32": (32, 16, False, False, -128, 8, 8, 128),
     "c16": (16, 16, False, False, -128, 8, 8, 128),
 }
-# sm_75 only (an RTX 20; the manifest's fallback line scales the grid to match, gz=): the layer's output-channel groups are
-# split over ZS blocks (blockIdx.z), each with the same input tile, so a layer with few big blocks fills more multiprocessors
+# The output-channel groups of a layer with few big blocks are split over ZS blocks (blockIdx.z), each with the same input
+# tile, so the layer fills more multiprocessors; the manifest's kernel / fallback line scales the grid to match (gz=).
+# NG = n-blocks an item, NT = threads a block (the manifest line says the same).
 SM75_ZS = {"c128": 4, "enc128": 4}
 SM75_NG = {"c128": 2, "enc128": 2}
 SM75_NT = {"enc128": 128}
+SM80_ZS = {"c128": 2}     # measured on a 5070 Ti: k24 0.053 -> 0.032 ms at 1080p, 1440p, level at 4K; the other splits lost at 4K
+SM80_NG = {}
+SM80_NT = {}
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
 ap.add_argument("--layer", required=True, choices=sorted(LAYERS))
@@ -54,8 +58,8 @@ ap.add_argument("--sm", type=int, default=80, choices=(75, 80))
 a = ap.parse_args()
 
 CIN, COUT, ENC, UNS, LO, TW, TH, NT = LAYERS[a.layer]
-if a.sm == 75:
-    NT = SM75_NT.get(a.layer, NT)
+ZSM, NGM, NTM = (SM75_ZS, SM75_NG, SM75_NT) if a.sm == 75 else (SM80_ZS, SM80_NG, SM80_NT)
+NT = NTM.get(a.layer, NT)
 CS = CIN // 16
 S = 2 if ENC else 1
 SW, SH = S * TW + 2, S * TH + 2     # staged input tile
@@ -65,10 +69,10 @@ MT = TW * TH // 16                  # m-tiles
 NB = COUT // 8
 NG = min(NB, 4)                     # n-blocks an item
 GW = 4                              # n-blocks a group steps by in the weights / bias / output slices (32 channels)
-if a.sm == 75 and a.layer in SM75_NG:
-    NG = GW = SM75_NG[a.layer]
+if a.layer in NGM:
+    NG = GW = NGM[a.layer]
 GI = NB // NG                       # n-block groups
-ZS = SM75_ZS.get(a.layer, 1) if a.sm == 75 else 1
+ZS = ZSM.get(a.layer, 1)
 assert GI % ZS == 0
 GIB = GI // ZS                      # groups a block makes
 ITEMS = MT * GIB
