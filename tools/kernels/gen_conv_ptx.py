@@ -44,8 +44,8 @@ LAYERS = {  # cin, cout, encoder, unsigned, clamp lo, tile w, tile h, threads
 }
 # sm_75 only (an RTX 20; the manifest's fallback line scales the grid to match, gz=): the layer's output-channel groups are
 # split over ZS blocks (blockIdx.z), each with the same input tile, so a layer with few big blocks fills more multiprocessors
-SM75_ZS = {"c128": 4, "enc128": 4}
-SM75_NG = {"c128": 2, "enc128": 2}
+SM75_ZS = {"c128": 4, "enc128": 4, "c64": 2}
+SM75_NG = {"c128": 2, "enc128": 2, "c64": 2}
 SM75_NT = {"enc128": 128}
 import os
 for _o in os.environ.get("SM75_EXP", "").split(";"):   # EXPERIMENT
