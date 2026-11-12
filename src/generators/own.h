@@ -555,10 +555,12 @@ public:
         if (cfg.prof)
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0);
         const UINT pre = static_cast<UINT>((n + 1) * kSlots) + d0;
+        // Prof=2 with the cold L2 knob: the per-run head / tail figures below include the fills (the dispatch sums do not)
         bool ok = dpack->Record(g, from, split && from == 0 ? splitAt : from, ds, d0, pre);
         if (cfg.prof)
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 1);
-        ok = ok && dpack->Record(g, split && from == 0 ? splitAt : from, n, ds, d0, pre);
+        // behind the head in this list its first dispatch's start stamp is the head's last end stamp: not taken a second time
+        ok = ok && dpack->Record(g, split && from == 0 ? splitAt : from, n, ds, d0, pre, !(split && from == 0));
         if (cfg.prof)
         {
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 2);
@@ -566,8 +568,8 @@ public:
             if (ds)
                 g->ResolveQueryData(dispHeap, D3D12_QUERY_TYPE_TIMESTAMP, d0 + static_cast<UINT>(from), static_cast<UINT>(n - from + 1),
                                     dispRb, 8 * (d0 + from));
-            if (ds && dpack->coldEach)
-                g->ResolveQueryData(dispHeap, D3D12_QUERY_TYPE_TIMESTAMP, pre + static_cast<UINT>(from), static_cast<UINT>(n - from + 1),
+            if (ds && dpack->coldBytes)        // a pre-stamp for each of dispatches from .. n - 1, no more
+                g->ResolveQueryData(dispHeap, D3D12_QUERY_TYPE_TIMESTAMP, pre + static_cast<UINT>(from), static_cast<UINT>(n - from),
                                     dispRb, 8 * (pre + from));
             stamped[slot] = true;
             stampedHead[slot] = split && from == 0;
@@ -601,9 +603,9 @@ public:
             if (SUCCEEDED(dispRb->Map(0, &dr, reinterpret_cast<void**>(&dv))))
             {
                 const UINT64* t = reinterpret_cast<const UINT64*>(reinterpret_cast<const uint8_t*>(dv) + 8 * b0);
-                const UINT64* pr = t + (n + 1) * kSlots;     // the test knob's pre-dispatch stamps (XEFG_CUDA_COLDL2_EACH)
+                const UINT64* pr = t + (n + 1) * kSlots;     // the cold L2 knob's pre-dispatch stamps (XEFG_CUDA_COLDL2)
                 for (size_t k = from; k < n; ++k)
-                    dispMs[k] += double(t[k + 1] - (dpack->coldEach && k > from ? pr[k] : t[k])) * 1000.0 / double(tsFreq);
+                    dispMs[k] += double(t[k + 1] - (dpack->coldBytes ? pr[k] : t[k])) * 1000.0 / double(tsFreq);
                 dispRb->Unmap(0, &none);
                 if (from == 0)
                     ++dispApp;
@@ -839,6 +841,7 @@ private:
                 return true;
             };
             dpack->packNatives = cfg.native;
+            dpack->logSink = [](const char* m) { XLog("%s", m); };
             const bool built3d = dpack->Build(dev, setupQueue, false);
             dpack->cancel = nullptr;           // it refers to the caller's state
             dpack->needCuda = nullptr;          // it refers to this call's locals
