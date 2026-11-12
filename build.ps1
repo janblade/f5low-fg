@@ -23,8 +23,9 @@
 # Also writes build\own_blobs.txt: SHA-256 of every shader container we compile into the DLL and the SHA-256 of every
 # file we put into resource 102 (our generated PTX among them), which tools\audit.py --dll accepts (anything else inside the DLL fails the audit).
 param([string]$EmbedPack = '', [string]$Python = 'python', [string]$XessInc = '', [string]$VsPath = 'D:\DEV\VS2022', [string]$Dxc = '',
-      [string]$StreamlineInc = '')
+      [string]$StreamlineInc = '', [switch]$TuningTests)
 $ErrorActionPreference = 'Stop'
+$tuneDef = if ($TuningTests) { '/DF5LOW_TUNING_TESTS' } else { '' }       # -TuningTests: the co-runner knob (XEFG_CUDA_CORUN), never in a release
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path $root 'src'
 $out = Join-Path $root 'build'
@@ -119,7 +120,7 @@ rc /nologo /fo _res.res _res.rc >> _build.log 2>&1
 fxc /nologo /T cs_5_0 /E main /O3 /Fh xefg_convert_cs.h /Fo xefg_convert.cso /Vn g_xefgConvertCS "$src\xefg_convert.hlsl" >> _build.log 2>&1
 cl /nologo /c /TC /w /O2 /MT /DNDEBUG /Fo_zstd.obj "$root\third_party\zstd\zstddeclib.c" >> _build.log 2>&1
 cl /nologo /c /TC /w /O2 /MT /DNDEBUG /Fo_hde.obj "$src\unlock\hde\hde64.c" >> _build.log 2>&1
-cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG /I"$out" /I"$src" /I"$inc" /I"$slInc" /I"$root\third_party\zstd" /LD "$src\xefg_cuda.cpp" "$src\intel_modules.cpp" "$src\pack_build.cpp" "$src\intel_file_source.cpp" _zstd.obj _hde.obj /link /OUT:f5low.dll d3d12.lib dxgi.lib cabinet.lib user32.lib bcrypt.lib _res.res >> _build.log 2>&1
+cl /nologo /std:c++20 /EHsc /W4 /O2 /MT /DNDEBUG $tuneDef /I"$out" /I"$src" /I"$inc" /I"$slInc" /I"$root\third_party\zstd" /LD "$src\xefg_cuda.cpp" "$src\intel_modules.cpp" "$src\pack_build.cpp" "$src\intel_file_source.cpp" _zstd.obj _hde.obj /link /OUT:f5low.dll d3d12.lib dxgi.lib cabinet.lib user32.lib bcrypt.lib _res.res >> _build.log 2>&1
 "@
 Remove-Item 'f5low.dll' -ErrorAction SilentlyContinue
 Set-Content -Path '_build.bat' -Value $cmd -Encoding ascii

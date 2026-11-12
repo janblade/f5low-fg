@@ -511,6 +511,7 @@ public:
             printf("test knob: XEFG_CUDA_COLDL2 %zu MB, %s\n", coldBytes >> 20, coldEach ? "before every dispatch (x times)" : "before each run");
         }
     }
+#ifdef F5LOW_TUNING_TESTS    // build.ps1 -TuningTests only: the hand-written PTX below is not part of a release DLL (tools/audit.py --dll)
     // XEFG_CUDA_CORUN=<MB>: a second compute queue keeps an int8 tensor kernel running (4096 blocks of 256 threads, 32 KB of
     // shared memory each, streaming a weight buffer of that many MB through L2), as DLSS Neural Rendering would, and prints
     // its throughput ("corun: <dispatches per second>") once a second. A test of what our kernels cost a neighbour.
@@ -639,6 +640,9 @@ LOOP:
             nv.DestroyCubin(dev, corunShader);
         corunShader = nullptr;
     }
+#else
+    void StopCorun() {}
+#endif
     void Flush(ID3D12GraphicsCommandList* cl)
     {
         if (!coldBuf)
@@ -1203,8 +1207,10 @@ TAIL:
             return Fail("swaprb: NvAPI_D3D12_CreateCubinComputeShaderEx " + std::to_string(r));
         if (coldBytes && !coldBuf)
             coldBuf = DeviceBuffer(coldBytes);
+#ifdef F5LOW_TUNING_TESTS
         if (const std::string c = TestEnv("XEFG_CUDA_CORUN"); !c.empty() && atoi(c.c_str()) > 0 && !corunThread.joinable())
             StartCorun(static_cast<unsigned>(atoi(c.c_str())));
+#endif
         if (TestEnv("XEFG_CUDA_DUMPGRIDS") == "1")
             for (size_t i = 0; i < pack.disp.size(); ++i)
                 printf("grid %zu %s %u %u %u block %u %u %u\n", i, pack.kernels[pack.disp[i].kernel].file.c_str(), pack.disp[i].g[0],
