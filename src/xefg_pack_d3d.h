@@ -19,9 +19,15 @@
 
 #include <d3d12.h>
 
+#include <cstdio>
+#include <atomic>
+#include <cstdarg>
+#include <chrono>
 #include <functional>
+#include <map>
 
 #include <set>
+#include <thread>
 
 namespace xefgpack
 {
@@ -170,10 +176,12 @@ public:
     // Records dispatches [from, to) with the pack's current constants (Pack::SetPass etc.) on `cl`. The
     // caller's inputs must already be in the role buffers; the list must not be executed before the buffers
     // it reads are ready, as any D3D12 work.
-    bool Record(ID3D12GraphicsCommandList* cl, size_t from, size_t to, ID3D12QueryHeap* stamps = nullptr, UINT stampBase = 0)
+    bool Record(ID3D12GraphicsCommandList* cl, size_t from, size_t to, ID3D12QueryHeap* stamps = nullptr, UINT stampBase = 0, UINT preBase = ~0u, bool entryStamp = true)
     {
-        // stamps: a timestamp after each dispatch, at index stampBase + i + 1 (stampBase + `from` before the first;
-        // profiling)
+        // stamps: a timestamp after each dispatch, at index stampBase + i + 1 (stampBase + `from` before the first, unless
+        // entryStamp is false: the caller's list already ended the dispatch before it there; profiling). preBase: with the cold L2
+        // knob, a second stamp per dispatch at preBase + i, taken after the dispatch's fills, so a dispatch is timed from there
+        // (stamp i + 1 - pre i) and the fills are outside every interval, the first and the head / tail boundary one included.
         // A record from dispatch 0 starts an app frame: the caller may have changed the inputs. A tail-only
         // record (the next generated frame) keeps the copies; writes by the dispatches mark them stale.
         if (from == 0)
@@ -186,8 +194,11 @@ public:
             cl->SetDescriptorHeaps(2, heaps);
         }
         std::vector<uint8_t> args;
-        if (stamps)
+        Flush(cl);
+        if (stamps && entryStamp)
             cl->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, stampBase + static_cast<UINT>(from));
+        if (stamps && coldBytes && preBase != ~0u)
+            cl->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, preBase + static_cast<UINT>(from));
         // A UAV barrier only where a dispatch depends on one since the last barrier: it reads or writes what
         // one wrote, or writes what one read. Profiling keeps one after every dispatch, to time each alone.
         std::set<int> wrote, read;
@@ -202,6 +213,13 @@ public:
         for (size_t i = from; i < to && i < pack.disp.size(); ++i)
         {
             const Dispatch& d = pack.disp[i];
+            if (coldEach && i > from)
+            {
+                for (int f = 0; f < coldEach; ++f)
+                    Flush(cl);
+            }
+            if (stamps && coldBytes && preBase != ~0u && i > from)      // its own start, after its flush (the end of the one before was taken ahead of it)
+                cl->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, preBase + static_cast<UINT>(i));
             for (const Clear& c : d.clears)
             {
                 need(c.res, true);
@@ -399,6 +417,10 @@ public:
 
     void Release()
     {
+        StopCorun();
+        if (coldBuf)
+            coldBuf->Release();
+        coldBuf = nullptr;
         if (dev)
         {
             for (void* h : kernelShaders)
@@ -462,6 +484,290 @@ public:
     std::set<std::string> fetchLoads;
     // pack_d3d --regs: print each kernel's registers, shared memory and spills as the JIT reports them. Set before Build.
     bool printRegs = false;
+    // TEST KNOBS: environment variables, read when the pack is built. Off unless set, and their messages go to the log
+    // (`logSink`, the caller's XLog). All of them but CORUN are in the player's DLL; CORUN only in a build.ps1 -TuningTests build.
+    //  XEFG_CUDA_TURING_OCC=<file>   lines "<ptx file> <bytes>": that much dynamic shared memory per block for that kernel, so
+    //                                this GPU fits as few blocks per processor as an RTX 20 (tools/turing_occ.py writes the
+    //                                file). D3D12 path only (the CUDA path launches its own way).
+    //  XEFG_CUDA_COLDL2=<MB 1..1024> before a run of dispatches (and, with XEFG_CUDA_COLDL2_EACH=<n 1..64>, n times before every
+    //                                dispatch) a fill of that many MB, so the L2 holds other data, as right after DLSS Neural
+    //                                Rendering. With Prof=2 the fill is outside each dispatch's timed interval (a stamp is taken
+    //                                after it); the per-run head / tail figures (Prof=1) DO include the fills.
+    //  XEFG_CUDA_DUMPGRIDS=1         one log line per dispatch: kernel file, groups, block
+    //  XEFG_CUDA_CORUN=<MB>          see StartCorun
+    std::function<void(const char*)> logSink;   // set before Build; empty: stdout (the offline tools)
+    void KLog(const char* fmt, ...)
+    {
+        char b[512];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(b, sizeof b, fmt, ap);
+        va_end(ap);
+        if (logSink)
+            logSink(b);
+        else
+        {
+            puts(b);
+            fflush(stdout);
+        }
+    }
+    std::map<std::string, unsigned> occPad;
+    size_t coldBytes = 0;
+    int coldEach = 0;     // flushes before every dispatch (2: twice, so a test can take the fill's own time off: 2 * t1 - t2)
+    ID3D12Resource* coldBuf = nullptr;
+    static std::string TestEnv(const char* n)
+    {
+        char v[1024];
+        const DWORD l = GetEnvironmentVariableA(n, v, sizeof v);
+        return l && l < sizeof v ? std::string(v, l) : std::string();
+    }
+    // A whole decimal number lo..hi (nothing else in the text).
+    static bool KnobNumber(const std::string& t, unsigned long lo, unsigned long hi, unsigned long& v)
+    {
+        if (t.empty() || t.size() > 10 || t.find_first_not_of("0123456789") != std::string::npos)
+            return false;
+        v = strtoul(t.c_str(), nullptr, 10);
+        return v >= lo && v <= hi;
+    }
+    void ReadTestKnobs()
+    {
+        occPad.clear();
+        coldBytes = 0;
+        coldEach = 0;
+        if (const std::string f = TestEnv("XEFG_CUDA_TURING_OCC"); !f.empty())
+        {
+            FILE* fp = nullptr;
+            if (fopen_s(&fp, f.c_str(), "r") || !fp)
+                KLog("XEFG_CUDA_TURING_OCC: cannot open %s, ignored", f.c_str());
+            else
+            {
+                char name[256];
+                unsigned pad = 0;
+                int n;
+                bool garbled = false;
+                for (;;)
+                {
+                    n = fscanf_s(fp, "%255s %u", name, static_cast<unsigned>(sizeof name), &pad);
+                    if (n != 2)
+                    {
+                        garbled = n != EOF;
+                        break;
+                    }
+                    if (pad > 101376)
+                    {
+                        garbled = true;
+                        break;
+                    }
+                    occPad[name] = pad;
+                }
+                fclose(fp);
+                if (garbled)
+                {
+                    occPad.clear();
+                    KLog("XEFG_CUDA_TURING_OCC: %s is garbled (lines of \"<ptx file> <bytes up to 101376>\"), ignored", f.c_str());
+                }
+                else if (occPad.empty())
+                    KLog("XEFG_CUDA_TURING_OCC: %s names no kernel, ignored", f.c_str());
+                else
+                    KLog("XEFG_CUDA_TURING_OCC active (D3D12 path only): %zu kernels padded (%s)", occPad.size(), f.c_str());
+            }
+        }
+        if (const std::string m = TestEnv("XEFG_CUDA_COLDL2"); !m.empty())
+        {
+            unsigned long mb = 0, each = 0;
+            if (!KnobNumber(m, 1, 1024, mb))
+                KLog("XEFG_CUDA_COLDL2=%s: not a number of MB from 1 to 1024, ignored", m.c_str());
+            else
+            {
+                coldBytes = static_cast<size_t>(mb) << 20;
+                if (const std::string e = TestEnv("XEFG_CUDA_COLDL2_EACH"); !e.empty())
+                {
+                    if (KnobNumber(e, 0, 64, each))
+                        coldEach = static_cast<int>(each);
+                    else
+                        KLog("XEFG_CUDA_COLDL2_EACH=%s: not a number from 0 to 64, ignored", e.c_str());
+                }
+            }
+        }
+    }
+#ifdef F5LOW_TUNING_TESTS    // build.ps1 -TuningTests only: the hand-written PTX below is not part of a release DLL (tools/audit.py --dll)
+    // XEFG_CUDA_CORUN=<MB, a power of two up to 2048>: a second compute queue keeps an int8 tensor kernel running (4096 blocks of
+    // 256 threads, 32 KB of shared memory each, streaming a weight buffer of that many MB through L2), as DLSS Neural Rendering
+    // would, and logs its throughput ("corun: <dispatches per second>") once a second. A test of what our kernels cost a neighbour.
+    std::thread corunThread;
+    std::atomic<bool> corunStop { false };
+    void* corunShader = nullptr;
+    ID3D12Resource *corunW = nullptr, *corunO = nullptr;
+    void StartCorun(unsigned mb)
+    {
+        static const char kCorun[] = R"(.version 7.0
+.target sm_75
+.address_size 64
+.visible .entry corun(.param .u64 pw, .param .u64 po, .param .u32 wmask, .param .u32 iters)
+{
+    .shared .align 16 .b8 sm[32768];
+    .reg .pred %p<2>;
+    .reg .b32 %r<24>;
+    .reg .b64 %d<6>;
+    ld.param.u64 %d1, [pw];
+    ld.param.u64 %d2, [po];
+    ld.param.u32 %r1, [wmask];
+    ld.param.u32 %r2, [iters];
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mad.lo.u32 %r5, %r4, 256, %r3;
+    mov.b32 %r6, 0;
+    mov.b32 %r7, 0;
+    mov.b32 %r8, 0;
+LOOP:
+    mad.lo.u32 %r9, %r8, 40961, %r5;
+    mad.lo.u32 %r9, %r9, 7, %r8;
+    and.b32 %r9, %r9, %r1;
+    mul.wide.u32 %d3, %r9, 16;
+    add.s64 %d3, %d1, %d3;
+    ld.global.nc.v4.b32 {%r10, %r11, %r12, %r13}, [%d3];
+    and.b32 %r14, %r8, 7;
+    mad.lo.u32 %r14, %r14, 4096, 0;
+    mad.lo.u32 %r15, %r3, 16, %r14;
+    st.shared.v4.b32 [%r15], {%r10, %r11, %r12, %r13};
+    bar.sync 0;
+    ld.shared.b32 %r16, [%r15];
+    ld.shared.b32 %r17, [%r15+4];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r16}, {%r17}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r17}, {%r16}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r16}, {%r16}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r17}, {%r17}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r16}, {%r17}, {%r6, %r7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%r6, %r7}, {%r17}, {%r16}, {%r6, %r7};
+    bar.sync 0;
+    add.u32 %r8, %r8, 1;
+    setp.lt.u32 %p1, %r8, %r2;
+    @%p1 bra LOOP;
+    mul.wide.u32 %d4, %r5, 8;
+    add.s64 %d4, %d2, %d4;
+    st.global.v2.b32 [%d4], {%r6, %r7};
+    ret;
+}
+)";
+        std::vector<uint8_t> bin;
+        if (!Cubin(std::vector<uint8_t>(kCorun, kCorun + sizeof(kCorun)), "corun", bin))
+        {
+            KLog("XEFG_CUDA_CORUN: the kernel did not compile (%s), off", error.c_str());
+            return;
+        }
+        if (nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), 256, 1, 1, 0, "corun", &corunShader))
+        {
+            KLog("XEFG_CUDA_CORUN: the kernel could not be created, off");
+            corunShader = nullptr;
+            return;
+        }
+        corunW = DeviceBuffer(static_cast<size_t>(mb) << 20);
+        corunO = DeviceBuffer(4096u * 256 * 8);
+        if (!corunW || !corunO)
+        {
+            KLog("XEFG_CUDA_CORUN: the buffers (%u MB) could not be allocated, off", mb);
+            StopCorun();
+            return;
+        }
+        const uint32_t wmask = static_cast<uint32_t>(((static_cast<uint64_t>(mb) << 20) / 16) - 1);    // mb a power of two, at most 2048
+        corunStop = false;
+        corunThread = std::thread([this, wmask] {
+            ID3D12CommandQueue* q = nullptr;
+            ID3D12CommandAllocator* al = nullptr;
+            ID3D12GraphicsCommandList* cl = nullptr;
+            ID3D12Fence* f = nullptr;
+            D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_COMPUTE };
+            if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) || FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&al))) ||
+                FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, al, nullptr, IID_PPV_ARGS(&cl))) ||
+                FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))))
+            {
+                KLog("XEFG_CUDA_CORUN: no second queue, off");
+                for (IUnknown* u : std::initializer_list<IUnknown*> { f, cl, al, q })
+                    if (u)
+                        u->Release();
+                return;
+            }
+            cl->Close();
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            // Waits for fence value v however long it takes, unless the device is gone: nothing is released while the GPU may still use it.
+            auto waitFence = [&](UINT64 v) {
+                f->SetEventOnCompletion(v, ev);
+                while (f->GetCompletedValue() < v)
+                {
+                    if (FAILED(dev->GetDeviceRemovedReason()))
+                        return false;
+                    WaitForSingleObject(ev, 100);
+                }
+                return true;
+            };
+            struct { uint64_t w, o; uint32_t mask, iters; } a { corunW->GetGPUVirtualAddress(), corunO->GetGPUVirtualAddress(), wmask, 48 };
+            UINT64 v = 0;
+            unsigned n = 0;
+            auto t0 = std::chrono::steady_clock::now();
+            while (!corunStop)
+            {
+                al->Reset();
+                cl->Reset(al, nullptr);
+                if (srvHeap)
+                {
+                    ID3D12DescriptorHeap* heaps[] = { srvHeap, smpHeap };
+                    cl->SetDescriptorHeaps(2, heaps);
+                }
+                for (int d = 0; d < 4; ++d)
+                    nv.LaunchCubin(cl, corunShader, 4096, 1, 1, &a, sizeof(a));
+                cl->Close();
+                ID3D12CommandList* l = cl;
+                q->ExecuteCommandLists(1, &l);
+                q->Signal(f, ++v);
+                if (!waitFence(v))
+                {
+                    KLog("XEFG_CUDA_CORUN: device removed, stopped");
+                    break;
+                }
+                n += 4;
+                const auto t1 = std::chrono::steady_clock::now();
+                const double sec = std::chrono::duration<double>(t1 - t0).count();
+                if (sec >= 1.0)
+                {
+                    KLog("corun: %.1f dispatches per second", n / sec);
+                    n = 0;
+                    t0 = t1;
+                }
+            }
+            CloseHandle(ev);
+            f->Release();
+            cl->Release();
+            al->Release();
+            q->Release();
+        });
+        KLog("XEFG_CUDA_CORUN active: %u MB of weights", mb);
+    }
+    void StopCorun()
+    {
+        corunStop = true;
+        if (corunThread.joinable())
+            corunThread.join();
+        if (corunShader && dev)
+            nv.DestroyCubin(dev, corunShader);
+        corunShader = nullptr;
+        for (ID3D12Resource** r : { &corunW, &corunO })
+            if (*r)
+            {
+                (*r)->Release();
+                *r = nullptr;
+            }
+    }
+#else
+    void StopCorun() {}
+#endif
+    void Flush(ID3D12GraphicsCommandList* cl)
+    {
+        if (!coldBuf)
+            return;
+        struct { uint64_t p; uint32_t n, v; } a { coldBuf->GetGPUVirtualAddress(), static_cast<uint32_t>(coldBytes / 4), 0x5a5a5a5au };
+        nv.LaunchCubin(cl, fillShader, (a.n + 1023) / 1024, 1, 1, &a, sizeof(a));
+        UavBarrier(cl);
+    }
     // Kernels (by PTX file) run as their native DXIL module instead (Intel's own container: root signature and
     // shader), compiled by the driver - the reconstruction takes 0.25 ms there vs 0.36 ms as translated PTX at
     // 2560x1440. A texture it writes lives as a texture (UAV for it, SRV for the kernels that read it: no buffer,
@@ -870,6 +1176,7 @@ private:
 
     bool Compile()
     {
+        ReadTestKnobs();
         // The view format each kernel's slots are bound with, for the texel fetches to read from the buffer
         // (0 = keep the texture: formats differ between dispatches, not a plain texture, or never written by
         // a dispatch). Only a resource the graph writes needs its shadow copied per generated frame; inputs
@@ -967,7 +1274,7 @@ private:
             if (!Cubin(ptx, k.file, bin))
                 return false;
             void* h = nullptr;
-            if (int r = nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), k.block[0], k.block[1], k.block[2], 0, "dxil_main", &h))
+            if (int r = nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), k.block[0], k.block[1], k.block[2], occPad.count(k.file) ? occPad[k.file] : 0u, "dxil_main", &h))
                 return Fail(k.file + ": NvAPI_D3D12_CreateCubinComputeShaderEx " + std::to_string(r));
             kernelShaders.push_back(h);
         }
@@ -1015,6 +1322,34 @@ TAIL:
             return false;
         if (int r = nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), 256, 1, 1, 0, "swaprb", &swapShader))
             return Fail("swaprb: NvAPI_D3D12_CreateCubinComputeShaderEx " + std::to_string(r));
+        if (coldBytes && !coldBuf)
+        {
+            coldBuf = DeviceBuffer(coldBytes);
+            if (!coldBuf)
+            {
+                KLog("XEFG_CUDA_COLDL2: the %zu MB buffer could not be allocated, off", coldBytes >> 20);
+                coldBytes = 0;
+                coldEach = 0;
+            }
+            else
+                KLog("XEFG_CUDA_COLDL2 active: %zu MB %s", coldBytes >> 20,
+                     coldEach ? ("before every dispatch, x" + std::to_string(coldEach)).c_str() : "before each run of dispatches");
+        }
+#ifdef F5LOW_TUNING_TESTS
+        if (const std::string c = TestEnv("XEFG_CUDA_CORUN"); !c.empty() && !corunThread.joinable())
+        {
+            unsigned long mb = 0;
+            if (!KnobNumber(c, 1, 2048, mb) || (mb & (mb - 1)))
+                KLog("XEFG_CUDA_CORUN=%s: not a power of two MB from 1 to 2048, ignored", c.c_str());
+            else
+                StartCorun(static_cast<unsigned>(mb));
+        }
+#endif
+        if (TestEnv("XEFG_CUDA_DUMPGRIDS") == "1")
+            for (size_t i = 0; i < pack.disp.size(); ++i)
+                KLog("grid %zu %s %u %u %u block %u %u %u", i, pack.kernels[pack.disp[i].kernel].file.c_str(), pack.disp[i].g[0],
+                     pack.disp[i].g[1], pack.disp[i].g[2], pack.kernels[pack.disp[i].kernel].block[0],
+                     pack.kernels[pack.disp[i].kernel].block[1], pack.kernels[pack.disp[i].kernel].block[2]);
         return true;
     }
 

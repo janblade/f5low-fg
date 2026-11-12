@@ -536,11 +536,11 @@ public:
         // as XeFGPsoCap sums Intel's - the like-for-like figure for MFG Unlocker's runs.
         if (cfg.prof && cfg.profDispatches && !dispHeap)
         {
-            D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>((n + 1) * kSlots) };
+            D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>(2 * (n + 1) * kSlots) };   // the second half: the test knob's pre-dispatch stamps
             D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
             D3D12_RESOURCE_DESC rd {};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = 8 * (n + 1) * kSlots;
+            rd.Width = 16 * (n + 1) * kSlots;
             rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
             rd.SampleDesc.Count = 1;
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -554,10 +554,13 @@ public:
         const UINT q0 = static_cast<UINT>(3 * slot);
         if (cfg.prof)
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0);
-        bool ok = dpack->Record(g, from, split && from == 0 ? splitAt : from, ds, d0);
+        const UINT pre = static_cast<UINT>((n + 1) * kSlots) + d0;
+        // Prof=2 with the cold L2 knob: the per-run head / tail figures below include the fills (the dispatch sums do not)
+        bool ok = dpack->Record(g, from, split && from == 0 ? splitAt : from, ds, d0, pre);
         if (cfg.prof)
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 1);
-        ok = ok && dpack->Record(g, split && from == 0 ? splitAt : from, n, ds, d0);
+        // behind the head in this list its first dispatch's start stamp is the head's last end stamp: not taken a second time
+        ok = ok && dpack->Record(g, split && from == 0 ? splitAt : from, n, ds, d0, pre, !(split && from == 0));
         if (cfg.prof)
         {
             g->EndQuery(stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 2);
@@ -565,6 +568,9 @@ public:
             if (ds)
                 g->ResolveQueryData(dispHeap, D3D12_QUERY_TYPE_TIMESTAMP, d0 + static_cast<UINT>(from), static_cast<UINT>(n - from + 1),
                                     dispRb, 8 * (d0 + from));
+            if (ds && dpack->coldBytes)        // a pre-stamp for each of dispatches from .. n - 1, no more
+                g->ResolveQueryData(dispHeap, D3D12_QUERY_TYPE_TIMESTAMP, pre + static_cast<UINT>(from), static_cast<UINT>(n - from),
+                                    dispRb, 8 * (pre + from));
             stamped[slot] = true;
             stampedHead[slot] = split && from == 0;
             stampedFrom[slot] = from;
@@ -592,13 +598,14 @@ public:
         if (cfg.profDispatches && dispRb && n)
         {
             const size_t b0 = (n + 1) * i, from = stampedFrom[i];
-            const D3D12_RANGE dr { 8 * (b0 + from), 8 * (b0 + n + 1) };
+            const D3D12_RANGE dr { 0, 16 * (n + 1) * kSlots };
             UINT64* dv = nullptr;
             if (SUCCEEDED(dispRb->Map(0, &dr, reinterpret_cast<void**>(&dv))))
             {
                 const UINT64* t = reinterpret_cast<const UINT64*>(reinterpret_cast<const uint8_t*>(dv) + 8 * b0);
+                const UINT64* pr = t + (n + 1) * kSlots;     // the cold L2 knob's pre-dispatch stamps (XEFG_CUDA_COLDL2)
                 for (size_t k = from; k < n; ++k)
-                    dispMs[k] += double(t[k + 1] - t[k]) * 1000.0 / double(tsFreq);
+                    dispMs[k] += double(t[k + 1] - (dpack->coldBytes ? pr[k] : t[k])) * 1000.0 / double(tsFreq);
                 dispRb->Unmap(0, &none);
                 if (from == 0)
                     ++dispApp;
@@ -834,6 +841,7 @@ private:
                 return true;
             };
             dpack->packNatives = cfg.native;
+            dpack->logSink = [](const char* m) { XLog("%s", m); };
             const bool built3d = dpack->Build(dev, setupQueue, false);
             dpack->cancel = nullptr;           // it refers to the caller's state
             dpack->needCuda = nullptr;          // it refers to this call's locals
