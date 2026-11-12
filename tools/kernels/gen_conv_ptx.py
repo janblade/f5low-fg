@@ -47,13 +47,6 @@ LAYERS = {  # cin, cout, encoder, unsigned, clamp lo, tile w, tile h, threads
 SM75_ZS = {"c128": 4, "enc128": 4, "c64": 2}
 SM75_NG = {"c128": 2, "enc128": 2, "c64": 2}
 SM75_NT = {"enc128": 128}
-import os
-for _o in os.environ.get("SM75_EXP", "").split(";"):   # EXPERIMENT
-    if _o:
-        _l, _kv = _o.split(":")
-        for _p in _kv.split(","):
-            _k, _v = _p.split("=")
-            {"zs": SM75_ZS, "ng": SM75_NG, "nt": SM75_NT}[_k][_l] = int(_v)
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
 ap.add_argument("--layer", required=True, choices=sorted(LAYERS))
