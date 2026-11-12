@@ -44,7 +44,8 @@ LAYERS = {  # cin, cout, encoder, unsigned, clamp lo, tile w, tile h, threads
 }
 # sm_75 only (an RTX 20; the manifest's fallback line scales the grid to match, gz=): the layer's output-channel groups are
 # split over ZS blocks (blockIdx.z), each with the same input tile, so a layer with few big blocks fills more multiprocessors
-SM75_ZS = {"c128": 2}
+SM75_ZS = {"c128": 4}
+SM75_NG = {"c128": 2}
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
 ap.add_argument("--layer", required=True, choices=sorted(LAYERS))
@@ -60,6 +61,9 @@ NW = NT // 32
 MT = TW * TH // 16                  # m-tiles
 NB = COUT // 8
 NG = min(NB, 4)                     # n-blocks an item
+GW = 4                              # n-blocks a group steps by in the weights / bias / output slices (32 channels)
+if a.sm == 75 and a.layer in SM75_NG:
+    NG = GW = SM75_NG[a.layer]
 GI = NB // NG                       # n-block groups
 ZS = SM75_ZS.get(a.layer, 1) if a.sm == 75 else 1
 assert GI % ZS == 0
@@ -91,7 +95,7 @@ def wword(tap, sl, nb):
 
 
 KS = ksteps()
-GSTEP = (32 // 16) * CS * 576       # weight words from one 32-channel group to the next
+GSTEP = (8 * GW // 16) * CS * 576       # weight words from one 32-channel group to the next
 
 # the header names --sm only for an older GPU (the sm 80 packs of 2026-10 were written without it)
 SMARG = f" --sm {a.sm}" if a.sm != 80 else ""
@@ -267,7 +271,7 @@ for px, (xr, yr, pr) in enumerate((("x0", "y0", "pa"), ("x1", "y1", "pb"))):
     w(f"    setp.lt.and.u32 %{pr}, %{yr}, %ho, %{pr};")
 w("    ld.param.u64 %PB, [p_s2+0];")
 w("    ld.param.u64 %PC, [p_s3+0];")
-w("    mul.lo.u32 %t, %gi, 128;")
+w(f"    mul.lo.u32 %t, %gi, {32 * GW};")
 w("    mad.lo.u32 %t, %tg, 8, %t;")
 w("    cvt.u64.u32 %r64, %t;")
 w("    add.s64 %PB, %PB, %r64;")
@@ -285,7 +289,7 @@ for nb in range(NG):
         w("    bfi.b32 %n1, %n1, %e, 8, 8;")
         w("    cvt.u16.u32 %hv, %n1;")
         w(f"    // slice 2gi + {nb // 2}, bytes {8 * (nb % 2)} + 2tg")
-        w(f"    mad.lo.u32 %t, %gi, 2, {nb // 2};")
+        w(f"    mad.lo.u32 %t, %gi, {GW // 2}, {nb // 2};")
         w(f"    mad.lo.u32 %t, %t, %ho, %{yr};")
         w("    mul.wide.u32 %r64, %t, %pio;")
         w("    add.s64 %PC, %PO, %r64;")
@@ -296,7 +300,7 @@ for nb in range(NG):
         w("    add.s64 %PC, %PC, %r64;")
         w(f"    @%{pr} st.global.u16 [%PC+{8 * (nb % 2)}], %hv;")
     w("    ld.param.u64 %PC, [p_s3+0];")
-    w("    mul.lo.u32 %t, %gi, 128;")
+    w(f"    mul.lo.u32 %t, %gi, {32 * GW};")
     w("    mad.lo.u32 %t, %tg, 8, %t;")
     w("    cvt.u64.u32 %r64, %t;")
     w("    add.s64 %PC, %PC, %r64;")
