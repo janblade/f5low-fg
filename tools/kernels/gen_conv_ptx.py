@@ -44,8 +44,16 @@ LAYERS = {  # cin, cout, encoder, unsigned, clamp lo, tile w, tile h, threads
 }
 # sm_75 only (an RTX 20; the manifest's fallback line scales the grid to match, gz=): the layer's output-channel groups are
 # split over ZS blocks (blockIdx.z), each with the same input tile, so a layer with few big blocks fills more multiprocessors
-SM75_ZS = {"c128": 4}
-SM75_NG = {"c128": 2}
+SM75_ZS = {"c128": 4, "enc128": 4}
+SM75_NG = {"c128": 2, "enc128": 2}
+SM75_NT = {"enc128": 128}
+import os
+for _o in os.environ.get("SM75_EXP", "").split(";"):   # EXPERIMENT
+    if _o:
+        _l, _kv = _o.split(":")
+        for _p in _kv.split(","):
+            _k, _v = _p.split("=")
+            {"zs": SM75_ZS, "ng": SM75_NG, "nt": SM75_NT}[_k][_l] = int(_v)
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
 ap.add_argument("--layer", required=True, choices=sorted(LAYERS))
@@ -53,6 +61,8 @@ ap.add_argument("--sm", type=int, default=80, choices=(75, 80))
 a = ap.parse_args()
 
 CIN, COUT, ENC, UNS, LO, TW, TH, NT = LAYERS[a.layer]
+if a.sm == 75:
+    NT = SM75_NT.get(a.layer, NT)
 CS = CIN // 16
 S = 2 if ENC else 1
 SW, SH = S * TW + 2, S * TH + 2     # staged input tile
