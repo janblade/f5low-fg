@@ -603,6 +603,7 @@ struct Kernel
 {
     std::string file, module, hash;
     unsigned block[3] = { 8, 8, 1 };
+    unsigned gridScale[3] = { 1, 1, 1 };    // a fallback's: its dispatches' groups times this (an sm_75 kernel that splits a block's work over more blocks)
     std::vector<uint8_t> ptx;
     // The pack has no PTX file for this kernel: it is the name of a 'native' line, whose DXBC is all there is (the
     // pack-less pack, which is for the D3D12 path only). Load leaves ptx empty; the CUDA runner refuses such a pack.
@@ -988,6 +989,14 @@ public:
                 unsigned idx = 0;
                 Kernel fb;
                 s >> idx >> fb.file >> fb.block[0] >> fb.block[1] >> fb.block[2];
+                for (std::string opt; s >> opt;)       // optional "gx=N" "gy=N" "gz=N": the dispatches' groups times N (dimension of 1 only)
+                    if (opt.size() > 3 && opt[0] == 'g' && opt[1] >= 'x' && opt[1] <= 'z' && opt[2] == '=')
+                        fb.gridScale[opt[1] - 'x'] = static_cast<unsigned>(atoi(opt.c_str() + 3));
+                    else
+                        return Fail("line " + std::to_string(lineNo) + ": unknown fallback option " + opt);
+                for (unsigned c : fb.gridScale)
+                    if (!c || c > 64)
+                        return Fail("line " + std::to_string(lineNo) + ": fallback grid scale out of range");
                 if (idx >= kernels.size() || fb.file.empty())
                     return Fail("fallback for an unknown kernel");
                 if (const size_t u = fb.file.find('_'); u != std::string::npos)
@@ -1008,7 +1017,26 @@ public:
             {
                 kernels[idx].file = fb.file;
                 kernels[idx].module = fb.module;
+                {
+                    // the generator names the scale its kernel needs ("// GRIDSCALE x y z"); a manifest that disagrees would launch it wrong
+                    const std::vector<uint8_t> text = Slurp(dir + "\\" + fb.file);
+                    const std::string t(text.begin(), text.end());
+                    unsigned want[3] = { 1, 1, 1 };
+                    if (const size_t at = t.find("// GRIDSCALE "); at != std::string::npos)
+                        sscanf_s(t.c_str() + at, "// GRIDSCALE %u %u %u", &want[0], &want[1], &want[2]);
+                    if (!std::equal(want, want + 3, fb.gridScale))
+                        return Fail(fb.file + ": its manifest line scales the grid differently than the kernel needs");
+                }
                 std::copy(fb.block, fb.block + 3, kernels[idx].block);
+                for (Dispatch& d : disp)
+                    if (d.kernel == static_cast<int>(idx))
+                        for (int c = 0; c < 3; ++c)
+                            if (fb.gridScale[c] > 1)
+                            {
+                                if (d.g[c] != 1)
+                                    return Fail("fallback grid scale on a dimension that is not 1");
+                                d.g[c] = fb.gridScale[c];
+                            }
                 ++fellBack;
             }
         for (Kernel& k : kernels)
