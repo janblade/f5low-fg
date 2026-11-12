@@ -10,6 +10,7 @@
 // Use only in games without anti-cheat.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <share.h>
 #include <windows.h>
 
 #include <compressapi.h>
@@ -96,7 +97,7 @@ bool OpenLog()
         wcsncpy_s(v, IniString(L"Log", L"0").c_str(), _TRUNCATE);
     if (!(v[0] == L'1' || _wcsicmp(v, L"true") == 0 || _wcsicmp(v, L"on") == 0))
         return false;
-    _wfopen_s(&g_log, longpath::ExtendIfLong(g_dir + L"\\f5low.log").c_str(), L"w");
+    g_log = _wfsopen(longpath::ExtendIfLong(g_dir + L"\\f5low.log").c_str(), L"w", _SH_DENYWR);    // readable while open
     if (!g_log)
     {
         // the DLL's folder is not writable: %LOCALAPPDATA%\f5low\f5low.log instead
@@ -104,7 +105,7 @@ bool OpenLog()
         if (!fb.empty())
         {
             CreateDirectoryW(longpath::ExtendIfLong(fb).c_str(), nullptr);
-            _wfopen_s(&g_log, longpath::ExtendIfLong(fb + L"\\f5low.log").c_str(), L"w");
+            g_log = _wfsopen(longpath::ExtendIfLong(fb + L"\\f5low.log").c_str(), L"w", _SH_DENYWR);
             if (g_log)
                 fprintf(g_log, "f5low: %ls is not writable: this log is %ls\\f5low.log\n", g_dir.c_str(), fb.c_str());
         }
@@ -1769,6 +1770,32 @@ xefg_swapchain_result_t xefgSwapChainD3D12CreateContext(ID3D12Device* d, xefg_sw
                      o->fixedMode == pacesched::kFixedTimer ? "each frame waits for its time with V-Sync too (the plain schedule)"
                      : o->fixedMode == pacesched::kFixedDisplay ? "with V-Sync the display spaces the frames"
                      : "timer: f5low times every frame itself with V-Sync (the driver never meters a V-Sync batch)");
+        }
+        // TargetFps (XEFG_CUDA_TARGETFPS; docs/TARGETFPS.md): a fixed output clock, each slot at its own t. 0 (default) off.
+        // Plain D3D12 path only (Show); GenBlock off, since GenAhead records the passes before their slots exist.
+        {
+            const double tf = atof(Setting("XEFG_CUDA_TARGETFPS", "TargetFps", "0").c_str());
+            o->targetFps = tf >= 30.0 && tf <= 500.0 ? tf : 0.0;
+            if (tf != 0.0 && o->targetFps == 0.0)
+                XLog("warning: TargetFps=%g is outside 30..500 - off", tf);
+            if (o->targetFps > 0.0)
+            {
+                XLog("TargetFps=%g: output clock on (own generator, D3D12 path, Gate=0, GenQueue=off)%s", o->targetFps,
+                     o->genBlock ? "; GenBlock off for it" : "");
+                o->genBlock = false;
+                o->fracEven = Setting("XEFG_CUDA_TARGETT", "TargetT", "exact") == "even";
+                XLog("TargetT=%s", o->fracEven ? "even (t = i / m, the real frame in the last slot)" : "exact (each slot at its own t)");
+                o->fracDisplay = Setting("XEFG_CUDA_TARGETPACING", "TargetPacing", "timer") == "display";
+                XLog("TargetPacing=%s", o->fracDisplay ? "display (at the refresh with V-Sync: the display spaces the presents)"
+                                                       : "timer (with V-Sync at most 97%% of the refresh)");
+                o->fracTear = Setting("XEFG_CUDA_TARGETPRESENT", "TargetPresent", "vsync") == "tearing";
+                XLog("TargetPresent=%s", o->fracTear ? "tearing (timer slots: sync 0 + tearing, at least a refresh apart)" : "vsync (the game's sync interval)");
+                {
+                    const double pm = atof(Setting("XEFG_CUDA_TARGETPASSMS", "TargetPassMs", "3").c_str());
+                    o->fracPassMs = pm >= 0.5 && pm <= 10.0 ? pm : 3.0;
+                    XLog("TargetPassMs=%.1f (late latch: a pass's expected time to done)", o->fracPassMs);
+                }
+            }
         }
         // OobQueue=1 / OobMarkers=1 (XEFG_CUDA_OOBQUEUE, XEFG_CUDA_OOBMARKERS): low-level, off by default (oob_driver.h).
         const std::string oobQueue = Setting("XEFG_CUDA_OOBQUEUE", "OobQueue", "0");

@@ -162,6 +162,14 @@ public:
     // ---- per pass ---------------------------------------------------------------------------------------
     // D3D12 path: constants for pass k of n (jitter, t = k / (n + 1), motion-vector scale), then the pass into g.
     virtual void PreparePass(uint32_t k, uint32_t n, const float jc[2], const float jp[2], const float mvs[2]) = 0;
+    // TargetFps (docs/TARGETFPS.md): the same at any t in (0, 1), pass = the pass's index within its app frame (0, 1, ... in
+    // order). false: this generator cannot, and the fixed k / (n + 1) layout stays.
+    virtual bool PreparePassAt(float t, uint32_t pass, const float jc[2], const float jp[2], const float mvs[2])
+    {
+        (void)t, (void)pass, (void)jc, (void)jp, (void)mvs;
+        return false;
+    }
+    virtual bool PassAtSupported() const { return false; }
     // slot: the timestamp slot (the present lane's allocator index, or kAllocs + the generation lane's); tsQueue: the queue g runs on.
     virtual bool RecordPass(ID3D12GraphicsCommandList* g, uint32_t k, size_t slot, ID3D12CommandQueue* tsQueue, bool bgra) = 0;
     // The same, the frame landing in dst (a UAV-capable plain buffer, COMMON between lists) instead of Output().
