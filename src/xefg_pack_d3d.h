@@ -19,7 +19,9 @@
 
 #include <d3d12.h>
 
+#include <cstdio>
 #include <functional>
+#include <map>
 
 #include <set>
 
@@ -170,7 +172,7 @@ public:
     // Records dispatches [from, to) with the pack's current constants (Pack::SetPass etc.) on `cl`. The
     // caller's inputs must already be in the role buffers; the list must not be executed before the buffers
     // it reads are ready, as any D3D12 work.
-    bool Record(ID3D12GraphicsCommandList* cl, size_t from, size_t to, ID3D12QueryHeap* stamps = nullptr, UINT stampBase = 0)
+    bool Record(ID3D12GraphicsCommandList* cl, size_t from, size_t to, ID3D12QueryHeap* stamps = nullptr, UINT stampBase = 0, UINT preBase = ~0u)
     {
         // stamps: a timestamp after each dispatch, at index stampBase + i + 1 (stampBase + `from` before the first;
         // profiling)
@@ -186,6 +188,7 @@ public:
             cl->SetDescriptorHeaps(2, heaps);
         }
         std::vector<uint8_t> args;
+        Flush(cl);
         if (stamps)
             cl->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, stampBase + static_cast<UINT>(from));
         // A UAV barrier only where a dispatch depends on one since the last barrier: it reads or writes what
@@ -202,6 +205,13 @@ public:
         for (size_t i = from; i < to && i < pack.disp.size(); ++i)
         {
             const Dispatch& d = pack.disp[i];
+            if (coldEach && i > from)
+            {
+                for (int f = 0; f < coldEach; ++f)
+                    Flush(cl);
+                if (stamps && preBase != ~0u)       // this dispatch's own start, after its flush (the end of the one before was taken ahead of it)
+                    cl->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, preBase + static_cast<UINT>(i));
+            }
             for (const Clear& c : d.clears)
             {
                 need(c.res, true);
@@ -462,6 +472,49 @@ public:
     std::set<std::string> fetchLoads;
     // pack_d3d --regs: print each kernel's registers, shared memory and spills as the JIT reports them. Set before Build.
     bool printRegs = false;
+    // TEST ONLY (all off unless their environment variable is set; nothing here runs in a release):
+    //  XEFG_CUDA_TURING_OCC=<file>   lines "<ptx file> <bytes>": that much dynamic shared memory per block for that kernel, so
+    //                                this GPU fits as few blocks per processor as an RTX 20 (tools/turing_occ.py writes the file)
+    //  XEFG_CUDA_COLDL2=<MB>         before a run of dispatches (and, with XEFG_CUDA_COLDL2_EACH=1, before every dispatch) a fill
+    //                                of that many MB, so the L2 holds other data, as right after DLSS Neural Rendering. With
+    //                                Prof=2 the fill is outside the timed interval of each dispatch.
+    std::map<std::string, unsigned> occPad;
+    size_t coldBytes = 0;
+    int coldEach = 0;     // flushes before every dispatch (2: twice, so a test can take the fill's own time off: 2 * t1 - t2)
+    ID3D12Resource* coldBuf = nullptr;
+    static std::string TestEnv(const char* n)
+    {
+        char v[1024];
+        const DWORD l = GetEnvironmentVariableA(n, v, sizeof v);
+        return l && l < sizeof v ? std::string(v, l) : std::string();
+    }
+    void ReadTestKnobs()
+    {
+        if (const std::string f = TestEnv("XEFG_CUDA_TURING_OCC"); !f.empty())
+            if (FILE* fp = fopen(f.c_str(), "r"))
+            {
+                char name[256];
+                unsigned pad;
+                while (fscanf(fp, "%255s %u", name, &pad) == 2)
+                    occPad[name] = pad;
+                fclose(fp);
+                printf("test knob: XEFG_CUDA_TURING_OCC, %zu kernels padded (%s)\n", occPad.size(), f.c_str());
+            }
+        if (const std::string m = TestEnv("XEFG_CUDA_COLDL2"); !m.empty() && atoi(m.c_str()) > 0)
+        {
+            coldBytes = static_cast<size_t>(atoi(m.c_str())) << 20;
+            coldEach = atoi(TestEnv("XEFG_CUDA_COLDL2_EACH").c_str());
+            printf("test knob: XEFG_CUDA_COLDL2 %zu MB, %s\n", coldBytes >> 20, coldEach ? "before every dispatch (x times)" : "before each run");
+        }
+    }
+    void Flush(ID3D12GraphicsCommandList* cl)
+    {
+        if (!coldBuf)
+            return;
+        struct { uint64_t p; uint32_t n, v; } a { coldBuf->GetGPUVirtualAddress(), static_cast<uint32_t>(coldBytes / 4), 0x5a5a5a5au };
+        nv.LaunchCubin(cl, fillShader, (a.n + 1023) / 1024, 1, 1, &a, sizeof(a));
+        UavBarrier(cl);
+    }
     // Kernels (by PTX file) run as their native DXIL module instead (Intel's own container: root signature and
     // shader), compiled by the driver - the reconstruction takes 0.25 ms there vs 0.36 ms as translated PTX at
     // 2560x1440. A texture it writes lives as a texture (UAV for it, SRV for the kernels that read it: no buffer,
@@ -870,6 +923,7 @@ private:
 
     bool Compile()
     {
+        ReadTestKnobs();
         // The view format each kernel's slots are bound with, for the texel fetches to read from the buffer
         // (0 = keep the texture: formats differ between dispatches, not a plain texture, or never written by
         // a dispatch). Only a resource the graph writes needs its shadow copied per generated frame; inputs
@@ -967,7 +1021,7 @@ private:
             if (!Cubin(ptx, k.file, bin))
                 return false;
             void* h = nullptr;
-            if (int r = nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), k.block[0], k.block[1], k.block[2], 0, "dxil_main", &h))
+            if (int r = nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), k.block[0], k.block[1], k.block[2], occPad.count(k.file) ? occPad[k.file] : 0u, "dxil_main", &h))
                 return Fail(k.file + ": NvAPI_D3D12_CreateCubinComputeShaderEx " + std::to_string(r));
             kernelShaders.push_back(h);
         }
@@ -1015,6 +1069,13 @@ TAIL:
             return false;
         if (int r = nv.CreateCubin(dev, bin.data(), static_cast<unsigned>(bin.size()), 256, 1, 1, 0, "swaprb", &swapShader))
             return Fail("swaprb: NvAPI_D3D12_CreateCubinComputeShaderEx " + std::to_string(r));
+        if (coldBytes && !coldBuf)
+            coldBuf = DeviceBuffer(coldBytes);
+        if (TestEnv("XEFG_CUDA_DUMPGRIDS") == "1")
+            for (size_t i = 0; i < pack.disp.size(); ++i)
+                printf("grid %zu %s %u %u %u block %u %u %u\n", i, pack.kernels[pack.disp[i].kernel].file.c_str(), pack.disp[i].g[0],
+                       pack.disp[i].g[1], pack.disp[i].g[2], pack.kernels[pack.disp[i].kernel].block[0],
+                       pack.kernels[pack.disp[i].kernel].block[1], pack.kernels[pack.disp[i].kernel].block[2]);
         return true;
     }
 
