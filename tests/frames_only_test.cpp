@@ -20,6 +20,7 @@
 //   FRAMES_DEPTHFMT=n  depth format (41 R32_FLOAT default, 56 R16_UNORM through the conversion, 40 D32_FLOAT)
 //   FRAMES_W / FRAMES_H  display size (default 1280x720)
 //   FRAMES_BARW / FRAMES_STEP  the bar's width and step
+//   FRAMES_ZERO_MOTION=1  motion vectors 0 while the bar moves: the run must FAIL (shows the checks can fail)
 //   F5LOW_FRAMES_QUEUE=compute  (read by the DLL) its own queue is a compute queue
 // Exit code: 0 PASS, 1 FAIL, 2 setup failed.
 
@@ -233,6 +234,7 @@ struct Scene
 };
 
 static int g_barW, g_step;
+static bool g_zeroMotion;       // FRAMES_ZERO_MOTION=1: motion = 0 while the bar still moves (the run must FAIL: proves the shape check)
 static DXGI_FORMAT g_colourFmt, g_mvFmt, g_depthFmt;
 static bool g_bgra;
 static ID3D12Fence *g_ready, *g_consumed, *g_done;
@@ -263,7 +265,7 @@ static void MakeScene(Scene& S, UINT w, UINT h)
     S.depth = Texture(w, h, g_depthFmt);
     for (auto& t : S.targets)
         t = Texture(w, h, g_colourFmt);
-    FillMotion(S, -static_cast<float>(g_step));
+    FillMotion(S, g_zeroMotion ? 0.0f : -static_cast<float>(g_step));
     const UINT dtexel = g_depthFmt == DXGI_FORMAT_R16_UNORM || g_depthFmt == DXGI_FORMAT_D16_UNORM ? 2 : 4;
     std::vector<uint8_t> dp(static_cast<size_t>(w) * h * dtexel);
     for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i)
@@ -494,6 +496,7 @@ int main(int argc, char** argv)
     g_depthFmt = static_cast<DXGI_FORMAT>(EnvInt("FRAMES_DEPTHFMT", DXGI_FORMAT_R32_FLOAT));
     g_barW = EnvInt("FRAMES_BARW", 120);
     g_step = EnvInt("FRAMES_STEP", 8);
+    g_zeroMotion = EnvInt("FRAMES_ZERO_MOTION", 0) != 0;
     if (g_mvFmt != DXGI_FORMAT_R16G16_FLOAT && g_mvFmt != DXGI_FORMAT_R32G32_FLOAT && g_mvFmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
     {
         printf("FRAMES_MVFMT %d is not one this test fills\n", static_cast<int>(g_mvFmt));
