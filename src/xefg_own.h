@@ -5853,7 +5853,7 @@ private:
     void RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst)
     {
         const size_t slot = kAllocs + genCur;
-        pg->RecordPassInto(g, k, dst, slot, TsQueue(slot), IsBgra(scDesc.Format), !dumpPath.empty());
+        (void)pg->RecordPassInto(g, k, dst, slot, TsQueue(slot), IsBgra(scDesc.Format), !dumpPath.empty());
     }
     // The GPU time of a pass recorded with allocator i, once its list has finished (Begin waited for it).
     void ReadStamps(size_t i) { pg->ReadStamps(i); }

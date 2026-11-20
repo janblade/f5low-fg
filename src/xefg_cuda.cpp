@@ -2370,6 +2370,14 @@ F5LOW_FRAMES_API F5LowFramesResult f5lowFramesGenerate(F5LowFramesContext contex
     catch (...)
     {
         Log("frames: an exception in f5lowFramesGenerate");
+        try
+        {
+            if (context)
+                reinterpret_cast<xefgown::FramesCtx*>(context)->FencesOnError(input, output);     // the fences still go through
+        }
+        catch (...)
+        {
+        }
         return F5LOW_FRAMES_ERROR_INTERNAL;
     }
 }

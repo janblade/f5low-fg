@@ -50,10 +50,14 @@ public:
             return "colorFormat " + std::to_string(static_cast<int>(i.colorFormat)) + " is not R8G8B8A8, B8G8R8A8 or R10G10B10A2";
         if (!i.maxGenerated || i.maxGenerated > F5LOW_FRAMES_MAX_GENERATED)
             return "maxGenerated " + std::to_string(i.maxGenerated) + " is outside 1.." + std::to_string(F5LOW_FRAMES_MAX_GENERATED);
+        if (ColourFamily(i.colorFormat) == 3 && i.colorFormat != DXGI_FORMAT_R10G10B10A2_UNORM)
+            return "colorFormat R10G10B10A2_TYPELESS / _UINT is not accepted: use R10G10B10A2_UNORM (with F5LOW_FRAMES_FLAG_HDR10)";
         if (((i.flags & F5LOW_FRAMES_FLAG_HDR10) != 0) != IsHdr10(i.colorFormat))
             return "F5LOW_FRAMES_FLAG_HDR10 and colorFormat R10G10B10A2_UNORM go together";
         if ((i.renderWidth != 0) != (i.renderHeight != 0) || i.renderWidth > 16384 || i.renderHeight > 16384)
             return "render size " + std::to_string(i.renderWidth) + "x" + std::to_string(i.renderHeight) + " is not both zero or both in range";
+        if (i.renderWidth > i.width || i.renderHeight > i.height)
+            return "render size " + std::to_string(i.renderWidth) + "x" + std::to_string(i.renderHeight) + " is larger than the display size";
         return {};
     }
 
@@ -80,7 +84,6 @@ public:
         char qv[16] = {};
         const bool compute = GetEnvironmentVariableA("F5LOW_FRAMES_QUEUE", qv, sizeof qv) && !_stricmp(qv, "compute");
         const D3D12_COMMAND_LIST_TYPE t = compute ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
-        listType = t;
         D3D12_COMMAND_QUEUE_DESC qd { t, D3D12_COMMAND_QUEUE_PRIORITY_HIGH };
         bool ok = SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)));
         for (auto& a : alloc)
@@ -114,7 +117,9 @@ public:
         const int s = state.load(std::memory_order_acquire);
         return s == kReady ? F5LOW_FRAMES_OK : s == kBuilding ? F5LOW_FRAMES_NOT_READY : failCode;
     }
-    const char* LastError() const { return lastErr.c_str(); }
+    // After a build failure (state kFailed, published by the release store this acquire load pairs with) the build's reason, else the last
+    // host-thread call's. The build thread writes buildErr only.
+    const char* LastError() const { return state.load(std::memory_order_acquire) == kFailed ? buildErr.c_str() : lastErr.c_str(); }
 
     F5LowFramesResult Generate(const F5LowFramesInput* in, F5LowFramesOutput* out)
     {
@@ -123,6 +128,7 @@ public:
         if (!in->consumedFence || !out->doneFence)
             return Err(F5LOW_FRAMES_ERROR_ARGUMENT, "consumedFence and doneFence are required");
         out->generated = 0;
+        lastErr.clear();
         // ---- what can be told without the GPU; any error from here on still signals the fences (Bail) ----
         if (out->count > maxGen)
             return Bail(F5LOW_FRAMES_ERROR_ARGUMENT, in, out, "count " + std::to_string(out->count) + " is above maxGenerated " + std::to_string(maxGen));
@@ -149,16 +155,15 @@ public:
             return Bail(F5LOW_FRAMES_ERROR_UNSUPPORTED, in, out, std::string("depth format ") + std::to_string(static_cast<int>(dd.Format)) + " " + FormatName(dd.Format) + " is not supported");
         const uint32_t mw = in->motionWidth ? in->motionWidth : static_cast<uint32_t>(md.Width), mh = in->motionHeight ? in->motionHeight : md.Height;
         const uint32_t dw = in->depthWidth ? in->depthWidth : static_cast<uint32_t>(dd.Width), dh = in->depthHeight ? in->depthHeight : dd.Height;
-        if (mw > md.Width || mh > md.Height || dw > dd.Width || dh > dd.Height || mw > 16384 || mh > 16384)
+        if (mw > md.Width || mh > md.Height || dw > dd.Width || dh > dd.Height)
             return Bail(F5LOW_FRAMES_ERROR_ARGUMENT, in, out, "motion or depth area is larger than its texture");
-        if (dw > W || dh > H)
-            return Bail(F5LOW_FRAMES_ERROR_ARGUMENT, in, out, "depth area is larger than the display size");
+        if (mw > W || mh > H || dw > W || dh > H)
+            return Bail(F5LOW_FRAMES_ERROR_ARGUMENT, in, out, "motion or depth area is larger than the display size (the render size must be <= the display size)");
 
-        // ---- not built yet / failed: the fences go through, nothing else ----
+        // ---- not built yet / failed: the fences go through, nothing else (the build thread owns the generator until kReady) ----
         const int s = state.load(std::memory_order_acquire);
         if (s == kBuilding)
         {
-            hasPrev = false;
             SignalOnly(in, out);
             return F5LOW_FRAMES_NOT_READY;
         }
@@ -169,6 +174,9 @@ public:
         }
         if (dev->GetDeviceRemovedReason() != S_OK)
             return Bail(F5LOW_FRAMES_ERROR_DEVICE, in, out, "the device was removed");
+        // t of generated frame k is (k + 1) / (count + 1) (the pass patches); a pack without them can only make the middle frame
+        if (out->count > 1 && !pg->HasPassPatches())
+            return Bail(F5LOW_FRAMES_ERROR_UNSUPPORTED, in, out, "this generator's pack has no per-pass patches: only count 0 or 1 is possible");
 
         // ---- the generator's variant and sizes: another one rebuilds it (waits for the GPU) ----
         uint32_t want = initFlags & ~(XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH | XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV);
@@ -176,6 +184,8 @@ public:
         bool rebuilt = false;
         if (want != initFlags || mw != RW || mh != RH)
         {
+            // The pack bakes the render size into its kernels' constants and buffer layouts (pack "2": RW RH formulas), so a sub-rect fed to a
+            // pack built for a larger size is not an option: another render size is another pack (a rebuild, GPU idle).
             XLog("frames: rebuilding for render %ux%u flags 0x%x (was %ux%u, 0x%x)", mw, mh, want, RW, RH, initFlags);
             const uint32_t oldFlags = initFlags, oldRW = RW, oldRH = RH;
             initFlags = want;
@@ -186,10 +196,10 @@ public:
                 initFlags = oldFlags;
                 RW = oldRW;
                 RH = oldRH;
-                state.store(kFailed, std::memory_order_release);
                 failCode = F5LOW_FRAMES_ERROR_BUILD;
+                state.store(kFailed, std::memory_order_release);
                 SignalOnly(in, out);
-                return Err(F5LOW_FRAMES_ERROR_BUILD, "the generator could not be rebuilt: " + lastErr);
+                return Err(F5LOW_FRAMES_ERROR_BUILD, "the generator could not be rebuilt: " + buildErr);
             }
             rebuilt = true;
         }
@@ -198,14 +208,14 @@ public:
         const xefgpack::Resource& mr = pg->InputRes(GenSlot::Motion);
         const xefgpack::Resource& dr = pg->InputRes(GenSlot::Depth);
         Plan mp, dp;
-        if (!MakePlan(mp, in->motion, md, mw, mh, mr, mTake, mKind, mStride, true, why) || !MakePlan(dp, in->depth, dd, dw, dh, dr, dTake, dKind, dStride, false, why))
+        if (!MakePlan(mp, md, mw, mh, mr, mTake, mKind, mStride, true, why) || !MakePlan(dp, dd, dw, dh, dr, dTake, dKind, dStride, false, why))
             return Bail(F5LOW_FRAMES_ERROR_UNSUPPORTED, in, out, why);
         if (mp.convert || dp.convert)
         {
             if (!convPso && !convFailed && !MakeConvertPipeline(dev, convRs, convPso))
             {
                 convFailed = true;
-                XLog("frames: the format conversion pipeline could not be made");
+                XLog("frames: error: the format conversion pipeline could not be made");
             }
             if (convFailed)
                 return Bail(F5LOW_FRAMES_ERROR_UNSUPPORTED, in, out, "motion or depth needs the format conversion, which could not be made");
@@ -217,22 +227,28 @@ public:
             XLog("frames: hudless given, but the pack lacks the UI inputs - interpolating the finished picture");
             warnedHud = true;
         }
+        // The number of generated frames is decided here and is what is made, or nothing (every t depends on it).
         const bool follows = hasPrev && !rebuilt && !in->reset && in->frameId == lastFrame + 1;
-        uint32_t nGen = !follows ? 0u : pg->HasPassPatches() ? out->count : std::min(out->count, 1u);
+        const uint32_t nGen = follows ? out->count : 0u;
         for (uint32_t k = 1; k <= nGen; ++k)
             if (!ring[k - 1] && !(ring[k - 1] = PlainBuffer(pg->Buf(GenSlot::Output).bytes, true)))
-            {
-                nGen = k - 1;
-                break;
-            }
+                return Bail(F5LOW_FRAMES_ERROR_DEVICE, in, out, "no buffer for a generated frame");
         ReleaseGraveyard();
+        // Never wait for the GPU here: this frame's lists need nGen + 2 allocators; if earlier lists still hold them the frame is not taken
+        // (NOT_READY, history dropped) and only the fences go through.
+        if (!AllocsFree(nGen + 2))
+        {
+            hasPrev = false;
+            SignalOnly(in, out);
+            return F5LOW_FRAMES_NOT_READY;
+        }
 
         // ---- list 1: the inputs into the pack's buffers ----
         if (in->readyFence)
             q->Wait(in->readyFence, in->readyValue);
         ID3D12GraphicsCommandList* g = Begin();
         if (!g)
-            return Bail(F5LOW_FRAMES_ERROR_DEVICE, in, out, "the GPU did not finish an earlier list in time");
+            return Bail(F5LOW_FRAMES_ERROR_INTERNAL, in, out, "no free command allocator");
         const xefgpack::Resource& ox = pg->Output();
         std::vector<ID3D12Resource*> texs { in->color, in->motion, in->depth };
         if (in->hudless)
@@ -247,14 +263,17 @@ public:
             CopyPitched(g, fmt, pg->Buf(GenSlot::BackBuffer).res, in->color, ox, false);
             pg->Back(g, pg->Buf(GenSlot::BackBuffer).res, D3D12_RESOURCE_STATE_COPY_DEST);
         }
-        RecordInput(g, mp, in->motion, GenSlot::Motion, 0);
-        RecordInput(g, dp, in->depth, GenSlot::Depth, 1);
+        RecordInput(g, mp, in->motion, GenSlot::Motion);
+        RecordInput(g, dp, in->depth, GenSlot::Depth);
         if (bgra)
             pg->SwapInputsBgra(g, uiMode);
         pg->SetUiMode(uiMode);
         Transition(g, texs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         if (!End())
+        {
+            hasPrev = false;
             return Bail(F5LOW_FRAMES_ERROR_DEVICE, in, out, "a command list did not close");
+        }
         q->Signal(in->consumedFence, in->consumedValue);
 
         // ---- the generated frames ----
@@ -262,54 +281,60 @@ public:
         if (mvs[0] == 0 && mvs[1] == 0)
             pg->MvScale(mvs[0], mvs[1]);
         const float jc[2] = { in->jitter[0], in->jitter[1] }, jp[2] = { prevJitter[0], prevJitter[1] };
-        uint32_t made = 0;
-        for (uint32_t k = 1; k <= nGen; ++k)
+        bool failed = false;
+        for (uint32_t k = 1; k <= nGen && !failed; ++k)
         {
             pg->PreparePass(k, nGen, jc, jp, mvs);
             g = Begin();
             if (!g)
+            {
+                failed = true;
                 break;
+            }
             ID3D12Resource* target = out->targets[k - 1];
-            pg->RecordPassInto(g, k, ring[k - 1], cur, q, bgra, false);
+            const bool recorded = pg->RecordPassInto(g, k, ring[k - 1], cur, q, bgra, false);
             Barrier(g, ring[k - 1], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
             Barrier(g, target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
             CopyPitched(g, fmt, target, ring[k - 1], ox, true);
             Barrier(g, target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
             Barrier(g, ring[k - 1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-            if (!End())
-                break;
-            ++made;
-        }
-        if (made < nGen && !warnedShort)
-        {
-            XLog("frames: only %u of %u generated frames could be made (a list failed)", made, nGen);
-            warnedShort = true;
+            const bool closed = End();
+            failed = !closed || !recorded;
         }
         q->Signal(out->doneFence, out->doneValue);
-        out->generated = made;
+        if (failed)
+        {
+            // some targets may hold a frame at another t: none counts
+            hasPrev = false;
+            return Err(F5LOW_FRAMES_ERROR_DEVICE, "recording a generated frame failed");
+        }
+        out->generated = nGen;
 
         // ---- cur -> prev for the next frame ----
         g = Begin();
+        bool handed = false;
         if (g)
         {
             RecordCopyToPrev(*pg, g);
-            End();
-            pg->FrameHandedOff();
+            handed = End();
         }
-        hasPrev = g != nullptr;
+        if (handed)
+            pg->FrameHandedOff();
+        hasPrev = handed;
         prevJitter[0] = in->jitter[0];
         prevJitter[1] = in->jitter[1];
         lastFrame = in->frameId;
-        if (made && (++frames == 1 || frames % 600 == 0))
-            XLog("frames: %llu frames generated for %llu app frames", static_cast<unsigned long long>(framesMade += made), static_cast<unsigned long long>(frames));
-        else
-            framesMade += made;
+        framesMade += nGen;
+        if (nGen && (++frames == 1 || frames % 600 == 0))
+            XLog("frames: %llu generated frames in %llu Generate calls with generation", static_cast<unsigned long long>(framesMade), static_cast<unsigned long long>(frames));
         return F5LOW_FRAMES_OK;
     }
 
-    // New colour size or format: waits idle, drops the history, rebuilds the generator at the new size.
+    // New colour size or format: waits idle, drops the history, rebuilds the generator at the new size. A failure is permanent (BuildStatus then
+    // returns ERROR_BUILD). Waits for a build still running.
     F5LowFramesResult Resize(uint32_t w, uint32_t h, DXGI_FORMAT f, uint32_t flags)
     {
+        lastErr.clear();
         F5LowFramesCreateInfo ci {};
         ci.apiVersion = F5LOW_FRAMES_API_VERSION;
         ci.device = dev;
@@ -324,7 +349,7 @@ public:
         if (state.load() == kFailed)
             return failCode;
         WaitIdle();
-        const uint32_t oW = W, oH = H, oRW = RW, oRH = RH;
+        const uint32_t oW = W, oH = H, oRW = RW, oRH = RH, oFlags = initFlags;
         const DXGI_FORMAT oF = fmt;
         const bool oHdr = hdr;
         const bool sameRender = RW == W && RH == H;
@@ -332,11 +357,11 @@ public:
         H = h;
         fmt = f;
         hdr = IsHdr10(f);
-        if (sameRender)
-        {
-            RW = w;
-            RH = h;
-        }
+        RW = sameRender ? w : std::min(RW, w);
+        RH = sameRender ? h : std::min(RH, h);
+        initFlags = (initFlags & ~(XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH | XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV)) |
+                    ((flags & F5LOW_FRAMES_FLAG_DEPTH_INVERTED) ? XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH : 0u) |
+                    ((flags & F5LOW_FRAMES_FLAG_MOTION_JITTERED) ? XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV : 0u);
         if (!Rebuild())
         {
             W = oW;
@@ -345,11 +370,19 @@ public:
             RH = oRH;
             fmt = oF;
             hdr = oHdr;
-            state.store(kFailed, std::memory_order_release);
+            initFlags = oFlags;
             failCode = F5LOW_FRAMES_ERROR_BUILD;
-            return Err(F5LOW_FRAMES_ERROR_BUILD, "the generator could not be rebuilt: " + lastErr);
+            state.store(kFailed, std::memory_order_release);
+            return Err(F5LOW_FRAMES_ERROR_BUILD, "the generator could not be rebuilt: " + buildErr);
         }
         return F5LOW_FRAMES_OK;
+    }
+
+    // Wrapper helper (exceptions): the fences still go through when the pointers allow it.
+    void FencesOnError(const F5LowFramesInput* in, F5LowFramesOutput* out)
+    {
+        if (in && out && in->consumedFence && out->doneFence)
+            SignalOnly(in, out);
     }
 
     void Shutdown()
@@ -401,8 +434,9 @@ private:
 
     F5LowFramesResult Err(F5LowFramesResult r, const std::string& why)
     {
-        if (why != lastErr)
-            XLog("frames: %s", why.c_str());
+        if (why != lastLogged)
+            XLog("frames: error: %s", why.c_str());
+        lastLogged = why;
         lastErr = why;
         return r;
     }
@@ -436,7 +470,7 @@ private:
         return true;
     }
 
-    bool MakePlan(Plan& p, ID3D12Resource* tex, const D3D12_RESOURCE_DESC& d, uint32_t sw, uint32_t sh, const xefgpack::Resource& pr, Take take, uint32_t kind,
+    bool MakePlan(Plan& p, const D3D12_RESOURCE_DESC& d, uint32_t sw, uint32_t sh, const xefgpack::Resource& pr, Take take, uint32_t kind,
                   uint32_t stride, bool isMv, std::string& why)
     {
         bool convert = take == Take::Convert && pr.texel == 4;
@@ -489,12 +523,11 @@ private:
             p.raw = raw[ci];
             p.conv = { static_cast<int32_t>(kind), sw, sh, p.fp.Footprint.RowPitch, static_cast<uint32_t>(pr.pitch), stride, 0, 0, raw[ci] };
         }
-        (void)tex;
         return true;
     }
 
     // The planned copy of motion / depth into the pack's buffer (list 1; the texture is in COPY_SOURCE already).
-    void RecordInput(ID3D12GraphicsCommandList* g, const Plan& p, ID3D12Resource* tex, GenSlot slot, int)
+    void RecordInput(ID3D12GraphicsCommandList* g, const Plan& p, ID3D12Resource* tex, GenSlot slot)
     {
         ID3D12Resource* dst = pg->Buf(slot).res;
         D3D12_TEXTURE_COPY_LOCATION s { tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, t { p.convert ? p.raw : dst, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
@@ -548,16 +581,21 @@ private:
         return b;
     }
 
-    // One of our lists, opened; null when its allocator's last use did not finish within the bound.
+    // The next n allocators (in order) are not in use by the GPU.
+    bool AllocsFree(uint32_t n) const
+    {
+        const UINT64 done = fence->GetCompletedValue();
+        for (uint32_t i = 0; i < n; ++i)
+            if (allocFence[(next + i) % kAllocs] > done)
+                return false;
+        return true;
+    }
+    // One of our lists, opened; null when its allocator is still in use (never waits).
     ID3D12GraphicsCommandList* Begin()
     {
         const size_t i = next++ % kAllocs;
-        if (fence->GetCompletedValue() < allocFence[i] && !WaitFence(allocFence[i], 5000))
-        {
-            lastErr = "the GPU did not finish an earlier list in 5 s";
-            XLog("frames: %s", lastErr.c_str());
+        if (fence->GetCompletedValue() < allocFence[i])      // Generate checked AllocsFree first; never waits
             return nullptr;
-        }
         pg->ReadStamps(i);
         alloc[i]->Reset();
         list->Reset(alloc[i], nullptr);
@@ -569,8 +607,7 @@ private:
     {
         if (FAILED(list->Close()))
         {
-            lastErr = "a command list did not close";
-            XLog("frames: %s", lastErr.c_str());
+            XLog("frames: error: a command list did not close");
             return false;
         }
         ID3D12CommandList* l = list;
@@ -634,7 +671,7 @@ private:
         GenBuild b;
         b.initFlags = initFlags;
         b.hdr = hdr;
-        b.releaseHostBuffers = [this] { ReleaseStaging(); };
+        b.releaseHostBuffers = [this] { ReleaseStaging(); };    // the host thread's Rebuild only (BuildThread clears it)
         b.cancelled = [this] { return quit.load(); };
         b.packBuilt = [this] { return PackBuilt(); };
         return b;
@@ -644,11 +681,11 @@ private:
         const xefgpack::Sizes& z = pg->PackSize();
         if (z.OW != W || z.OH != H)
         {
-            lastErr = "the pack was built for " + std::to_string(z.OW) + "x" + std::to_string(z.OH) + ", not " + std::to_string(W) + "x" + std::to_string(H);
-            XLog("frames: %s", lastErr.c_str());
+            buildErr = "the pack was built for " + std::to_string(z.OW) + "x" + std::to_string(z.OH) + ", not " + std::to_string(W) + "x" + std::to_string(H);
+            XLog("frames: error: %s", buildErr.c_str());
             return false;
         }
-        XLog("frames: built: pack %s%s, %zu dispatches, output %ux%u, render %ux%u, flags 0x%x, UI inputs %s, per-pass patches %s", prm.packDir.c_str(),
+        XLog("frames: pack %s%s, %zu dispatches, output %ux%u, render %ux%u, flags 0x%x, UI inputs %s, per-pass patches %s", prm.packDir.c_str(),
              pg->PackHdr() ? "\\hdr" : "", pg->DispatchCount(), z.OW, z.OH, z.RW, z.RH, initFlags, pg->HasUiInputs() ? "yes" : "no",
              pg->HasPassPatches() ? "yes" : "NO (one generated frame only)");
         return true;
@@ -659,13 +696,20 @@ private:
     {
         JoinBuild();
         WaitIdle();
+        buildErr.clear();
         const xefgpack::Sizes want { W, H, RW, RH, 0, 0, 0, 0 };
-        const bool ok = gen->Rebuild(want, BuildArgs());
+        bool ok = gen->Rebuild(want, BuildArgs());
         hasPrev = false;
+        if (ok && !pg->InCommandLists())
+        {
+            buildErr = "the generator fell back to the CUDA path (an explicit pack without the d3d12_only marker): the frames-only API needs the D3D12 path";
+            ok = false;
+        }
         if (!ok)
         {
-            if (lastErr.empty())
-                lastErr = "the pack did not build (see the log)";
+            if (buildErr.empty())
+                buildErr = "the pack did not build (see the log)";
+            XLog("frames: error: %s", buildErr.c_str());
             return false;
         }
         return true;
@@ -697,17 +741,24 @@ private:
         else
         {
             GenBuild args = BuildArgs();
+            args.releaseHostBuffers = nullptr;      // nothing to release at the first build; the host thread owns those buffers
             const xefgpack::Sizes want { W, H, RW, RH, 0, 0, 0, 0 };
             args.firstSizes = &want;
             if (!(ok = gen->Build(args)))
-                why = quit ? "context destroyed" : lastErr.empty() ? "the pack did not build for D3D12 (see the log)" : lastErr;
+                why = quit ? "context destroyed" : buildErr.empty() ? "the pack did not build for D3D12 (see the log)" : buildErr;
+            else if (!pg->InCommandLists())
+            {
+                ok = false;
+                why = "the generator fell back to the CUDA path (an explicit pack without the d3d12_only marker): the frames-only API needs the D3D12 path";
+                code = F5LOW_FRAMES_ERROR_UNSUPPORTED;
+            }
         }
         if (ok)
             XLog("frames: generator ready %.0f ms after the context was made", static_cast<double>(Now() - t0) * 1000.0 / Freq());
         else
         {
-            XLog("frames: generator FAILED: %s", why.c_str());
-            lastErr = why;
+            XLog("frames: error: generator FAILED: %s", why.c_str());
+            buildErr = why;
             failCode = code;
         }
         state.store(ok ? kReady : kFailed, std::memory_order_release);
@@ -743,13 +794,14 @@ private:
     IPackGenerator* pg = nullptr;
     std::atomic<int> state { kBuilding };
     F5LowFramesResult failCode = F5LOW_FRAMES_ERROR_BUILD;     // written before state = kFailed
-    std::string lastErr;
+    std::string lastErr;                        // host thread only
+    std::string buildErr;                       // the build thread (and the build callbacks); read after join / kFailed
+    std::string lastLogged;
     std::atomic<bool> quit { false };
     HANDLE thread = nullptr;
     bool shutDone = false;
 
     ID3D12CommandQueue* q = nullptr;
-    D3D12_COMMAND_LIST_TYPE listType = D3D12_COMMAND_LIST_TYPE_DIRECT;
     ID3D12CommandAllocator* alloc[kAllocs] {};
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12Fence* fence = nullptr;

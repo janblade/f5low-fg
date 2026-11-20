@@ -455,7 +455,9 @@ pacing and hands over one app frame at a time; f5low writes the 1 to 5 in-betwee
 - **Fences**: `Generate` makes the queue wait on `readyFence`, records and submits the copy-in list, signals `consumedFence` right after it (the
   inputs are copied into the pack's own buffers, the host may overwrite them), then one list per generated frame (the pass, then the frame copied into
   `targets[k]`), signals `doneFence`, then a last list copies cur -> prev. `consumedFence` / `doneFence` are signalled on every return except a null
-  pointer, also for `NOT_READY` and errors, so a host can always wait on them. `Generate` waits for the GPU only to rebuild.
+  pointer, also for `NOT_READY` and errors, so a host can always wait on them. `Generate` waits for the GPU only to rebuild: when the context's 16
+  command allocators are still in flight (the host runs ahead; a frame needs count + 2) it returns `NOT_READY` without recording (history dropped).
+  It makes all `count` generated frames or none (t = (k + 1) / (count + 1)); a pack without per-pass patches refuses count > 1.
 - **Shared with the XeFG path** (factored out of `class Own` in `src/xefg_own.h`; the XeFG path records the same commands in the same order, checked
   bit for bit with `XEFG_CUDA_DUMP` runs of `tests\repro_test.cpp`): `CopyPitched` (texture <-> pitched pack buffer), `RecordCopyToPrev`,
   `MakeConvertPipeline` and `RecordConvert` (the motion / depth format conversion, `xefg_convert.hlsl`). The generator itself is `OwnGenerator`
@@ -464,8 +466,9 @@ pacing and hands over one app frame at a time; f5low writes the 1 to 5 in-betwee
   texture through the conversion). Motion and depth go straight into the pack's buffers, no staging set (the context's queue is their only user).
   `hudless`, when the pack has the UI inputs, makes UI mode 4 (hudless interpolated, the finished picture as the output layer's back buffer), else it is
   ignored with one log line. `depthInverted`, `motionJittered` and the motion size pick the pack's variant and size: a frame with other values rebuilds
-  the generator (about 0.2 s; that `Generate` waits for the GPU and makes no frames). The camera fields are not used (the XeFG path does not use them
-  either).
+  the generator (about 0.2 s; that `Generate` waits for the GPU and makes no frames). The render size is baked into the pack's kernels and buffers, so a
+  smaller motion area is another pack, not a sub-rect of a bigger one; it must not exceed the display size. The camera fields are not used (the XeFG
+  path does not use them either).
 - **History**: the first frame, `reset = 1`, a `frameId` that is not the last one + 1, a rebuild, `NOT_READY` and `Resize` take the frame as history and
   generate nothing (`generated` 0, result OK).
 - **Test**: `tests\build_frames_only_test.ps1`, then `build\frames_only_test.exe build\f5low.dll` (needs an NVIDIA GPU and the player's libxess_fg.dll):

@@ -489,7 +489,7 @@ public:
     // A pass on the generation lane whose frame ends up in `dst` (a UAV-capable plain buffer, COMMON between lists): the
     // blend writes it there itself (D3DPack::Redirect), which saves copying the 2560x1440 output into it every generated
     // frame. With a dump pending the output stays in the pack's buffer (DumpOnce reads it) and is copied.
-    void RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst, size_t slot, ID3D12CommandQueue* tsQueue,
+    bool RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst, size_t slot, ID3D12CommandQueue* tsQueue,
                         bool bgra, bool dumpPending) override
     {
         static bool warned = false;
@@ -501,15 +501,16 @@ public:
         if (!dumpPending && (dst->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && dpack->Redirect(rOut, dst))
         {
             GenBarrier(g, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            RecordPass(g, k, slot, tsQueue, bgra);
+            const bool ok = RecordPass(g, k, slot, tsQueue, bgra);
             dpack->Redirect(rOut, nullptr);
             GenBarrier(g, dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-            return;
+            return ok;
         }
-        RecordPass(g, k, slot, tsQueue, bgra);
+        const bool ok = RecordPass(g, k, slot, tsQueue, bgra);
         Out(g, out.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
         g->CopyBufferRegion(dst, 0, out.res, 0, out.bytes);
         Back(g, out.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        return ok;
     }
 
     bool RecordPass(ID3D12GraphicsCommandList* g, uint32_t k, size_t slot, ID3D12CommandQueue* tsQueue, bool bgra) override
