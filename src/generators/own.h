@@ -118,12 +118,12 @@ public:
         bool ok;
         {
             GenScope cuda(*this);
-            ok = BuildPack(nullptr, gb);
+            ok = BuildPack(gb.firstSizes, gb);
             if (!ok && d3dPath && !d3dOnly)
             {
                 XLog("build: the D3D12 path failed - using the CUDA path");
                 d3dPath = false;
-                ok = BuildPack(nullptr, gb);
+                ok = BuildPack(gb.firstSizes, gb);
             }
             if (ok && !d3dPath)
                 io.cu.StreamCreate(&stream, 1);

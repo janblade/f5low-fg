@@ -100,6 +100,7 @@ struct GenBuild
     std::function<void()> releaseHostBuffers;       // the old pack is gone: the host lets go of what was sized by it
     std::function<bool()> cancelled;                // true: the context is going away - stop at the next step (a build thread)
     std::function<bool()> packBuilt;                // the new pack is built: the host makes its staging; false fails the build
+    const xefgpack::Sizes* firstSizes = nullptr;    // the FIRST build only (Build): the sizes to build for instead of the pack's captured ones (frames_only.h)
 };
 
 class IPackGenerator;

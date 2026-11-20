@@ -136,6 +136,73 @@ inline DXGI_FORMAT SrgbTwin(DXGI_FORMAT f)
     }
 }
 
+// ---- recording helpers the host (Own) and the frames-only context (frames_only.h) share ----------------------------------------
+// Texture <-> pitched buffer of the pack's layout (output size, `fmt` the colour format: B8G8R8A8 stays in that byte order here,
+// SwapRB turns it round for the pack).
+inline void CopyPitched(ID3D12GraphicsCommandList* g, DXGI_FORMAT fmt, ID3D12Resource* dst, ID3D12Resource* src, const xefgpack::Resource& px,
+                        bool toTexture)
+{
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+    fp.Footprint = { fmt, px.w, px.h, 1, static_cast<UINT>(px.pitch) };
+    if (!toTexture)
+    {
+        D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, s { src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        d.PlacedFootprint = fp;
+        s.SubresourceIndex = 0;
+        g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+    }
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, s { src, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        d.SubresourceIndex = 0;
+        s.PlacedFootprint = fp;
+        g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+    }
+}
+
+// cur -> prev and depth -> depthPrev of the pack, for the next frame (after every pass of this one read them).
+inline void RecordCopyToPrev(IPackGenerator& pg, ID3D12GraphicsCommandList* g)
+{
+    for (auto [dstSlot, srcSlot] : { std::pair<GenSlot, GenSlot> { GenSlot::Prev, GenSlot::Cur }, { GenSlot::DepthPrev, GenSlot::Depth } })
+    {
+        const GenBuf dst = pg.Buf(dstSlot), src = pg.Buf(srcSlot);
+        if (!dst.res)
+            continue;
+        pg.Out(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
+        pg.Out(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g->CopyBufferRegion(dst.res, 0, src.res, 0, dst.bytes);
+        pg.Back(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        pg.Back(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+}
+
+// The conversion pipeline (xefg_convert.hlsl, root signature in its bytecode). False: it could not be made.
+inline bool MakeConvertPipeline(ID3D12Device* dev, ID3D12RootSignature*& rs, ID3D12PipelineState*& pso)
+{
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};
+    if (SUCCEEDED(dev->CreateRootSignature(0, g_xefgConvertCS, sizeof(g_xefgConvertCS), IID_PPV_ARGS(&rs))))
+    {
+        pd.pRootSignature = rs;
+        pd.CS = { g_xefgConvertCS, sizeof(g_xefgConvertCS) };
+        if (SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso))))
+            return true;
+    }
+    return false;
+}
+
+// One conversion's dispatch (src: the raw copy, readable by a shader; dst: a buffer a shader may write, both in their states already).
+inline void RecordConvert(ID3D12GraphicsCommandList* g, ID3D12RootSignature* rs, ID3D12PipelineState* pso, const Conversion& c, ID3D12Resource* src,
+                          ID3D12Resource* dst)
+{
+    const uint32_t k[8] = { c.w, c.h, c.srcPitch, c.dstPitch, static_cast<uint32_t>(c.kind), c.stride, c.srcX, c.srcY };
+    g->SetComputeRootSignature(rs);
+    g->SetPipelineState(pso);
+    g->SetComputeRoot32BitConstants(0, 8, k, 0);
+    g->SetComputeRootShaderResourceView(1, src->GetGPUVirtualAddress());
+    g->SetComputeRootUnorderedAccessView(2, dst->GetGPUVirtualAddress());
+    g->Dispatch((c.w + 7) / 8, (c.h + 7) / 8, 1);
+}
+
 class Own;
 
 // IDXGISwapChain4 the app gets: our backbuffers and Present, everything else goes to the real swap chain.
@@ -4259,20 +4326,7 @@ private:
     // cur -> prev for the next app frame, and with it depth -> depth_prev when the pack keeps the previous frame's
     // depth (the multi-frame model's head reads it): both histories move together every app frame, camera cuts and
     // frames without generated ones included, so prev's colour and depth are always the same frame's.
-    void CopyToPrev(ID3D12GraphicsCommandList* g)
-    {
-        for (auto [dstSlot, srcSlot] : { std::pair<GenSlot, GenSlot> { GenSlot::Prev, GenSlot::Cur }, { GenSlot::DepthPrev, GenSlot::Depth } })
-        {
-            const GenBuf dst = pg->Buf(dstSlot), src = pg->Buf(srcSlot);
-            if (!dst.res)
-                continue;
-            Out(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
-            Out(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g->CopyBufferRegion(dst.res, 0, src.res, 0, dst.bytes);
-            Back(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Back(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
-        }
-    }
+    void CopyToPrev(ID3D12GraphicsCommandList* g) { RecordCopyToPrev(*pg, g); }
 
     // The frame is done with cur and prev: cur -> prev for the next one (after all its passes, on our queue). hold: the
     // next frame comes before this one's own present, so its picture goes into hold first (cur or keep is rewritten).
@@ -5622,22 +5676,7 @@ private:
     // that byte order here, SwapRB turns it round for the pack).
     void Copy(ID3D12GraphicsCommandList* g, ID3D12Resource* dst, ID3D12Resource* src, const Resource& px, bool toTexture = false)
     {
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-        fp.Footprint = { scDesc.Format, px.w, px.h, 1, static_cast<UINT>(px.pitch) };
-        if (!toTexture)
-        {
-            D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, s { src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-            d.PlacedFootprint = fp;
-            s.SubresourceIndex = 0;
-            g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
-        }
-        else
-        {
-            D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, s { src, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-            d.SubresourceIndex = 0;
-            s.PlacedFootprint = fp;
-            g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
-        }
+        CopyPitched(g, scDesc.Format, dst, src, px, toTexture);
     }
 
     bool CopyIn(ID3D12GraphicsCommandList* g, const xefg_swapchain_d3d12_resource_data_t& rd, ID3D12Resource* dst, const Resource& pr, const char* what,
@@ -5771,14 +5810,8 @@ private:
             return true;
         if (convFailed)
             return false;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};
-        if (SUCCEEDED(dev->CreateRootSignature(0, g_xefgConvertCS, sizeof(g_xefgConvertCS), IID_PPV_ARGS(&convRs))))
-        {
-            pd.pRootSignature = convRs;
-            pd.CS = { g_xefgConvertCS, sizeof(g_xefgConvertCS) };
-            if (SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&convPso))))
-                return true;
-        }
+        if (MakeConvertPipeline(dev, convRs, convPso))
+            return true;
         XLog("tag: the format conversion pipeline could not be made - motion / depth in other formats ignored");
         convFailed = true;
         return false;
@@ -5795,15 +5828,9 @@ private:
             ID3D12Resource* dst = ci == 0 ? stMv[j.set] : stDepth[j.set];
             if (c.kind < 0 || !src || !dst || !convPso)
                 continue;
-            const uint32_t k[8] = { c.w, c.h, c.srcPitch, c.dstPitch, static_cast<uint32_t>(c.kind), c.stride, c.srcX, c.srcY };
             Barrier(g, src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             Barrier(g, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            g->SetComputeRootSignature(convRs);
-            g->SetPipelineState(convPso);
-            g->SetComputeRoot32BitConstants(0, 8, k, 0);
-            g->SetComputeRootShaderResourceView(1, src->GetGPUVirtualAddress());
-            g->SetComputeRootUnorderedAccessView(2, dst->GetGPUVirtualAddress());
-            g->Dispatch((c.w + 7) / 8, (c.h + 7) / 8, 1);
+            RecordConvert(g, convRs, convPso, c, src, dst);
             Barrier(g, dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); // CopyFrame's copy next
         }
     }

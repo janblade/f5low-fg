@@ -26,9 +26,11 @@
 #include <vector>
 
 #define XEFG_SWAPCHAIN_EXPORT_API
+#define F5LOW_FRAMES_EXPORTS
 #include "intel_file_source.h"
 #include "pack_build.h"
 #include "xefg_own.h"
+#include "frames_only.h"
 #include "generators/dlssg.h"
 #include "generators/intel.h"
 #include "xefg_version.h"
@@ -2284,6 +2286,125 @@ DWORD WINAPI DredOn(void*)
     else
         Log("dred: could not be turned on");
     return 0;
+}
+
+// ---- Not Intel's API: the frames-only API (include/f5low_frames.h, src/frames_only.h, docs/GENERATORS.md "Frames only API") ----
+// The own generator without a swap chain: the host owns presenting and pacing. Nothing here touches the XeFG contexts (g_own).
+static thread_local std::string t_framesCreateError;    // why the last f5lowFramesCreate of this thread failed (f5lowFramesLastError(null))
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesCreate(const F5LowFramesCreateInfo* info, F5LowFramesContext* out)
+{
+    try
+    {
+        if (out)
+            *out = nullptr;
+        t_framesCreateError.clear();
+        const auto fail = [&](F5LowFramesResult r, const std::string& why) {
+            t_framesCreateError = why;
+            Log("frames: create failed (%d): %s", static_cast<int>(r), why.c_str());
+            return r;
+        };
+        if (!info || !out)
+            return fail(F5LOW_FRAMES_ERROR_ARGUMENT, "null info or out");
+        if (const std::string e = xefgown::FramesCtx::CheckCreate(*info); !e.empty())
+            return fail(F5LOW_FRAMES_ERROR_ARGUMENT, e);
+        // NVIDIA only: a CUDA device behind the adapter, and one the DLL's own kernels run on
+        const int have = GpuSm(info->device);
+        if (const std::string misfit = FitReason(have, BundleNeedSm()); !misfit.empty())
+            return fail(F5LOW_FRAMES_ERROR_UNSUPPORTED, misfit);
+        xefgown::FramesCtx::Params p;
+        p.dev = info->device;
+        p.w = info->width;
+        p.h = info->height;
+        p.rw = info->renderWidth;
+        p.rh = info->renderHeight;
+        p.fmt = info->colorFormat;
+        p.maxGen = info->maxGenerated;
+        p.initFlags = ((info->flags & F5LOW_FRAMES_FLAG_DEPTH_INVERTED) ? XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH : 0u) |
+                      ((info->flags & F5LOW_FRAMES_FLAG_MOTION_JITTERED) ? XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV : 0u);
+        // the pack: an explicit one (folder, embedded), else built in memory from the player's libxess_fg.dll on the pack thread
+        p.packDir = ExplicitPackDir();
+        if (p.packDir.empty())
+        {
+            p.packDir = xefgpack::kBuiltDir;
+            StartPackBuild();
+            p.packPoll = &PackPoll;
+            p.packFit = [have] { return FitReason(have, PackNeedSm(xefgpack::kBuiltDir)); };
+        }
+        else
+        {
+            const std::string dir = p.packDir;
+            p.packFit = [have, dir] { return FitReason(have, PackNeedSm(dir)); };
+        }
+        auto ctx = std::make_unique<xefgown::FramesCtx>(std::move(p));
+        if (!ctx->Start())
+            return fail(F5LOW_FRAMES_ERROR_DEVICE, ctx->LastError());
+        *out = reinterpret_cast<F5LowFramesContext>(ctx.release());
+        return F5LOW_FRAMES_OK;
+    }
+    catch (...)
+    {
+        t_framesCreateError = "an exception in f5lowFramesCreate";
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesBuildStatus(F5LowFramesContext context)
+{
+    try
+    {
+        return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->BuildStatus() : F5LOW_FRAMES_ERROR_ARGUMENT;
+    }
+    catch (...)
+    {
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesGenerate(F5LowFramesContext context, const F5LowFramesInput* input, F5LowFramesOutput* output)
+{
+    try
+    {
+        return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->Generate(input, output) : F5LOW_FRAMES_ERROR_ARGUMENT;
+    }
+    catch (...)
+    {
+        Log("frames: an exception in f5lowFramesGenerate");
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesResize(F5LowFramesContext context, uint32_t width, uint32_t height, DXGI_FORMAT colorFormat, uint32_t flags)
+{
+    try
+    {
+        return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->Resize(width, height, colorFormat, flags) : F5LOW_FRAMES_ERROR_ARGUMENT;
+    }
+    catch (...)
+    {
+        Log("frames: an exception in f5lowFramesResize");
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API void f5lowFramesDestroy(F5LowFramesContext context)
+{
+    try
+    {
+        if (context)
+        {
+            delete reinterpret_cast<xefgown::FramesCtx*>(context);
+            Log("frames: context destroyed");
+        }
+    }
+    catch (...)
+    {
+    }
+}
+
+F5LOW_FRAMES_API const char* f5lowFramesLastError(F5LowFramesContext context)
+{
+    return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->LastError() : t_framesCreateError.c_str();
 }
 
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
