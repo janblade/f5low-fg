@@ -191,6 +191,9 @@ F5LOW_PACER_API int32_t f5lowPacerBatchDone(F5LowPacer p, const F5LowPacerBatch*
 F5LOW_PACER_API int32_t f5lowPacerGetInfo(F5LowPacer p, F5LowPacerInfo* out);
 
 // ---- the same timing helpers the D3D12 presenter uses ----
+// The level of this API in the DLL: 1 = the first release, 2 = F5LowPacerCreateInfo::fixedPacing and ::gate are applied. A DLL without
+// this export is level 1 (it accepts the larger struct and ignores the two fields: V-Sync batches are timed).
+F5LOW_PACER_API uint32_t f5lowPacerApiLevel(void);
 F5LOW_PACER_API int64_t f5lowPacerNowTicks(void);      // QPC
 F5LOW_PACER_API int64_t f5lowPacerTicksPerSecond(void);
 // Sleeps until a QPC time: a high-resolution timer for all but the last half millisecond, then a spin. QPC clock only.

@@ -750,7 +750,11 @@ int main(int argc, char** argv)
             wrong.fixedPacing = 3;
             q = nullptr;
             CHECK(Create(&wrong, &q) == F5LOW_PACER_ERROR_ARGUMENT && !q, "fixedPacing 3");
-            printf("  exports: FixedPacing / gate resolution, v1 structSize: ok"), puts("");
+            {
+            auto Level = reinterpret_cast<decltype(&f5lowPacerApiLevel)>(GetProcAddress(dll, "f5lowPacerApiLevel"));
+            CHECK(Level != nullptr && Level() == 2, "f5lowPacerApiLevel");
+        }
+        printf("  exports: FixedPacing / gate resolution, v1 structSize, api level: ok"), puts("");
         }
     }
 

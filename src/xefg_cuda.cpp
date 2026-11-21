@@ -2565,6 +2565,7 @@ F5LOW_PACER_API int32_t f5lowPacerGetInfo(F5LowPacer p, F5LowPacerInfo* out)
         return F5LOW_PACER_OK;
     });
 }
+F5LOW_PACER_API uint32_t f5lowPacerApiLevel(void) { return 2; }
 F5LOW_PACER_API int64_t f5lowPacerNowTicks(void) { return pacewait::NowQpc(); }
 F5LOW_PACER_API int64_t f5lowPacerTicksPerSecond(void) { return static_cast<int64_t>(pacewait::FreqQpc()); }
 F5LOW_PACER_API void f5lowPacerWaitUntil(int64_t qpcTicks) { pacewait::WaitUntilQpc(qpcTicks); }
