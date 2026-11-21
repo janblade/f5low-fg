@@ -26,9 +26,13 @@
 #include <vector>
 
 #define XEFG_SWAPCHAIN_EXPORT_API
+#define F5LOW_FRAMES_EXPORTS
 #include "intel_file_source.h"
 #include "pack_build.h"
 #include "xefg_own.h"
+#include "frames_only.h"
+#include "pace_api.h"
+#include "pace_wait.h"
 #include "generators/dlssg.h"
 #include "generators/intel.h"
 #include "xefg_version.h"
@@ -2284,6 +2288,299 @@ DWORD WINAPI DredOn(void*)
     else
         Log("dred: could not be turned on");
     return 0;
+}
+
+// ---- Not Intel's API: the frames-only API (include/f5low_frames.h, src/frames_only.h, docs/GENERATORS.md "Frames only API") ----
+// The own generator without a swap chain: the host owns presenting and pacing. Nothing here touches the XeFG contexts (g_own).
+static thread_local std::string t_framesCreateError;    // why the last f5lowFramesCreate of this thread failed (f5lowFramesLastError(null))
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesCreate(const F5LowFramesCreateInfo* info, F5LowFramesContext* out)
+{
+    try
+    {
+        if (out)
+            *out = nullptr;
+        t_framesCreateError.clear();
+        const auto fail = [&](F5LowFramesResult r, const std::string& why) {
+            t_framesCreateError = why;
+            Log("frames: create failed (%d): %s", static_cast<int>(r), why.c_str());
+            return r;
+        };
+        if (!info || !out)
+            return fail(F5LOW_FRAMES_ERROR_ARGUMENT, "null info or out");
+        if (const std::string e = xefgown::FramesCtx::CheckCreate(*info); !e.empty())
+            return fail(F5LOW_FRAMES_ERROR_ARGUMENT, e);
+        // NVIDIA only: a CUDA device behind the adapter, and one the DLL's own kernels run on
+        const int have = GpuSm(info->device);
+        if (const std::string misfit = FitReason(have, BundleNeedSm()); !misfit.empty())
+            return fail(F5LOW_FRAMES_ERROR_UNSUPPORTED, misfit);
+        xefgown::FramesCtx::Params p;
+        p.dev = info->device;
+        p.w = info->width;
+        p.h = info->height;
+        p.rw = info->renderWidth;
+        p.rh = info->renderHeight;
+        p.fmt = info->colorFormat;
+        p.maxGen = info->maxGenerated;
+        p.gpuSm = have;
+        p.initFlags = ((info->flags & F5LOW_FRAMES_FLAG_DEPTH_INVERTED) ? XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH : 0u) |
+                      ((info->flags & F5LOW_FRAMES_FLAG_MOTION_JITTERED) ? XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV : 0u);
+        // the pack: an explicit one (folder, embedded), else built in memory from the player's libxess_fg.dll on the pack thread
+        p.packDir = ExplicitPackDir();
+        if (p.packDir.empty())
+        {
+            p.packDir = xefgpack::kBuiltDir;
+            StartPackBuild();
+            p.packPoll = &PackPoll;
+            p.packFit = [have] { return FitReason(have, PackNeedSm(xefgpack::kBuiltDir)); };
+        }
+        else
+        {
+            const std::string dir = p.packDir;
+            p.packFit = [have, dir] { return FitReason(have, PackNeedSm(dir)); };
+        }
+        auto ctx = std::make_unique<xefgown::FramesCtx>(std::move(p));
+        if (!ctx->Start())
+            return fail(F5LOW_FRAMES_ERROR_DEVICE, ctx->LastError());
+        *out = reinterpret_cast<F5LowFramesContext>(ctx.release());
+        return F5LOW_FRAMES_OK;
+    }
+    catch (...)
+    {
+        t_framesCreateError = "an exception in f5lowFramesCreate";
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesBuildStatus(F5LowFramesContext context)
+{
+    try
+    {
+        return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->BuildStatus() : F5LOW_FRAMES_ERROR_ARGUMENT;
+    }
+    catch (...)
+    {
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesGenerate(F5LowFramesContext context, const F5LowFramesInput* input, F5LowFramesOutput* output)
+{
+    try
+    {
+        return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->Generate(input, output) : F5LOW_FRAMES_ERROR_ARGUMENT;
+    }
+    catch (...)
+    {
+        Log("frames: an exception in f5lowFramesGenerate");
+        try
+        {
+            if (context)
+                reinterpret_cast<xefgown::FramesCtx*>(context)->FencesOnError(input, output);     // the fences still go through
+        }
+        catch (...)
+        {
+        }
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API F5LowFramesResult f5lowFramesResize(F5LowFramesContext context, uint32_t width, uint32_t height, DXGI_FORMAT colorFormat, uint32_t flags)
+{
+    try
+    {
+        return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->Resize(width, height, colorFormat, flags) : F5LOW_FRAMES_ERROR_ARGUMENT;
+    }
+    catch (...)
+    {
+        Log("frames: an exception in f5lowFramesResize");
+        return F5LOW_FRAMES_ERROR_INTERNAL;
+    }
+}
+
+F5LOW_FRAMES_API void f5lowFramesDestroy(F5LowFramesContext context)
+{
+    try
+    {
+        if (context)
+        {
+            delete reinterpret_cast<xefgown::FramesCtx*>(context);
+            Log("frames: context destroyed");
+        }
+    }
+    catch (...)
+    {
+    }
+}
+
+F5LOW_FRAMES_API const char* f5lowFramesLastError(F5LowFramesContext context)
+{
+    return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->LastError() : t_framesCreateError.c_str();
+}
+
+// ---- Not Intel's API: the pacer (include/f5low_pacer.h, src/pace_api.h, docs/GENERATORS.md "Frames only API") ----
+// The own presenter's pacing as a CPU-only API for a host that presents itself. The settings are read as the D3D12 context reads them.
+// Every export is guarded: an exception is F5LOW_PACER_ERROR_INTERNAL; a structSize below the version-1 size is an argument error (larger: a newer host).
+namespace
+{
+template <class S> bool SizeOk(const S* s) { return s && s->structSize >= sizeof(S); }
+template <class F> int32_t PacerGuard(F f)
+{
+    try
+    {
+        return f();
+    }
+    catch (...)
+    {
+        return F5LOW_PACER_ERROR_INTERNAL;
+    }
+}
+pacecore::Pacer* AsPacer(F5LowPacer p) { return reinterpret_cast<pacecore::Pacer*>(p); }
+} // namespace
+
+F5LOW_PACER_API int32_t f5lowPacerCreate(const F5LowPacerCreateInfo* info, F5LowPacer* out)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (out)
+            *out = nullptr;
+        // the first release of the struct ends at refreshHz: an older host passes that size and gets fixedPacing 0, gate 0
+        if (!out || !info || info->structSize < F5LOW_PACER_CREATEINFO_SIZE_V1 || info->apiVersion != F5LOW_PACER_API_VERSION || !info->maxGenerated ||
+            info->maxGenerated > F5LOW_PACER_MAX_GENERATED)
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const bool haveFixed = info->structSize >= sizeof(F5LowPacerCreateInfo);
+        if (haveFixed && info->fixedPacing > 2)
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        pacecore::Config c;
+        c.ticksPerSecond = info->ticksPerSecond > 0 ? static_cast<double>(info->ticksPerSecond) : pacewait::FreqQpc();
+        c.gpuSm = info->gpuSm;
+        c.maxGenerated = info->maxGenerated;
+        c.vrr = (info->flags & F5LOW_PACER_FLAG_VRR) != 0;
+        c.hostCanMeter = (info->flags & F5LOW_PACER_FLAG_HOST_CAN_METER) != 0;
+        c.burstCapable = (info->flags & F5LOW_PACER_FLAG_BURST_CAPABLE) != 0;
+        c.refreshHz = info->refreshHz;
+        c.flipMetering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "auto");
+        const std::string pacingText = Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "");
+        c.driverPacing = pacingText.empty() ? -1 : std::clamp(atoi(pacingText.c_str()), 0, 2);
+        c.flipBurst = Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1";
+        c.paceLeadFixedMs = PaceLeadSetting(&c.paceLeadAuto);
+        std::string lead = Setting("XEFG_CUDA_FLIPLEADUS", "FlipLeadUs", "auto");
+        lead.erase(0, lead.find_first_not_of(" \t\r\n"));
+        lead.erase(lead.find_last_not_of(" \t\r\n") + 1);
+        c.flipLeadAuto = lead.empty() || lead == "auto";
+        if (!c.flipLeadAuto)
+            c.flipLeadUs = static_cast<uint32_t>(std::clamp(atoi(lead.c_str()), 0, 8000));
+        {
+            // FixedPacing as D3D12 reads it: the setting, the host's field over it, the host's gate over both (xefg_own.h FixedTimer)
+            const std::string fp = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "auto");
+            const unsigned char own = fp == "timer" ? pacesched::kFixedTimer : fp == "display" ? pacesched::kFixedDisplay : pacesched::kFixedAuto;
+            const unsigned char mode = pacesched::HostFixedMode(haveFixed ? info->fixedPacing : 0u, own);
+            const bool gate = haveFixed && info->gate != 0;
+            c.fixedDisplay = !pacesched::FixedTimer(mode, gate);
+            Log("pacer: FixedPacing %s (host field %u, setting %s, host gate %s)", c.fixedDisplay ? "display" : "timer", haveFixed ? info->fixedPacing : 0u,
+                 fp.c_str(), gate ? "on" : "off");
+        }
+        auto* p = new pacecore::Pacer(c);
+        *out = reinterpret_cast<F5LowPacer>(p);
+        Log("pacer: created, GPU sm_%d, host %s meter, flip metering %s (FlipMetering=%s), burst %s, clock %.0f ticks/s", info->gpuSm, c.hostCanMeter ? "can" : "cannot",
+            p->Metering() ? "on" : "off", c.flipMetering.c_str(), c.burstCapable ? "capable" : "not capable", c.ticksPerSecond);
+        return F5LOW_PACER_OK;
+    });
+}
+F5LOW_PACER_API void f5lowPacerDestroy(F5LowPacer p)
+{
+    PacerGuard([&]() -> int32_t {
+        if (p)
+        {
+            pacewait::RaiseTimer(AsPacer(p)->timerMu, AsPacer(p)->timerHold, false);
+            delete AsPacer(p);
+        }
+        return 0;
+    });
+}
+F5LOW_PACER_API int32_t f5lowPacerFrameArrived(F5LowPacer p, const F5LowPacerFrame* frame, F5LowPacerBatch* batch)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(frame) || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const uint32_t ss = batch->structSize;
+        AsPacer(p)->FrameArrived(*frame, *batch);
+        batch->structSize = ss;
+        return F5LOW_PACER_OK;
+    });
+}
+F5LOW_PACER_API int32_t f5lowPacerTarget(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, F5LowPacerTarget* out)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch) || !SizeOk(out))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const uint32_t ss = out->structSize;
+        AsPacer(p)->Target(*batch, k, *out);
+        out->structSize = ss;
+        return F5LOW_PACER_OK;
+    });
+}
+F5LOW_PACER_API int32_t f5lowPacerStale(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, int64_t nowTicks, uint32_t nextGameFrameDone)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        return AsPacer(p)->Stale(*batch, k, nowTicks, nextGameFrameDone != 0);
+    });
+}
+F5LOW_PACER_API int32_t f5lowPacerMeterResult(F5LowPacer p, F5LowPacerBatch* batch, int32_t status, uint32_t noIndependentFlip)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        AsPacer(p)->MeterResult(*batch, status, noIndependentFlip != 0);
+        return F5LOW_PACER_OK;
+    });
+}
+F5LOW_PACER_API int32_t f5lowPacerPresented(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, const F5LowPacerPresented* what)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch) || !SizeOk(what))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        AsPacer(p)->Presented(*batch, k, *what);
+        return F5LOW_PACER_OK;
+    });
+}
+F5LOW_PACER_API int32_t f5lowPacerBatchDone(F5LowPacer p, const F5LowPacerBatch* batch)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        AsPacer(p)->BatchDone(*batch);
+        return F5LOW_PACER_OK;
+    });
+}
+F5LOW_PACER_API int32_t f5lowPacerGetInfo(F5LowPacer p, F5LowPacerInfo* out)
+{
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(out))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const uint32_t ss = out->structSize;
+        AsPacer(p)->Info(*out);
+        out->structSize = ss;
+        return F5LOW_PACER_OK;
+    });
+}
+F5LOW_PACER_API uint32_t f5lowPacerApiLevel(void) { return 2; }
+F5LOW_PACER_API int64_t f5lowPacerNowTicks(void) { return pacewait::NowQpc(); }
+F5LOW_PACER_API int64_t f5lowPacerTicksPerSecond(void) { return static_cast<int64_t>(pacewait::FreqQpc()); }
+F5LOW_PACER_API void f5lowPacerWaitUntil(int64_t qpcTicks) { pacewait::WaitUntilQpc(qpcTicks); }
+F5LOW_PACER_API void f5lowPacerTimerRaise(F5LowPacer p, uint32_t on)
+{
+    PacerGuard([&]() -> int32_t {
+        if (p)
+            pacewait::RaiseTimer(AsPacer(p)->timerMu, AsPacer(p)->timerHold, on != 0);
+        return 0;
+    });
+}
+
+F5LOW_FRAMES_API int32_t f5lowFramesGpuSm(F5LowFramesContext context)
+{
+    return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->GpuSm() : 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)

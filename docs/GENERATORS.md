@@ -40,7 +40,7 @@ made. Switching to XeFG Tensor is the player's choice, never automatic. The gene
 
 ## Two backend shapes
 
-Every library falls in one of two shapes. The code carries the present sink (dlssg); the frames-only shape is not built.
+Every library falls in one of two shapes. The code carries the present sink (dlssg); the frames-only shape exists for the own generator only, as the swapchain-less "Frames only API" below.
 
 **Frames only** (`own`, `fsr` through its dispatch): the host calls the generator once per app frame with the
 inputs and the interpolation points `t = k / (n + 1)`, and gets n frames back on the GPU. The host paces and
@@ -436,9 +436,84 @@ that. A generator without a pack surface cannot be driven yet, so `Create` refus
   dispatch (`outputs[]`, `numGeneratedFrames`, `frameID` +1 each frame); the sink shape only if the dispatch path
   turns out unusable on its own. Opens F5Low on AMD and Intel GPUs.
 
+## Frames only API
+
+`include/f5low_frames.h` (six exports of f5low.dll, `f5lowFramesCreate` / `BuildStatus` / `Generate` / `Resize` / `Destroy` / `LastError`; the header is the
+contract) is the frames-only shape for the own generator: no swap chain, no presenter, no pacing. The host (a Vulkan output, a test) owns presenting and
+pacing and hands over one app frame at a time; f5low writes the 1 to 5 in-between frames into textures the host gives, on the host's D3D12 device.
+`src/frames_only.h` (`FramesCtx`) is the context; the exports are at the end of `src/xefg_cuda.cpp`.
+
+- **Pack and GPU**: the same as the XeFG API. The pack is built in memory on the pack thread from the player's libxess_fg.dll (`XEFG_CUDA_INTEL_LIBRARY`
+  and the other places `RealLibraryPath` looks); a context builds its generator on a background thread of its own once the pack is ready, for the display
+  size and render size of `F5LowFramesCreateInfo`. Until then `Generate` returns `NOT_READY` (history dropped) after passing the fences. A GPU
+  without a CUDA device behind its adapter (not NVIDIA), or older than the kernels need, is refused by `Create` (`ERROR_UNSUPPORTED`); a libxess_fg we
+  do not know ends in `BuildStatus` = `ERROR_BUILD`. There is no forwarding to Intel's library here, and no `intel` / `dlssg` generator.
+- **Queue**: the context makes one queue of its own on the host's device (direct, high priority; `F5LOW_FRAMES_QUEUE=compute` makes it a compute queue:
+  a test knob, the passes and copies need nothing graphics). Direct is the default because it is what the own generator's lists run on by default
+  everywhere else (`GenQueue` off/direct); both pass `tests\frames_only_test.cpp`. All the work of an app frame is on that queue, in order, so
+  nothing needs a barrier between lists; the host's queues are untouched.
+- **Fences**: `Generate` makes the queue wait on `readyFence`, records and submits the copy-in list, signals `consumedFence` right after it (the
+  inputs are copied into the pack's own buffers, the host may overwrite them), then one list per generated frame (the pass, then the frame copied into
+  `targets[k]`), signals `doneFence`, then a last list copies cur -> prev. `consumedFence` / `doneFence` are signalled on every return except a null
+  pointer, also for `NOT_READY` and errors, so a host can always wait on them. `Generate` waits for the GPU only to rebuild: when the context's 16
+  command allocators are still in flight (the host runs ahead; a frame needs count + 2) it returns `NOT_READY` without recording (history dropped).
+  It makes all `count` generated frames or none (t = (k + 1) / (count + 1)); a pack without per-pass patches refuses count > 1.
+- **Shared with the XeFG path** (factored out of `class Own` in `src/xefg_own.h`; the XeFG path records the same commands in the same order, checked
+  bit for bit with `XEFG_CUDA_DUMP` runs of `tests\repro_test.cpp`): `CopyPitched` (texture <-> pitched pack buffer), `RecordCopyToPrev`,
+  `MakeConvertPipeline` and `RecordConvert` (the motion / depth format conversion, `xefg_convert.hlsl`). The generator itself is `OwnGenerator`
+  (`PreparePass`, `RecordPassInto`, `SwapInputsBgra`), built the first time for the context's sizes through `GenBuild::firstSizes`.
+- **Inputs**: motion R16G16_FLOAT as it is, the other formats of `src/xefg_formats.h` through the conversion; depth likewise (a region of a depth-stencil
+  texture through the conversion). Motion and depth go straight into the pack's buffers, no staging set (the context's queue is their only user).
+  `hudless`, when the pack has the UI inputs, makes UI mode 4 (hudless interpolated, the finished picture as the output layer's back buffer), else it is
+  ignored with one log line. `depthInverted`, `motionJittered` and the motion size pick the pack's variant and size: a frame with other values rebuilds
+  the generator (about 0.2 s; that `Generate` waits for the GPU and makes no frames). The render size is baked into the pack's kernels and buffers, so a
+  smaller motion area is another pack, not a sub-rect of a bigger one; it must not exceed the display size. The camera fields are not used (the XeFG
+  path does not use them either).
+- **History**: the first frame, `reset = 1`, a `frameId` that is not the last one + 1, a rebuild, `NOT_READY` and `Resize` take the frame as history and
+  generate nothing (`generated` 0, result OK).
+- **Test**: `tests\build_frames_only_test.ps1`, then `build\frames_only_test.exe build\f5low.dll` (needs an NVIDIA GPU and the player's libxess_fg.dll):
+  a moving bar, counts 1 and 3, positions within 1 px, fences, an argument error, a frame gap, `Resize`. `FRAMES_DEBUG=1` runs it under the debug layer.
+
+### Pacer export (`include/f5low_pacer.h`)
+
+A host that presents itself (OptiScaler's Vulkan output) must space the generated frames. Instead of its own `interval / (n + 1)`, it calls the pacer
+of f5low, a CPU-only C API (`f5lowPacerCreate` / `FrameArrived` / `Target` / `Stale` / `MeterResult` / `Presented` / `BatchDone` / `GetInfo`, plus
+`f5lowPacerNowTicks`, `WaitUntil`, `TimerRaise`) with no D3D12, DXGI or Vulkan types. It is the same code the D3D12 presenter runs: `src/pace_api.h`
+(`pacecore::Pacer`) keeps the presenter's pacing state and calls the shared functions in `src/pace_sched.h`, `pace_lead.h`, `oob_driver.h` and
+`pace_wait.h`, which `xefg_own.h` (class `Own`) calls too (`ReadyMs`, `NextScheduleBase`, `StepTicks`, `ScheduleTarget`, `BatchTarget`, `ObserveBatch`,
+`FlipSkip`, `FlipBatchMs`, `FlipLeadTicks`, `LoadEma`, `WaitUntilQpc`, `RaiseTimer`). A fix to one of them reaches the Vulkan host with the DLL.
+The settings are the D3D12 context's: `FlipMetering=` (`XEFG_CUDA_FLIPMETERING`), `DriverPacing=`, `FlipBurst=`, `PaceLead=`, `FlipLeadUs=`, `FixedPacing=`.
+`f5lowFramesGpuSm(context)` gives the `gpuSm` the pacer's flip metering decision needs (`FlipMetering=auto`: on from sm_100, RTX 50).
+
+| D3D12 presenter | Pacer call |
+|---|---|
+| `Pick`: ready-to-ready time into `ReadyInterval` (eased 1/10, raised at once after two slow frames, lowered after three fast ones), `ClockObserve`, `NextBase` (a clock of its own, drawn a fifth towards the ready stamp), the GPU load share | `FrameArrived(arriveTicks, readyTicks, generated, displayPaced)` |
+| `Submit`: the step (`interval / (n + 1)`), the lead frozen for the batch (`pacelead::Lead`, none under V-Sync) | the returned `F5LowPacerBatch` (`baseTicks`, `stepTicks`, `leadTicks`) |
+| `MeterBatch`: flip metering per batch (not generating / V-Sync / refused / more than 8 frames / fewer than 24 frames of known frame time: no), the batch time (growth limited to 1/8 per batch) | `meterWanted`, `numFramesPerBatch`, `batchMs`; the driver's answer to `MeterResult` (8 refusals in a row: off for the context) |
+| `Target(f, k)` = `Bound(base + Offset(lead, step, k))`, half a step to two steps after the last present | `Target(batch, k)` -> `targetTicks` |
+| `PresentReal`: sleep to the target less the flip lead (metered frames after the first go `FlipLeadUs` early, at most 0.45 of a step); the burst (metered, `DriverPacing`'s load rule) is not waited for | `releaseTicks` (0: do not sleep), flags `BURST`, `METERED`, `PACED` |
+| `PresentReal` `LateGen=auto` stale rule (no flip metering): not presented when the game's next frame is done and the slot is half a step past | `Stale(batch, k, nowTicks, nextGameFrameDone)` |
+| `PresentReal` tail: `lastAnyPresent = lastShown = t`; a dropped frame keeps its slot; `Show`: a generated frame whose own GPU work came out late raises the lead; `Lead::EndFrame` | `Presented(batch, k, presentTicks, gpuDoneTicks, flags)`, `BatchDone` |
+| `WaitUntil` (high-resolution timer, then a spin), `SetTimerRaised` (1 ms system timer while generating) | `f5lowPacerWaitUntil`, `f5lowPacerTimerRaise` |
+
+Create flags: `F5LOW_PACER_FLAG_HOST_CAN_METER` (without it no metering, as D3D12 without `SetFlipConfig`) and `F5LOW_PACER_FLAG_BURST_CAPABLE` (D3D12's
+`BurstCapable()`; the burst also needs `DriverPacing` / `FlipBurst`); both default off. Every struct carries `structSize`; `f5lowPacerMeterResult` takes the driver's
+answer (Vulkan: `presentConfigFeedback != 0` or a stripped extension is a refusal). The header has the full call order.
+
+Not expressible host-agnostically, so not in the pacer (the host does these with its own objects): waiting for a frame's GPU work (`WaitGpu`, the
+`gpuOk` timeout drop of `LateGen`), the swap chain's frame latency token and its debt (`tokenDebt`, the DXGI waitable object), `GenBlock` and the
+generation lane's queue waits (`BlockDone`, `blockFence`, `aheadRead`), `Consumed`/`retireFence`, the NVAPI calls themselves (`SetFlipConfig`,
+Reflex Sync with the multiplier, out of band markers; the host uses `VK_NV_present_metering` with `numFramesPerBatch` / `batchMs`), XeLL, and the
+`DriverPacing=1` arming machine (`PacingMachine`: its settle frames exist for OptiScaler's cap export and Reflex Sync, so on the pacer the load rule
+switches `burstNow` directly). The refresh rate and the VRR flag are accepted but not read: the D3D12 presenter's pacing does not read them either.
+`LateGen=drop` / `compress` / `early` (experiments) and the clock pacer (`Pacer=clock`, CUDA path) are not exported. The median interval mode of
+`feat/pacer-round2` is not in this branch, so it is not here either; when it lands in `ReadyInterval` the pacer has it with no change.
+Host test: `tests\build_pacer_api_test.ps1 [-Dll build\f5low.dll]` (`tests\pacer_api_test.cpp`): synthetic timelines at 2X to 6X compared to a model of the
+presenter built from the same functions, evenness and ordering checks, the metering decision and plan, and (with the DLL) the exports.
+
 ## Not in the interface on purpose
 
-- Vulkan: the host is D3D12 (D3D11 and Vulkan games reach it through OptiScaler's bridges).
+- Vulkan: the swap chain API stays D3D12 (D3D11 games reach it through OptiScaler's bridge); a host that presents itself, such as a Vulkan output, uses the swapchain-less "Frames only API" above.
 - Upscaling: generators never upscale; OptiScaler does that before the frame reaches the host.
 
 ## Motion and depth formats

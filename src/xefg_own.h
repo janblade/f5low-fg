@@ -52,6 +52,7 @@
 #include "generators/own.h"
 #include "generators/stubs.h"
 #include "pace_lead.h"
+#include "pace_wait.h"
 #include "oob_driver.h"
 #include "pace_sched.h"
 #include "timer_raise.h"
@@ -134,6 +135,73 @@ inline DXGI_FORMAT SrgbTwin(DXGI_FORMAT f)
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
     default: return DXGI_FORMAT_UNKNOWN;
     }
+}
+
+// ---- recording helpers the host (Own) and the frames-only context (frames_only.h) share ----------------------------------------
+// Texture <-> pitched buffer of the pack's layout (output size, `fmt` the colour format: B8G8R8A8 stays in that byte order here,
+// SwapRB turns it round for the pack).
+inline void CopyPitched(ID3D12GraphicsCommandList* g, DXGI_FORMAT fmt, ID3D12Resource* dst, ID3D12Resource* src, const xefgpack::Resource& px,
+                        bool toTexture)
+{
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+    fp.Footprint = { fmt, px.w, px.h, 1, static_cast<UINT>(px.pitch) };
+    if (!toTexture)
+    {
+        D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, s { src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        d.PlacedFootprint = fp;
+        s.SubresourceIndex = 0;
+        g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+    }
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, s { src, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        d.SubresourceIndex = 0;
+        s.PlacedFootprint = fp;
+        g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+    }
+}
+
+// cur -> prev and depth -> depthPrev of the pack, for the next frame (after every pass of this one read them).
+inline void RecordCopyToPrev(IPackGenerator& pg, ID3D12GraphicsCommandList* g)
+{
+    for (auto [dstSlot, srcSlot] : { std::pair<GenSlot, GenSlot> { GenSlot::Prev, GenSlot::Cur }, { GenSlot::DepthPrev, GenSlot::Depth } })
+    {
+        const GenBuf dst = pg.Buf(dstSlot), src = pg.Buf(srcSlot);
+        if (!dst.res)
+            continue;
+        pg.Out(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
+        pg.Out(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g->CopyBufferRegion(dst.res, 0, src.res, 0, dst.bytes);
+        pg.Back(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        pg.Back(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+}
+
+// The conversion pipeline (xefg_convert.hlsl, root signature in its bytecode). False: it could not be made.
+inline bool MakeConvertPipeline(ID3D12Device* dev, ID3D12RootSignature*& rs, ID3D12PipelineState*& pso)
+{
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};
+    if (SUCCEEDED(dev->CreateRootSignature(0, g_xefgConvertCS, sizeof(g_xefgConvertCS), IID_PPV_ARGS(&rs))))
+    {
+        pd.pRootSignature = rs;
+        pd.CS = { g_xefgConvertCS, sizeof(g_xefgConvertCS) };
+        if (SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso))))
+            return true;
+    }
+    return false;
+}
+
+// One conversion's dispatch (src: the raw copy, readable by a shader; dst: a buffer a shader may write, both in their states already).
+inline void RecordConvert(ID3D12GraphicsCommandList* g, ID3D12RootSignature* rs, ID3D12PipelineState* pso, const Conversion& c, ID3D12Resource* src,
+                          ID3D12Resource* dst)
+{
+    const uint32_t k[8] = { c.w, c.h, c.srcPitch, c.dstPitch, static_cast<uint32_t>(c.kind), c.stride, c.srcX, c.srcY };
+    g->SetComputeRootSignature(rs);
+    g->SetPipelineState(pso);
+    g->SetComputeRoot32BitConstants(0, 8, k, 0);
+    g->SetComputeRootShaderResourceView(1, src->GetGPUVirtualAddress());
+    g->SetComputeRootUnorderedAccessView(2, dst->GetGPUVirtualAddress());
+    g->Dispatch((c.w + 7) / 8, (c.h + 7) / 8, 1);
 }
 
 class Own;
@@ -608,33 +676,7 @@ public:
     // A 1 ms system timer while generating (timer_raise.h): a game that never raises it has every Sleep(1) in the process
     // round up to the 15.6 ms tick, and generated frames are lost with it (NBA 2K27 with the timer forced back: 3.5 shown per rendered at 4x, 4.0 raised). DLSS-G does the same.
     // Called without mu: the first call in a process measures, up to some 50 ms.
-    void SetTimerRaised(bool on)
-    {
-        using TimerFn = UINT(WINAPI*)(UINT);
-        // Once for the process; winmm stays loaded. By name: a winmm.dll proxy forwards these two.
-        static const HMODULE winmm = LoadLibraryW(L"winmm.dll");
-        static const TimerFn begin = winmm ? reinterpret_cast<TimerFn>(GetProcAddress(winmm, "timeBeginPeriod")) : nullptr;
-        static const TimerFn end = winmm ? reinterpret_cast<TimerFn>(GetProcAddress(winmm, "timeEndPeriod")) : nullptr;
-        static const auto sleep1 = [] {
-            const long long t0 = Now();
-            Sleep(1);
-            return static_cast<double>(Now() - t0) * 1000.0 / freq();
-        };
-        static std::atomic<bool> measured { false };
-        if (!begin || !end)
-        {
-            if (on && !measured.exchange(true))
-                XLog("timer: no timeBeginPeriod in winmm.dll - the system timer stays as it is");
-            return;
-        }
-        std::lock_guard<std::mutex> lk(timerMu);
-        const bool first = on && !measured.exchange(true);
-        const double before = first ? (std::max)(sleep1(), sleep1()) : 0.0;
-        timerHold.Set(on, [&] { return begin(1) == 0; }, [&] { end(1); });
-        if (first)
-            XLog("timer: Sleep(1) took %.1f ms before the raise, %.1f ms with it (%s)", before, sleep1(),
-                 timerHold.Held() ? "1 ms requested" : "request refused");
-    }
+    void SetTimerRaised(bool on) { pacewait::RaiseTimer(timerMu, timerHold, on); }
 
     ~Own()
     {
@@ -1754,31 +1796,8 @@ private:
         }();
         return f;
     }
-    // Sleeps until a QPC time: a high-resolution waitable timer for all but the last half millisecond, then a
-    // spin. Sleep() alone would round up to the system timer tick (15.6 ms unless someone raised it).
-    static void WaitUntil(long long target)
-    {
-        static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        for (;;)
-        {
-            const double ms = static_cast<double>(target - Now()) * 1000.0 / freq();
-            if (ms <= 0)
-                return;
-            if (ms > 0.6 && timer)
-            {
-                LARGE_INTEGER due;
-                due.QuadPart = -static_cast<LONGLONG>((ms - 0.5) * 10000.0);       // relative, 100 ns units
-                if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0))
-                    WaitForSingleObject(timer, INFINITE);
-                else
-                    Sleep(0);
-            }
-            else if (ms > 2)
-                Sleep(1);
-            else
-                YieldProcessor();
-        }
-    }
+    // Sleeps until a QPC time (pace_wait.h).
+    static void WaitUntil(long long target) { pacewait::WaitUntilQpc(target); }
     // A stall on the application's side of a present (> 50 ms; its own time > 100 ms, so menus and loading under 20 fps do
     // not use up the lines): its own time before the call, our part under mu, the GPU backpressure wait, the wait for the
     // presenter queue. The frame number matches the presenter's "hitch:" lines.
@@ -2207,8 +2226,7 @@ private:
     // milliseconds, which taken as they are put the jitter into the gap between an app frame and the next generated one.
     long long PaceTarget(uint32_t k, uint32_t n) const
     {
-        const double step = ri.ms / static_cast<double>(n + 1) * freq() / 1000.0;
-        return Bound(schedBase + static_cast<long long>(k * step), static_cast<long long>(step));
+        return pacesched::ScheduleTarget(schedBase, ri.ms, n, k, freq(), lastAnyPresent);
     }
     // Whether the game frame `after` frames after j's (1: the next one) is finished on the GPU, read without waiting. Game frames are
     // numbered one by one (Job::frame = appFrame at the game's Present) and frame f is done when appFence reaches f + 1, so the frame is
@@ -2307,7 +2325,7 @@ private:
     double PresentReal(const Job& j, uint32_t k, uint32_t n, UINT sync, UINT flags, long long target = 0, long long rawTarget = 0, long long step = 0)
     {
         if (n > 0 && !step)
-            step = static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0);
+            step = pacesched::StepTicks(ri.ms, n, freq());
         if (n > 0 && !target)
         {
             target = PaceTarget(k, n);
@@ -2326,7 +2344,7 @@ private:
         // it to the schedule was measured worse in one game.
         const bool metered = Metered(j);
         const bool burst = oobdriver::BurstNow(Burst(), k, metered);
-        const long long lead = !burst && k > 1 && metered ? FlipLead(static_cast<long long>(ri.ms / static_cast<double>(n + 1) * freq() / 1000.0)) : 0;
+        const long long lead = !burst && k > 1 && metered ? FlipLead(pacesched::StepTicks(ri.ms, n, freq())) : 0;
         const long long t0 = Now(), before = lastShown;
         bool metered_ = false;
         // Flip metering is off for LateGen=auto when the settings say so (flipMetering, as the GPU resolved it), or when it was wanted but the
@@ -2695,7 +2713,7 @@ private:
         const long long ready = readyCount.load() > j.frame && readyCount.load() - j.frame <= kReady ? readyAt[j.frame % kReady] : Now();
         if (lastReady)
         {
-            const double ms = static_cast<double>(ready - lastReady) * 1000.0 / freq();
+            const double ms = pacesched::ReadyMs(ready, lastReady, freq());
             std::lock_guard<std::mutex> l(clkMu);
             ObserveReady(ms);
             ClockObserve(ms);
@@ -2703,8 +2721,7 @@ private:
         lastReady = ready;
         jobBase = ready;
         // The schedule's clock (PaceTarget); set anew when it is more than an interval off (a pause, the first frame).
-        const long long iv = static_cast<long long>(ri.ms * freq() / 1000.0);
-        schedBase = pacesched::NextBase(schedBase, ready, static_cast<long long>(paceLag * freq() / 1000.0), iv);
+        schedBase = pacesched::NextScheduleBase(schedBase, ready, paceLag, ri.ms, freq());
         // Where the presenter stands: how old the frame's ready stamp is, and how many app frames came after it.
         statStampAge += static_cast<double>(Now() - ready) * 1000.0 / freq();
         statBehind += static_cast<double>(submitted.load() - j.frame - 1);
@@ -2713,7 +2730,7 @@ private:
         // The GPU's share of the app interval (DriverPacing=1): how long after the game's Present call its GPU work finished, over the
         // app's interval (ri.ms, the smoothed ready-to-ready time), smoothed by 1/8.
         if (const double share = oobdriver::LoadShare(static_cast<double>(ready - j.arrive) * 1000.0 / freq(), ri.ms); share >= 0.0)
-            loadEma = loadSamples++ ? loadEma + (share - loadEma) / 8.0 : share;
+            loadEma = oobdriver::LoadEma(loadEma, loadSamples, share);
         PacingFrame(j);
         ++statJobs;
         catchUp = appFence->GetCompletedValue() >= j.frame + 2;
@@ -2772,7 +2789,7 @@ private:
         f.ready = jobBase;
         f.pickT = pickT;
         f.catchUp = catchUp;
-        f.step = static_cast<long long>(ri.ms / static_cast<double>(f.nGen + 1) * freq() / 1000.0);
+        f.step = pacesched::StepTicks(ri.ms, f.nGen, freq());
         // GenSpread on the CUDA path (PresentGenGated has the why): pass k > 1 waits on the stream until the present spread
         // places before it is released; this frame's presents come after those of the frame being shown (gateFrameEnd: a
         // frame taken early is submitted in the middle of the last one's presents).
@@ -2821,7 +2838,7 @@ private:
     // Frame k's present time (PaceTarget, on the frame's own schedule).
     long long Target(const Frame& f, uint32_t k) const
     {
-        return Bound(f.base + pacelead::Offset(f.lead, f.step, k), f.step);
+        return pacesched::BatchTarget(f.base, f.lead, f.step, k, lastAnyPresent);
     }
     // Half a step after the last present at the soonest, two steps after it at the latest: a frame the game handed over
     // after a stutter has its schedule set from that late frame, and it waited lag + a step more with its picture ready.
@@ -2848,8 +2865,8 @@ private:
         UINT reserved;
     };
     static constexpr UINT kFlipConfigVer2 = static_cast<UINT>(sizeof(FlipConfig)) | (2u << 16);
-    static constexpr UINT kFlipFeedbackNoIflip = 1, kFlipMaxBatch = 8, kFlipRefusals = 8, kFlipSamples = 24;  // (3 and 8: the first batch got the start-up frames' 11-13 ms of 33; clkBatch eases 1/8)
-    static constexpr double kFlipGrowth = 1.125;
+    static constexpr UINT kFlipFeedbackNoIflip = 1, kFlipMaxBatch = pacesched::kFlipMaxBatch, kFlipRefusals = pacesched::kFlipRefusals, kFlipSamples = pacesched::kFlipSamples;
+    static constexpr double kFlipGrowth = pacesched::kFlipGrowth;
     using SetFlipConfigFn = int(__cdecl*)(IUnknown* queue, UINT vidPnSource, FlipConfig* config);
     using NvQueryFn = void*(__cdecl*)(unsigned);
 
@@ -2868,12 +2885,8 @@ private:
     }
     // How early a metered frame after a batch's first is released. Auto: 2500 us at 180 out (5.56 ms spacing, 0.45 of it), less
     // as the spacing shrinks - a lead longer than the spacing queued the frames at 540+ out (harness fast6x). A set value wins.
-    static constexpr double kFlipLeadShare = 0.45;
-    long long FlipLead(long long spacing) const
-    {
-        const long long set = static_cast<long long>(flipLeadUs * freq() / 1e6);
-        return flipLeadAuto && spacing > 0 ? std::min(set, static_cast<long long>(kFlipLeadShare * static_cast<double>(spacing))) : set;
-    }
+    static constexpr double kFlipLeadShare = pacesched::kFlipLeadShare;
+    long long FlipLead(long long spacing) const { return pacesched::FlipLeadTicks(spacing, flipLeadUs, flipLeadAuto, freq()); }
 
     // fakenvapi (OptiScaler's own, or a game-folder nvapi64.dll) answers its private interface 0x21382138; NVIDIA's does not.
     static bool AnswersFakeQuery(NvQueryFn qi)
@@ -3424,9 +3437,7 @@ private:
             batch = clkBatch;
         }
         flipSamples = n ? flipSamples + 1 : 0;
-        const char* skip = !n ? "not generating" : DisplayPaced(j) ? "V-Sync" : flipRefused ? "refused by the driver"
-                         : n + 1 > kFlipMaxBatch ? "too many frames per batch" : flipSamples < kFlipSamples || batch <= 0 ? "frame time unknown"
-                         : nullptr;
+        const char* skip = pacesched::FlipSkip(n, DisplayPaced(j), flipRefused, flipSamples, batch);
         if (skip)
         {
             meteredFrame.store(0, std::memory_order_release);
@@ -3435,8 +3446,7 @@ private:
             return;
         }
         // One long frame must not hold the whole next batch to it: up by an eighth per batch at most.
-        if (flipOutputs == n + 1)
-            batch = std::min(batch, flipBatchMs * kFlipGrowth);
+        batch = pacesched::FlipBatchMs(batch, flipOutputs, flipBatchMs, n);
         FlipConfigure(n + 1, batch, nullptr);
         meteredFrame.store(flipMeteredNow ? j.frame + 1 : 0, std::memory_order_release);
     }
@@ -3497,30 +3507,7 @@ private:
 
     // The app frame's time on the GPU timeline (Pick): smoothed (1/8), a delta over 1.5x left out at most twice in a
     // row (one game stutter must not stretch the spacing for the frames after it), none outside 1-250 ms (set anew).
-    void ClockObserve(double ms)
-    {
-        if (ms < 1 || ms > 250)
-        {
-            clkBatch = clkVar = 0;
-            clkHitchRun = 0;
-            return;
-        }
-        if (clkBatch <= 0)
-        {
-            clkBatch = ms;
-            return;
-        }
-        if (ms > 1.5 * clkBatch && clkHitchRun < 2)
-        {
-            ++clkHitchRun;
-            ++statClkHitches;
-            return;
-        }
-        clkHitchRun = 0;
-        const double d = ms - clkBatch;
-        clkBatch += d / 8;
-        clkVar += (d * d - clkVar) / 8;
-    }
+    void ClockObserve(double ms) { pacesched::ObserveBatch(clkBatch, clkVar, clkHitchRun, statClkHitches, ms); }
 
     // Frame k's release time: one spacing after the last release, but no sooner than the delay the generated frames
     // need (clkTarget less the margin: after a game stutter the clock had run ahead of the frames) and no later than
@@ -4259,20 +4246,7 @@ private:
     // cur -> prev for the next app frame, and with it depth -> depth_prev when the pack keeps the previous frame's
     // depth (the multi-frame model's head reads it): both histories move together every app frame, camera cuts and
     // frames without generated ones included, so prev's colour and depth are always the same frame's.
-    void CopyToPrev(ID3D12GraphicsCommandList* g)
-    {
-        for (auto [dstSlot, srcSlot] : { std::pair<GenSlot, GenSlot> { GenSlot::Prev, GenSlot::Cur }, { GenSlot::DepthPrev, GenSlot::Depth } })
-        {
-            const GenBuf dst = pg->Buf(dstSlot), src = pg->Buf(srcSlot);
-            if (!dst.res)
-                continue;
-            Out(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
-            Out(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g->CopyBufferRegion(dst.res, 0, src.res, 0, dst.bytes);
-            Back(g, src.res, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Back(g, dst.res, D3D12_RESOURCE_STATE_COPY_DEST);
-        }
-    }
+    void CopyToPrev(ID3D12GraphicsCommandList* g) { RecordCopyToPrev(*pg, g); }
 
     // The frame is done with cur and prev: cur -> prev for the next one (after all its passes, on our queue). hold: the
     // next frame comes before this one's own present, so its picture goes into hold first (cur or keep is rewritten).
@@ -5622,22 +5596,7 @@ private:
     // that byte order here, SwapRB turns it round for the pack).
     void Copy(ID3D12GraphicsCommandList* g, ID3D12Resource* dst, ID3D12Resource* src, const Resource& px, bool toTexture = false)
     {
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-        fp.Footprint = { scDesc.Format, px.w, px.h, 1, static_cast<UINT>(px.pitch) };
-        if (!toTexture)
-        {
-            D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, s { src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-            d.PlacedFootprint = fp;
-            s.SubresourceIndex = 0;
-            g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
-        }
-        else
-        {
-            D3D12_TEXTURE_COPY_LOCATION d { dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, s { src, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-            d.SubresourceIndex = 0;
-            s.PlacedFootprint = fp;
-            g->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
-        }
+        CopyPitched(g, scDesc.Format, dst, src, px, toTexture);
     }
 
     bool CopyIn(ID3D12GraphicsCommandList* g, const xefg_swapchain_d3d12_resource_data_t& rd, ID3D12Resource* dst, const Resource& pr, const char* what,
@@ -5771,14 +5730,8 @@ private:
             return true;
         if (convFailed)
             return false;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};
-        if (SUCCEEDED(dev->CreateRootSignature(0, g_xefgConvertCS, sizeof(g_xefgConvertCS), IID_PPV_ARGS(&convRs))))
-        {
-            pd.pRootSignature = convRs;
-            pd.CS = { g_xefgConvertCS, sizeof(g_xefgConvertCS) };
-            if (SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&convPso))))
-                return true;
-        }
+        if (MakeConvertPipeline(dev, convRs, convPso))
+            return true;
         XLog("tag: the format conversion pipeline could not be made - motion / depth in other formats ignored");
         convFailed = true;
         return false;
@@ -5795,15 +5748,9 @@ private:
             ID3D12Resource* dst = ci == 0 ? stMv[j.set] : stDepth[j.set];
             if (c.kind < 0 || !src || !dst || !convPso)
                 continue;
-            const uint32_t k[8] = { c.w, c.h, c.srcPitch, c.dstPitch, static_cast<uint32_t>(c.kind), c.stride, c.srcX, c.srcY };
             Barrier(g, src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             Barrier(g, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            g->SetComputeRootSignature(convRs);
-            g->SetPipelineState(convPso);
-            g->SetComputeRoot32BitConstants(0, 8, k, 0);
-            g->SetComputeRootShaderResourceView(1, src->GetGPUVirtualAddress());
-            g->SetComputeRootUnorderedAccessView(2, dst->GetGPUVirtualAddress());
-            g->Dispatch((c.w + 7) / 8, (c.h + 7) / 8, 1);
+            RecordConvert(g, convRs, convPso, c, src, dst);
             Barrier(g, dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); // CopyFrame's copy next
         }
     }
@@ -5826,7 +5773,7 @@ private:
     void RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst)
     {
         const size_t slot = kAllocs + genCur;
-        pg->RecordPassInto(g, k, dst, slot, TsQueue(slot), IsBgra(scDesc.Format), !dumpPath.empty());
+        (void)pg->RecordPassInto(g, k, dst, slot, TsQueue(slot), IsBgra(scDesc.Format), !dumpPath.empty());
     }
     // The GPU time of a pass recorded with allocator i, once its list has finished (Begin waited for it).
     void ReadStamps(size_t i) { pg->ReadStamps(i); }

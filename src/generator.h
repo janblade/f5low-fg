@@ -100,6 +100,7 @@ struct GenBuild
     std::function<void()> releaseHostBuffers;       // the old pack is gone: the host lets go of what was sized by it
     std::function<bool()> cancelled;                // true: the context is going away - stop at the next step (a build thread)
     std::function<bool()> packBuilt;                // the new pack is built: the host makes its staging; false fails the build
+    const xefgpack::Sizes* firstSizes = nullptr;    // the FIRST build only (Build): the sizes to build for instead of the pack's captured ones (frames_only.h)
 };
 
 class IPackGenerator;
@@ -165,7 +166,8 @@ public:
     // slot: the timestamp slot (the present lane's allocator index, or kAllocs + the generation lane's); tsQueue: the queue g runs on.
     virtual bool RecordPass(ID3D12GraphicsCommandList* g, uint32_t k, size_t slot, ID3D12CommandQueue* tsQueue, bool bgra) = 0;
     // The same, the frame landing in dst (a UAV-capable plain buffer, COMMON between lists) instead of Output().
-    virtual void RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst, size_t slot,
+    // false: recording the pass failed (the list is still to be closed; the host's XeFG path ignores the result as before).
+    virtual bool RecordPassInto(ID3D12GraphicsCommandList* g, uint32_t k, ID3D12Resource* dst, size_t slot,
                                 ID3D12CommandQueue* tsQueue, bool bgra, bool dumpPending) = 0;
     virtual void ReadStamps(size_t slot) = 0;                           // the GPU time of a pass recorded in slot, once done
 
