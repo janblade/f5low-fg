@@ -594,6 +594,16 @@ int main(int argc, char** argv)
     GoldenAll();
 
     // through the DLL's exports
+    // The host's FixedPacing field and the gate (pace_sched.h HostFixedMode + FixedTimer), host-only
+    {
+        using namespace pacesched;
+        CHECK(HostFixedMode(0, kFixedAuto) == kFixedAuto && HostFixedMode(0, kFixedDisplay) == kFixedDisplay, "host field 0 keeps the setting");
+        CHECK(HostFixedMode(1, kFixedTimer) == kFixedDisplay && HostFixedMode(2, kFixedDisplay) == kFixedTimer, "host field 1 / 2 override the setting");
+        CHECK(FixedTimer(HostFixedMode(0, kFixedAuto), false) && !FixedTimer(HostFixedMode(1, kFixedAuto), false) && FixedTimer(HostFixedMode(2, kFixedAuto), false),
+              "no gate: auto and timer time a V-Sync batch, display does not");
+        CHECK(!FixedTimer(HostFixedMode(2, kFixedTimer), true) && !FixedTimer(kFixedAuto, true), "the gate forces display, over timer too");
+    }
+
     if (argc > 1)
     {
         HMODULE dll = LoadLibraryA(argv[1]);
@@ -692,6 +702,56 @@ int main(int argc, char** argv)
         Raise(p2, 1);
         Destroy(p2);
         printf("  exports: versioning checks, Destroy with the timer raised: ok\n");
+        // FixedPacing from the host (fixedPacing + gate) over f5low's own setting: a displayPaced batch's Target is "paced" only for timer.
+        // The setting is read from the environment / f5low.ini next to the DLL: the cases below hold with the default (auto).
+        {
+            struct Case { uint32_t fixed, gate; bool paced; const char* what; };
+            const Case cases[] = { { 0, 0, true, "own setting (auto = timer)" }, { 1, 0, false, "display" },  { 2, 0, true, "timer" },
+                                   { 0, 1, false, "gate, auto" },               { 2, 1, false, "gate over timer" }, { 1, 1, false, "gate, display" } };
+            for (const Case& c : cases)
+            {
+                F5LowPacerCreateInfo ci2 = ci;
+                ci2.fixedPacing = c.fixed;
+                ci2.gate = c.gate;
+                F5LowPacer q = nullptr;
+                CHECK(Create(&ci2, &q) == 0 && q, "Create fixedPacing %u gate %u", c.fixed, c.gate);
+                F5LowPacerFrame f {};
+                f.structSize = sizeof(f);
+                f.arriveTicks = f.readyTicks = Ticks(100.0);
+                f.generated = 2;
+                f.displayPaced = 1;
+                F5LowPacerBatch b {};
+                b.structSize = sizeof(b);
+                Arrived(q, &f, &b);
+                F5LowPacerTarget t {};
+                t.structSize = sizeof(t);
+                Target(q, &b, 1, &t);
+                CHECK(((t.flags & F5LOW_PACER_TARGET_PACED) != 0) == c.paced, "fixedPacing %u gate %u (%s): V-Sync batch paced=%d", c.fixed, c.gate,
+                      c.what, (t.flags & F5LOW_PACER_TARGET_PACED) != 0);
+                // a MAILBOX / IMMEDIATE batch (not displayPaced) is timed whatever the setting
+                f.displayPaced = 0;
+                F5LowPacerBatch b2 {};
+                b2.structSize = sizeof(b2);
+                f.arriveTicks = f.readyTicks = Ticks(120.0);
+                Arrived(q, &f, &b2);
+                F5LowPacerTarget t2 {};
+                t2.structSize = sizeof(t2);
+                Target(q, &b2, 1, &t2);
+                CHECK((t2.flags & F5LOW_PACER_TARGET_PACED) != 0, "fixedPacing %u gate %u: a timed batch was not paced", c.fixed, c.gate);
+                Destroy(q);
+            }
+            // the first release's struct (no fixedPacing / gate) is accepted and gives the setting; a value above 2 is an argument error
+            F5LowPacerCreateInfo old = ci;
+            old.structSize = F5LOW_PACER_CREATEINFO_SIZE_V1;
+            F5LowPacer q = nullptr;
+            CHECK(Create(&old, &q) == 0 && q, "Create with the v1 structSize");
+            Destroy(q);
+            F5LowPacerCreateInfo wrong = ci;
+            wrong.fixedPacing = 3;
+            q = nullptr;
+            CHECK(Create(&wrong, &q) == F5LOW_PACER_ERROR_ARGUMENT && !q, "fixedPacing 3");
+            printf("  exports: FixedPacing / gate resolution, v1 structSize: ok"), puts("");
+        }
     }
 
     printf("%s (%d failures)\n", g_fail ? "pacer_api_test: FAIL" : "pacer_api_test: PASS", g_fail);

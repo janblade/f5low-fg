@@ -2443,7 +2443,12 @@ F5LOW_PACER_API int32_t f5lowPacerCreate(const F5LowPacerCreateInfo* info, F5Low
     return PacerGuard([&]() -> int32_t {
         if (out)
             *out = nullptr;
-        if (!out || !SizeOk(info) || info->apiVersion != F5LOW_PACER_API_VERSION || !info->maxGenerated || info->maxGenerated > F5LOW_PACER_MAX_GENERATED)
+        // the first release of the struct ends at refreshHz: an older host passes that size and gets fixedPacing 0, gate 0
+        if (!out || !info || info->structSize < F5LOW_PACER_CREATEINFO_SIZE_V1 || info->apiVersion != F5LOW_PACER_API_VERSION || !info->maxGenerated ||
+            info->maxGenerated > F5LOW_PACER_MAX_GENERATED)
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const bool haveFixed = info->structSize >= sizeof(F5LowPacerCreateInfo);
+        if (haveFixed && info->fixedPacing > 2)
             return F5LOW_PACER_ERROR_ARGUMENT;
         pacecore::Config c;
         c.ticksPerSecond = info->ticksPerSecond > 0 ? static_cast<double>(info->ticksPerSecond) : pacewait::FreqQpc();
@@ -2464,7 +2469,16 @@ F5LOW_PACER_API int32_t f5lowPacerCreate(const F5LowPacerCreateInfo* info, F5Low
         c.flipLeadAuto = lead.empty() || lead == "auto";
         if (!c.flipLeadAuto)
             c.flipLeadUs = static_cast<uint32_t>(std::clamp(atoi(lead.c_str()), 0, 8000));
-        c.fixedDisplay = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "auto") == "display";
+        {
+            // FixedPacing as D3D12 reads it: the setting, the host's field over it, the host's gate over both (xefg_own.h FixedTimer)
+            const std::string fp = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "auto");
+            const unsigned char own = fp == "timer" ? pacesched::kFixedTimer : fp == "display" ? pacesched::kFixedDisplay : pacesched::kFixedAuto;
+            const unsigned char mode = pacesched::HostFixedMode(haveFixed ? info->fixedPacing : 0u, own);
+            const bool gate = haveFixed && info->gate != 0;
+            c.fixedDisplay = !pacesched::FixedTimer(mode, gate);
+            Log("pacer: FixedPacing %s (host field %u, setting %s, host gate %s)", c.fixedDisplay ? "display" : "timer", haveFixed ? info->fixedPacing : 0u,
+                 fp.c_str(), gate ? "on" : "off");
+        }
         auto* p = new pacecore::Pacer(c);
         *out = reinterpret_cast<F5LowPacer>(p);
         Log("pacer: created, GPU sm_%d, host %s meter, flip metering %s (FlipMetering=%s), burst %s, clock %.0f ticks/s", info->gpuSm, c.hostCanMeter ? "can" : "cannot",

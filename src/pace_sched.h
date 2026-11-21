@@ -221,6 +221,12 @@ inline bool FixedTimer(unsigned char mode, bool gate)
         return false;
     return mode != kFixedDisplay;
 }
+// The pacer export's FixedPacing (include/f5low_pacer.h F5LowPacerCreateInfo::fixedPacing): the host's value (0 = f5low's own setting `own`,
+// 1 display, 2 timer) over the setting; the gate still wins in FixedTimer. Values above 2 are the caller's argument error.
+inline unsigned char HostFixedMode(unsigned hostField, unsigned char own)
+{
+    return hostField == 1 ? kFixedDisplay : hostField == 2 ? kFixedTimer : own;
+}
 
 // LateGen=drop: whether a generated frame is left out instead of shown late (xefg_own.h, PresentReal). Never the batch's real frame
 // (`generated` false). A frame whose own GPU work did not finish in its wait (`gpuOk` false) is dropped. Where its time means something

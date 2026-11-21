@@ -31,6 +31,7 @@
 // and `batchMs`), XeLL / Reflex. docs/GENERATORS.md "Frames only API" lists the mapping and the gaps.
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -73,7 +74,16 @@ typedef struct F5LowPacerCreateInfo
     int32_t gpuSm;            // the NVIDIA GPU's compute capability as NN of sm_NN (RTX 50: 100 and up), 0 not NVIDIA / unknown; f5lowFramesGpuSm gives it
     uint32_t maxGenerated;    // 1..F5LOW_PACER_MAX_GENERATED
     double refreshHz;         // the display's refresh rate, 0 unknown (informational, see the VRR flag)
+    // ---- added after the first release of this struct (a host built against the older header passes the smaller structSize, which is
+    // accepted: the two fields below are then 0). Who spaces a batch whose F5LowPacerFrame::displayPaced is 1 (V-Sync / FIFO), as D3D12's
+    // FixedPacing (pace_sched.h FixedTimer):
+    uint32_t fixedPacing;     // 0: f5low's own setting (XEFG_CUDA_FIXEDPACING / f5low.ini FixedPacing, auto = timer), 1: display (the batch
+                              // goes out back to back, F5LOW_PACER_TARGET_PACED is not set), 2: timer (each frame waits for its time).
+                              // Anything above 2 is an argument error. MAILBOX / IMMEDIATE batches (displayPaced 0) are always timed.
+    uint32_t gate;            // 1: the host's own latency gate paces the game (D3D12 Gate=1): display, whatever fixedPacing or the setting say
 } F5LowPacerCreateInfo;
+// structSize of the first release of F5LowPacerCreateInfo (everything up to refreshHz); f5low accepts it and anything larger
+#define F5LOW_PACER_CREATEINFO_SIZE_V1 offsetof(F5LowPacerCreateInfo, fixedPacing)
 
 // One app frame arriving at the present worker.
 typedef struct F5LowPacerFrame
