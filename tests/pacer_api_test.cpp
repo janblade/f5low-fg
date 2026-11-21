@@ -7,6 +7,14 @@
 // 3. The flip metering decision (RTX 50 = on, older = off, the settings override) and the metering / burst plan on a metered GPU.
 // 4. With a DLL argument: the same through the exported C functions.
 //
+// 5. A frozen copy of the pre-refactor presenter arithmetic (xefg_own.h at b305fa8, written out as it was, inline) against the pacer on fixed timelines:
+//    plain, metered with the flip lead release, metered with the burst, V-Sync, and MeterResult refusals (8 in a row = off).
+//
+// Limits (what this test does not prove): no GPU and no swap chain are involved, so waiting for a frame's GPU work, the latency token, GenBlock, the NVAPI
+// calls and XeLL are not exercised; the frozen copy is a transcription, not a build of b305fa8 (the D3D12 path itself is checked by repro_test with
+// REPRO_PACELOG and the dump identity); the DriverPacing=1 arming dwell is not modelled (the pacer has none); present times are simulated from the
+// release times, not measured.
+//
 // Usage: pacer_api_test.exe [f5low.dll]   Exit code: 0 PASS, 1 FAIL.
 
 #define NOMINMAX
@@ -120,7 +128,254 @@ static pacecore::Config Cfg(int sm, uint32_t maxGen)
     c.ticksPerSecond = kFreq;
     c.gpuSm = sm;
     c.maxGenerated = maxGen;
+    c.hostCanMeter = true;
     return c;
+}
+
+
+// ---- the frozen copy of the pre-refactor presenter (xefg_own.h, b305fa8): Pick, ClockObserve, Submit, MeterBatch, Target, FlipLead, PresentReal ----
+struct Frozen
+{
+    pacesched::ReadyInterval ri;
+    pacelead::Lead lead;
+    int64_t lastReady = 0, schedBase = 0, lastAny = 0;
+    double clkBatch = 0, clkVar = 0;
+    unsigned clkHitchRun = 0, statClkHitches = 0;
+    unsigned flipSamples = 0, flipFails = 0;
+    uint32_t flipOutputs = 0;
+    double flipBatchMs = 0;
+    bool flipRefused = false;
+    bool metering, burstOn;
+    struct Batch
+    {
+        int64_t base = 0, step = 0, leadT = 0;
+        uint32_t n = 0;
+        bool metered = false, wanted = false;
+        double batchMs = 0;
+    };
+    Frozen(bool meteringOn, bool burst) : metering(meteringOn), burstOn(burst) {}
+    void ClockObserve(double ms)
+    {
+        if (ms < 1 || ms > 250)
+        {
+            clkBatch = clkVar = 0;
+            clkHitchRun = 0;
+            return;
+        }
+        if (clkBatch <= 0)
+        {
+            clkBatch = ms;
+            return;
+        }
+        if (ms > 1.5 * clkBatch && clkHitchRun < 2)
+        {
+            ++clkHitchRun;
+            ++statClkHitches;
+            return;
+        }
+        clkHitchRun = 0;
+        const double d = ms - clkBatch;
+        clkBatch += d / 8;
+        clkVar += (d * d - clkVar) / 8;
+    }
+    Batch Pick(int64_t ready, uint32_t n, bool displayPaced)
+    {
+        if (lastReady)
+        {
+            const double ms = static_cast<double>(ready - lastReady) * 1000.0 / kFreq;
+            ri.Observe(ms);
+            ClockObserve(ms);
+        }
+        lastReady = ready;
+        const int64_t iv = static_cast<int64_t>(ri.ms * kFreq / 1000.0);
+        schedBase = pacesched::NextBase(schedBase, ready, static_cast<int64_t>(0.0 * kFreq / 1000.0), iv);
+        Batch b;
+        b.n = n;
+        b.base = schedBase;
+        b.step = static_cast<int64_t>(ri.ms / static_cast<double>(n + 1) * kFreq / 1000.0);
+        if (n && !displayPaced && lead.On())
+        {
+            const double l = lead.Freeze(static_cast<double>(b.step) * 1000.0 / kFreq);
+            b.leadT = static_cast<int64_t>(l * kFreq / 1000.0);
+        }
+        // MeterBatch
+        flipSamples = n ? flipSamples + 1 : 0;
+        const char* skip = !n ? "not generating" : displayPaced ? "V-Sync" : flipRefused ? "refused by the driver"
+                           : n + 1 > 8 ? "too many frames per batch" : flipSamples < 24 || clkBatch <= 0 ? "frame time unknown" : nullptr;
+        if (metering && !flipRefused && !skip)
+        {
+            double batch = clkBatch;
+            if (flipOutputs == n + 1)
+                batch = std::min(batch, flipBatchMs * 1.125);
+            flipOutputs = n + 1;
+            flipBatchMs = batch;
+            b.wanted = b.metered = true;
+            b.batchMs = batch;
+        }
+        else
+        {
+            flipOutputs = 0;
+            flipBatchMs = 0;
+        }
+        return b;
+    }
+    void Refusal()
+    {
+        if (++flipFails >= 8)
+            flipRefused = true;
+        flipOutputs = 0;
+        flipBatchMs = 0;
+    }
+    void Target(const Batch& b, uint32_t k, int64_t& target, int64_t& release, bool& burst) const
+    {
+        target = b.n ? pacesched::Bound(b.base + pacelead::Offset(b.leadT, b.step, k), b.step, lastAny) : 0;
+        burst = burstOn && k > 1 && b.metered;
+        int64_t flipLead = 0;
+        if (!burst && k > 1 && b.metered)
+        {
+            const int64_t spacing = static_cast<int64_t>(ri.ms / static_cast<double>(b.n + 1) * kFreq / 1000.0);
+            const int64_t set = static_cast<int64_t>(2500 * kFreq / 1e6);
+            flipLead = spacing > 0 ? std::min(set, static_cast<int64_t>(0.45 * static_cast<double>(spacing))) : set;
+        }
+        release = b.n && !burst ? target - flipLead : 0;
+    }
+};
+
+static void GoldenCase(const char* name, const std::vector<double>& ready, uint32_t gen, bool burst, bool vsync, int sm)
+{
+    pacecore::Config c = Cfg(sm, 5);
+    c.burstCapable = burst;
+    if (burst)
+    {
+        c.flipBurst = true;
+        c.driverPacing = 0;
+    }
+    pacecore::Pacer pacer(c);
+    Frozen ref(sm >= 100, burst);
+    int64_t prev = 0;
+    int compared = 0, burstFrames = 0, earlyFrames = 0, meteredBatches = 0;
+    for (double ms : ready)
+    {
+        const int64_t r = Ticks(ms);
+        F5LowPacerFrame f {};
+        f.arriveTicks = r - Ticks(1.0);
+        f.readyTicks = r;
+        f.generated = gen;
+        f.displayPaced = vsync;
+        F5LowPacerBatch b {};
+        pacer.FrameArrived(f, b);
+        const Frozen::Batch rb = ref.Pick(r, gen, vsync);
+        CHECK(b.baseTicks == rb.base && b.stepTicks == rb.step && b.leadTicks == rb.leadT && (b.meterWanted != 0) == rb.wanted && (b.metered != 0) == rb.metered &&
+                  (!rb.wanted || (b.numFramesPerBatch == gen + 1 && b.batchMs == rb.batchMs)),
+              "golden %s %ux: batch plan differs from the frozen presenter (base %lld/%lld step %lld/%lld lead %lld/%lld metered %u/%d batchMs %.4f/%.4f)", name, gen + 1,
+              (long long)b.baseTicks, (long long)rb.base, (long long)b.stepTicks, (long long)rb.step, (long long)b.leadTicks, (long long)rb.leadT, b.metered, rb.metered,
+              b.batchMs, rb.batchMs);
+        meteredBatches += rb.metered;
+        for (uint32_t k = 1; k <= gen + 1; ++k)
+        {
+            F5LowPacerTarget t {};
+            pacer.Target(b, k, t);
+            int64_t target, release;
+            bool bu;
+            ref.Target(rb, k, target, release, bu);
+            ++compared;
+            CHECK(t.targetTicks == target && t.releaseTicks == release && ((t.flags & F5LOW_PACER_TARGET_BURST) != 0) == bu && ((t.flags & F5LOW_PACER_TARGET_METERED) != 0) == rb.metered,
+                  "golden %s %ux frame %.1f k %u: target %lld/%lld release %lld/%lld burst %d/%d", name, gen + 1, ms, k, (long long)t.targetTicks, (long long)target,
+                  (long long)t.releaseTicks, (long long)release, (t.flags & F5LOW_PACER_TARGET_BURST) != 0, bu);
+            burstFrames += bu;
+            earlyFrames += !bu && rb.metered && k > 1 && release < target;
+            const int64_t at = std::max<int64_t>(std::max(release, r), prev + 1);
+            F5LowPacerPresented w {};
+            w.presentTicks = at;
+            pacer.Presented(b, k, w);
+            ref.lastAny = at;
+            prev = at;
+        }
+        pacer.BatchDone(b);
+        if (rb.leadT > 0)
+            ref.lead.EndFrame(Ms(rb.leadT), Ms(rb.step));
+    }
+    printf("  golden %-22s %ux: %d targets identical to the frozen presenter (%d metered batches, %d burst frames, %d flip-lead releases)\n", name, gen + 1, compared,
+           meteredBatches, burstFrames, earlyFrames);
+}
+
+static void GoldenAll()
+{
+    const std::vector<double> steady = Make("steady", 300, 1), jit = Make("jitter", 300, 9), stall = Make("stall", 300, 1);
+    for (uint32_t gen : { 1u, 2u, 5u })
+    {
+        GoldenCase("plain sm_89", jit, gen, false, false, 89);
+        GoldenCase("metered, flip lead", steady, gen, false, false, 120);
+        GoldenCase("metered, flip lead", jit, gen, false, false, 120);
+        GoldenCase("metered + burst", steady, gen, true, false, 120);
+        GoldenCase("metered + burst, stall", stall, gen, true, false, 120);
+    }
+    GoldenCase("V-Sync", steady, 2, false, true, 120);
+    // MeterResult refusals: 8 in a row switch metering off for the context, a success in between resets the count
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        pacecore::Pacer pacer(Cfg(120, 5));
+        Frozen ref(true, false);
+        const std::vector<double> r = Make("steady", 120, 1);
+        int refusals = 0, offAt = -1, attempts = 0;
+        for (size_t i = 0; i < r.size(); ++i)
+        {
+            F5LowPacerFrame f {};
+            f.arriveTicks = f.readyTicks = Ticks(r[i]);
+            f.generated = 3;
+            F5LowPacerBatch b {};
+            pacer.FrameArrived(f, b);
+            const Frozen::Batch rb = ref.Pick(Ticks(r[i]), 3, false);
+            CHECK((b.meterWanted != 0) == rb.wanted, "refusals pass %d frame %zu: meterWanted %u, frozen %d", pass, i, b.meterWanted, rb.wanted);
+            if (b.meterWanted && i >= 30)
+            {
+                const bool refuse = pass == 0 || (attempts++ % 8) != 7;   // pass 1: every 8th is a success (never 8 in a row)
+                const int status = refuse ? -3 : 0;
+                pacer.MeterResult(b, status, 0);
+                if (status)
+                {
+                    ref.Refusal();
+                    ++refusals;
+                }
+                else
+                    ref.flipFails = 0;
+            }
+            F5LowPacerInfo inf {};
+            pacer.Info(inf);
+            CHECK((inf.meteringRefused != 0) == ref.flipRefused, "refusals pass %d frame %zu: refused %u, frozen %d", pass, i, inf.meteringRefused, ref.flipRefused);
+            if (inf.meteringRefused && offAt < 0)
+                offAt = static_cast<int>(i);
+            for (uint32_t k = 1; k <= 4; ++k)
+            {
+                F5LowPacerPresented w {};
+                w.presentTicks = Ticks(r[i]) + k * 10000 + static_cast<int64_t>(i) * 1000000;
+                pacer.Presented(b, k, w);
+            }
+        }
+        CHECK(pass == 0 ? offAt == 30 + 7 : offAt < 0, "refusals pass %d: metering went off at frame %d", pass, offAt);
+        printf("  MeterResult refusals, pass %d (%s): metering off at frame %d (the 8th refusal in a row is at 37)\n", pass, pass == 0 ? "every batch refused" : "a success every 8th", offAt);
+    }
+    // the host cannot meter / cannot burst
+    {
+        pacecore::Config c = Cfg(120, 5);
+        c.hostCanMeter = false;
+        pacecore::Pacer noMeter(c);
+        F5LowPacerInfo inf {};
+        noMeter.Info(inf);
+        CHECK(inf.flipMetering == 0, "host cannot meter: flipMetering %u on sm_120", inf.flipMetering);
+        c = Cfg(120, 5);
+        c.flipBurst = true;
+        c.driverPacing = 0;
+        pacecore::Pacer noBurst(c);       // burst allowed by the settings, but the host did not say it can
+        noBurst.Info(inf);
+        CHECK(inf.burstCapable == 0 && inf.burstNow == 0, "burst without F5LOW_PACER_FLAG_BURST_CAPABLE: capable %u now %u", inf.burstCapable, inf.burstNow);
+        c.burstCapable = true;
+        pacecore::Pacer withBurst(c);
+        withBurst.Info(inf);
+        CHECK(inf.burstCapable == 1 && inf.burstNow == 1 && inf.pacingActive == 1, "burst with the flag and FlipBurst=1: capable %u now %u active %u", inf.burstCapable,
+              inf.burstNow, inf.pacingActive);
+        printf("  host cannot meter: flipMetering 0 on sm_120; burst needs the capable flag (and FlipBurst / DriverPacing); with both: burstNow %u\n", inf.burstNow);
+    }
 }
 
 int main(int argc, char** argv)
@@ -336,6 +591,8 @@ int main(int argc, char** argv)
         CHECK(rtx50.Stale(b, 1, t1.targetTicks + 10 * b.stepTicks, true) == 0, "stale on a metering GPU");
     }
 
+    GoldenAll();
+
     // through the DLL's exports
     if (argc > 1)
     {
@@ -363,6 +620,8 @@ int main(int argc, char** argv)
         }
         F5LowPacerCreateInfo ci {};
         ci.apiVersion = F5LOW_PACER_API_VERSION;
+        ci.structSize = sizeof(ci);
+        ci.flags = F5LOW_PACER_FLAG_HOST_CAN_METER;
         ci.ticksPerSecond = static_cast<int64_t>(kFreq);
         ci.gpuSm = 120;
         ci.maxGenerated = 5;
@@ -370,6 +629,7 @@ int main(int argc, char** argv)
         CHECK(Create(&ci, &p) == 0 && p, "f5lowPacerCreate");
         pacecore::Pacer local(Cfg(120, 5));       // same settings (defaults): the export must give the same targets as the header-only class
         F5LowPacerInfo inf {};
+        inf.structSize = sizeof(inf);
         Info(p, &inf);
         CHECK(inf.flipMetering == 1, "exported pacer on sm_120: flipMetering %u", inf.flipMetering);
         const std::vector<double> r = Make("jitter", 300, 3);
@@ -377,19 +637,23 @@ int main(int argc, char** argv)
         for (double ms : r)
         {
             F5LowPacerFrame f {};
+            f.structSize = sizeof(f);
             f.arriveTicks = f.readyTicks = Ticks(ms);
             f.generated = 3;
             F5LowPacerBatch b1 {}, b2 {};
+            b1.structSize = sizeof(b1);
             Arrived(p, &f, &b1);
             local.FrameArrived(f, b2);
             for (uint32_t k = 1; k <= 4; ++k)
             {
                 F5LowPacerTarget t1 {}, t2 {};
+                t1.structSize = sizeof(t1);
                 Target(p, &b1, k, &t1);
                 local.Target(b2, k, t2);
                 ++total;
                 same += t1.targetTicks == t2.targetTicks && t1.releaseTicks == t2.releaseTicks && t1.flags == t2.flags;
                 F5LowPacerPresented w {};
+                w.structSize = sizeof(w);
                 w.presentTicks = std::max(t1.releaseTicks, Ticks(ms)) + k;
                 Presented(p, &b1, k, &w);
                 local.Presented(b2, k, w);
@@ -402,9 +666,32 @@ int main(int argc, char** argv)
         const int64_t t0 = Now(), want = t0 + Freq() / 100;     // 10 ms
         Wait(want);
         CHECK(Now() >= want && Now() < want + Freq() / 50, "f5lowPacerWaitUntil returned at %lld ticks past the target", (long long)(Now() - want));
+        // versioning: a smaller structSize is an argument error, a larger one is accepted and kept
+        {
+            F5LowPacerFrame f {};
+            f.structSize = sizeof(f) - 4;
+            F5LowPacerBatch b {};
+            b.structSize = sizeof(b);
+            CHECK(Arrived(p, &f, &b) == F5LOW_PACER_ERROR_ARGUMENT, "a structSize below the known one was accepted");
+            struct Bigger : F5LowPacerInfo { uint32_t future[4]; } big {};
+            big.structSize = sizeof(big);
+            CHECK(Info(p, &big) == 0 && big.structSize == sizeof(big), "a larger structSize: result or structSize lost");
+            CHECK(Info(nullptr, &big) == F5LOW_PACER_ERROR_ARGUMENT, "a null pacer");
+            F5LowPacerCreateInfo bad = ci;
+            bad.structSize = 4;
+            F5LowPacer q = nullptr;
+            CHECK(Create(&bad, &q) == F5LOW_PACER_ERROR_ARGUMENT && !q, "Create with a small structSize");
+        }
+        // Destroy with the timer raise left on (no Raise(0)): the DLL lets it go; twice in a row works
         Raise(p, 1);
-        Raise(p, 0);
         Destroy(p);
+        F5LowPacer p2 = nullptr;
+        CHECK(Create(&ci, &p2) == 0 && p2, "second Create");
+        Raise(p2, 1);
+        Raise(p2, 0);
+        Raise(p2, 1);
+        Destroy(p2);
+        printf("  exports: versioning checks, Destroy with the timer raised: ok\n");
     }
 
     printf("%s (%d failures)\n", g_fail ? "pacer_api_test: FAIL" : "pacer_api_test: PASS", g_fail);

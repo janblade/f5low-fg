@@ -2420,23 +2420,40 @@ F5LOW_FRAMES_API const char* f5lowFramesLastError(F5LowFramesContext context)
 
 // ---- Not Intel's API: the pacer (include/f5low_pacer.h, src/pace_api.h, docs/GENERATORS.md "Frames only API") ----
 // The own presenter's pacing as a CPU-only API for a host that presents itself. The settings are read as the D3D12 context reads them.
-F5LOW_PACER_API int32_t f5lowPacerCreate(const F5LowPacerCreateInfo* info, F5LowPacer* out)
+// Every export is guarded: an exception is F5LOW_PACER_ERROR_INTERNAL; a structSize below the version-1 size is an argument error (larger: a newer host).
+namespace
+{
+template <class S> bool SizeOk(const S* s) { return s && s->structSize >= sizeof(S); }
+template <class F> int32_t PacerGuard(F f)
 {
     try
     {
+        return f();
+    }
+    catch (...)
+    {
+        return F5LOW_PACER_ERROR_INTERNAL;
+    }
+}
+pacecore::Pacer* AsPacer(F5LowPacer p) { return reinterpret_cast<pacecore::Pacer*>(p); }
+} // namespace
+
+F5LOW_PACER_API int32_t f5lowPacerCreate(const F5LowPacerCreateInfo* info, F5LowPacer* out)
+{
+    return PacerGuard([&]() -> int32_t {
         if (out)
             *out = nullptr;
-        if (!info || !out || info->apiVersion != F5LOW_PACER_API_VERSION || !info->maxGenerated || info->maxGenerated > F5LOW_PACER_MAX_GENERATED)
-            return -1;
-        static thread_local std::string metering;
+        if (!out || !SizeOk(info) || info->apiVersion != F5LOW_PACER_API_VERSION || !info->maxGenerated || info->maxGenerated > F5LOW_PACER_MAX_GENERATED)
+            return F5LOW_PACER_ERROR_ARGUMENT;
         pacecore::Config c;
         c.ticksPerSecond = info->ticksPerSecond > 0 ? static_cast<double>(info->ticksPerSecond) : pacewait::FreqQpc();
         c.gpuSm = info->gpuSm;
         c.maxGenerated = info->maxGenerated;
         c.vrr = (info->flags & F5LOW_PACER_FLAG_VRR) != 0;
+        c.hostCanMeter = (info->flags & F5LOW_PACER_FLAG_HOST_CAN_METER) != 0;
+        c.burstCapable = (info->flags & F5LOW_PACER_FLAG_BURST_CAPABLE) != 0;
         c.refreshHz = info->refreshHz;
-        metering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "auto");
-        c.flipMetering = metering.c_str();
+        c.flipMetering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "auto");
         const std::string pacingText = Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "");
         c.driverPacing = pacingText.empty() ? -1 : std::clamp(atoi(pacingText.c_str()), 0, 2);
         c.flipBurst = Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1";
@@ -2450,84 +2467,100 @@ F5LOW_PACER_API int32_t f5lowPacerCreate(const F5LowPacerCreateInfo* info, F5Low
         c.fixedDisplay = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "auto") == "display";
         auto* p = new pacecore::Pacer(c);
         *out = reinterpret_cast<F5LowPacer>(p);
-        Log("pacer: created, GPU sm_%d, flip metering %s (FlipMetering=%s), clock %.0f ticks/s", info->gpuSm, p->Metering() ? "on" : "off", c.flipMetering,
-            c.ticksPerSecond);
-        return 0;
-    }
-    catch (...)
-    {
-        return -5;
-    }
+        Log("pacer: created, GPU sm_%d, host %s meter, flip metering %s (FlipMetering=%s), burst %s, clock %.0f ticks/s", info->gpuSm, c.hostCanMeter ? "can" : "cannot",
+            p->Metering() ? "on" : "off", c.flipMetering.c_str(), c.burstCapable ? "capable" : "not capable", c.ticksPerSecond);
+        return F5LOW_PACER_OK;
+    });
 }
 F5LOW_PACER_API void f5lowPacerDestroy(F5LowPacer p)
 {
-    try
-    {
+    PacerGuard([&]() -> int32_t {
         if (p)
         {
-            pacewait::RaiseTimer(reinterpret_cast<pacecore::Pacer*>(p)->timerMu, reinterpret_cast<pacecore::Pacer*>(p)->timerHold, false);
-            delete reinterpret_cast<pacecore::Pacer*>(p);
+            pacewait::RaiseTimer(AsPacer(p)->timerMu, AsPacer(p)->timerHold, false);
+            delete AsPacer(p);
         }
-    }
-    catch (...)
-    {
-    }
+        return 0;
+    });
 }
 F5LOW_PACER_API int32_t f5lowPacerFrameArrived(F5LowPacer p, const F5LowPacerFrame* frame, F5LowPacerBatch* batch)
 {
-    if (!p || !frame || !batch)
-        return -1;
-    reinterpret_cast<pacecore::Pacer*>(p)->FrameArrived(*frame, *batch);
-    return 0;
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(frame) || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const uint32_t ss = batch->structSize;
+        AsPacer(p)->FrameArrived(*frame, *batch);
+        batch->structSize = ss;
+        return F5LOW_PACER_OK;
+    });
 }
 F5LOW_PACER_API int32_t f5lowPacerTarget(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, F5LowPacerTarget* out)
 {
-    if (!p || !batch || !out)
-        return -1;
-    reinterpret_cast<pacecore::Pacer*>(p)->Target(*batch, k, *out);
-    return 0;
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch) || !SizeOk(out))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const uint32_t ss = out->structSize;
+        AsPacer(p)->Target(*batch, k, *out);
+        out->structSize = ss;
+        return F5LOW_PACER_OK;
+    });
 }
 F5LOW_PACER_API int32_t f5lowPacerStale(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, int64_t nowTicks, uint32_t nextGameFrameDone)
 {
-    if (!p || !batch)
-        return -1;
-    return reinterpret_cast<pacecore::Pacer*>(p)->Stale(*batch, k, nowTicks, nextGameFrameDone != 0);
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        return AsPacer(p)->Stale(*batch, k, nowTicks, nextGameFrameDone != 0);
+    });
 }
 F5LOW_PACER_API int32_t f5lowPacerMeterResult(F5LowPacer p, F5LowPacerBatch* batch, int32_t status, uint32_t noIndependentFlip)
 {
-    if (!p || !batch)
-        return -1;
-    reinterpret_cast<pacecore::Pacer*>(p)->MeterResult(*batch, status, noIndependentFlip != 0);
-    return 0;
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        AsPacer(p)->MeterResult(*batch, status, noIndependentFlip != 0);
+        return F5LOW_PACER_OK;
+    });
 }
 F5LOW_PACER_API int32_t f5lowPacerPresented(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, const F5LowPacerPresented* what)
 {
-    if (!p || !batch || !what)
-        return -1;
-    reinterpret_cast<pacecore::Pacer*>(p)->Presented(*batch, k, *what);
-    return 0;
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch) || !SizeOk(what))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        AsPacer(p)->Presented(*batch, k, *what);
+        return F5LOW_PACER_OK;
+    });
 }
 F5LOW_PACER_API int32_t f5lowPacerBatchDone(F5LowPacer p, const F5LowPacerBatch* batch)
 {
-    if (!p || !batch)
-        return -1;
-    reinterpret_cast<pacecore::Pacer*>(p)->BatchDone(*batch);
-    return 0;
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(batch))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        AsPacer(p)->BatchDone(*batch);
+        return F5LOW_PACER_OK;
+    });
 }
 F5LOW_PACER_API int32_t f5lowPacerGetInfo(F5LowPacer p, F5LowPacerInfo* out)
 {
-    if (!p || !out)
-        return -1;
-    reinterpret_cast<pacecore::Pacer*>(p)->Info(*out);
-    return 0;
+    return PacerGuard([&]() -> int32_t {
+        if (!p || !SizeOk(out))
+            return F5LOW_PACER_ERROR_ARGUMENT;
+        const uint32_t ss = out->structSize;
+        AsPacer(p)->Info(*out);
+        out->structSize = ss;
+        return F5LOW_PACER_OK;
+    });
 }
 F5LOW_PACER_API int64_t f5lowPacerNowTicks(void) { return pacewait::NowQpc(); }
 F5LOW_PACER_API int64_t f5lowPacerTicksPerSecond(void) { return static_cast<int64_t>(pacewait::FreqQpc()); }
 F5LOW_PACER_API void f5lowPacerWaitUntil(int64_t qpcTicks) { pacewait::WaitUntilQpc(qpcTicks); }
 F5LOW_PACER_API void f5lowPacerTimerRaise(F5LowPacer p, uint32_t on)
 {
-    if (p)
-        pacewait::RaiseTimer(reinterpret_cast<pacecore::Pacer*>(p)->timerMu, reinterpret_cast<pacecore::Pacer*>(p)->timerHold, on != 0);
+    PacerGuard([&]() -> int32_t {
+        if (p)
+            pacewait::RaiseTimer(AsPacer(p)->timerMu, AsPacer(p)->timerHold, on != 0);
+        return 0;
+    });
 }
 
 F5LOW_FRAMES_API int32_t f5lowFramesGpuSm(F5LowFramesContext context)

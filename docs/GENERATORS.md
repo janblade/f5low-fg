@@ -496,6 +496,10 @@ The settings are the D3D12 context's: `FlipMetering=` (`XEFG_CUDA_FLIPMETERING`)
 | `PresentReal` tail: `lastAnyPresent = lastShown = t`; a dropped frame keeps its slot; `Show`: a generated frame whose own GPU work came out late raises the lead; `Lead::EndFrame` | `Presented(batch, k, presentTicks, gpuDoneTicks, flags)`, `BatchDone` |
 | `WaitUntil` (high-resolution timer, then a spin), `SetTimerRaised` (1 ms system timer while generating) | `f5lowPacerWaitUntil`, `f5lowPacerTimerRaise` |
 
+Create flags: `F5LOW_PACER_FLAG_HOST_CAN_METER` (without it no metering, as D3D12 without `SetFlipConfig`) and `F5LOW_PACER_FLAG_BURST_CAPABLE` (D3D12's
+`BurstCapable()`; the burst also needs `DriverPacing` / `FlipBurst`); both default off. Every struct carries `structSize`; `f5lowPacerMeterResult` takes the driver's
+answer (Vulkan: `presentConfigFeedback != 0` or a stripped extension is a refusal). The header has the full call order.
+
 Not expressible host-agnostically, so not in the pacer (the host does these with its own objects): waiting for a frame's GPU work (`WaitGpu`, the
 `gpuOk` timeout drop of `LateGen`), the swap chain's frame latency token and its debt (`tokenDebt`, the DXGI waitable object), `GenBlock` and the
 generation lane's queue waits (`BlockDone`, `blockFence`, `aheadRead`), `Consumed`/`retireFence`, the NVAPI calls themselves (`SetFlipConfig`,

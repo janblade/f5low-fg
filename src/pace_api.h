@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <mutex>
+#include <string>
 
 #include <f5low_pacer.h>
 
@@ -34,9 +35,11 @@ struct Config
     int gpuSm = 0;
     uint32_t maxGenerated = 5;
     bool vrr = false;
+    bool hostCanMeter = false;              // F5LOW_PACER_FLAG_HOST_CAN_METER: without it no metering at all (D3D12: flipFn == nullptr)
+    bool burstCapable = false;              // F5LOW_PACER_FLAG_BURST_CAPABLE (D3D12: BurstCapable())
     double refreshHz = 0;
     // the settings of the D3D12 context (xefg_cuda.cpp reads them the same way)
-    const char* flipMetering = "auto";      // FlipMetering= (XEFG_CUDA_FLIPMETERING)
+    std::string flipMetering = "auto";      // FlipMetering= (XEFG_CUDA_FLIPMETERING)
     int driverPacing = -1;                  // DriverPacing=: -1 absent (automatic: the host routes the markers), 0, 1, 2
     bool flipBurst = false;                 // FlipBurst=1
     bool paceLeadAuto = true;               // PaceLead=auto, else paceLeadFixedMs (0: off)
@@ -52,7 +55,7 @@ public:
     explicit Pacer(const Config& c) : cfg(c)
     {
         freq = cfg.ticksPerSecond > 0 ? cfg.ticksPerSecond : 1e9;
-        metering = oobdriver::FlipMeteringOn(cfg.flipMetering, cfg.gpuSm);
+        metering = cfg.hostCanMeter && oobdriver::FlipMeteringOn(cfg.flipMetering.c_str(), cfg.gpuSm);
         drv = oobdriver::ResolveDriver(false, cfg.driverPacing, false, 15, cfg.flipBurst, true, cfg.gpuSm > 0, metering);
         pacingActive = !drv.pacingAuto;                 // automatic starts off: the rule switches it
         lead.automatic = cfg.paceLeadAuto;
@@ -199,7 +202,8 @@ public:
         std::lock_guard<std::mutex> l(mu);
         o = {};
         o.flipMetering = metering && !meteringRefused;
-        o.burstCapable = drv.flipBurst;
+        o.burstCapable = BurstCapable();
+        o.pacingActive = pacingActive;
         o.burstNow = Burst();
         o.pacingMode = drv.mode;
         o.meteringRefused = meteringRefused;
@@ -216,12 +220,13 @@ public:
 
 private:
     // The burst (xefg_own.h Burst): capable, the pacing active, and for DriverPacing=2 the load rule's want.
-    bool Burst() const { return drv.flipBurst && pacingActive && (drv.mode != 2 || drv.pacingAuto || burstWanted); }
+    bool BurstCapable() const { return drv.flipBurst && cfg.burstCapable; }
+    bool Burst() const { return BurstCapable() && pacingActive && (drv.mode != 2 || drv.pacingAuto || burstWanted); }
     // PacingFrame: the load rule decides the automatic mode (1: pacingActive) or the burst alone (2). No arming dwell: that is for the cap export
     // and Reflex Sync of the D3D12 context.
     void PacingFrame(int64_t arrive, bool displayPaced, uint32_t n)
     {
-        if (!drv.flipBurst)
+        if (!BurstCapable())
             return;
         const bool hard = !metering || meteringRefused || displayPaced || !n;
         const bool transient = !meteredNow || lastN == ~0u || lastN == 0;
