@@ -29,6 +29,7 @@ public:
         uint32_t w = 0, h = 0, rw = 0, rh = 0;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         uint32_t maxGen = 0;
+        int gpuSm = 0;                                 // the NVIDIA GPU's compute capability (sm_NN as NN)
         uint32_t initFlags = 0;                        // XEFG_SWAPCHAIN_INIT_FLAG_*
         std::string packDir;
         std::function<int(std::string*)> packPoll;     // 0 still being made, 1 ready, 2 failed (xefg_cuda.cpp PackPoll)
@@ -119,6 +120,7 @@ public:
     }
     // After a build failure (state kFailed, published by the release store this acquire load pairs with) the build's reason, else the last
     // host-thread call's. The build thread writes buildErr only.
+    int GpuSm() const { return prm.gpuSm; }
     const char* LastError() const { return state.load(std::memory_order_acquire) == kFailed ? buildErr.c_str() : lastErr.c_str(); }
 
     F5LowFramesResult Generate(const F5LowFramesInput* in, F5LowFramesOutput* out)

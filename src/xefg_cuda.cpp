@@ -31,6 +31,8 @@
 #include "pack_build.h"
 #include "xefg_own.h"
 #include "frames_only.h"
+#include "pace_api.h"
+#include "pace_wait.h"
 #include "generators/dlssg.h"
 #include "generators/intel.h"
 #include "xefg_version.h"
@@ -2320,6 +2322,7 @@ F5LOW_FRAMES_API F5LowFramesResult f5lowFramesCreate(const F5LowFramesCreateInfo
         p.rh = info->renderHeight;
         p.fmt = info->colorFormat;
         p.maxGen = info->maxGenerated;
+        p.gpuSm = have;
         p.initFlags = ((info->flags & F5LOW_FRAMES_FLAG_DEPTH_INVERTED) ? XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH : 0u) |
                       ((info->flags & F5LOW_FRAMES_FLAG_MOTION_JITTERED) ? XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV : 0u);
         // the pack: an explicit one (folder, embedded), else built in memory from the player's libxess_fg.dll on the pack thread
@@ -2413,6 +2416,123 @@ F5LOW_FRAMES_API void f5lowFramesDestroy(F5LowFramesContext context)
 F5LOW_FRAMES_API const char* f5lowFramesLastError(F5LowFramesContext context)
 {
     return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->LastError() : t_framesCreateError.c_str();
+}
+
+// ---- Not Intel's API: the pacer (include/f5low_pacer.h, src/pace_api.h, docs/GENERATORS.md "Frames only API") ----
+// The own presenter's pacing as a CPU-only API for a host that presents itself. The settings are read as the D3D12 context reads them.
+F5LOW_PACER_API int32_t f5lowPacerCreate(const F5LowPacerCreateInfo* info, F5LowPacer* out)
+{
+    try
+    {
+        if (out)
+            *out = nullptr;
+        if (!info || !out || info->apiVersion != F5LOW_PACER_API_VERSION || !info->maxGenerated || info->maxGenerated > F5LOW_PACER_MAX_GENERATED)
+            return -1;
+        static thread_local std::string metering;
+        pacecore::Config c;
+        c.ticksPerSecond = info->ticksPerSecond > 0 ? static_cast<double>(info->ticksPerSecond) : pacewait::FreqQpc();
+        c.gpuSm = info->gpuSm;
+        c.maxGenerated = info->maxGenerated;
+        c.vrr = (info->flags & F5LOW_PACER_FLAG_VRR) != 0;
+        c.refreshHz = info->refreshHz;
+        metering = Setting("XEFG_CUDA_FLIPMETERING", "FlipMetering", "auto");
+        c.flipMetering = metering.c_str();
+        const std::string pacingText = Setting("XEFG_CUDA_DRIVERPACING", "DriverPacing", "");
+        c.driverPacing = pacingText.empty() ? -1 : std::clamp(atoi(pacingText.c_str()), 0, 2);
+        c.flipBurst = Setting("XEFG_CUDA_FLIPBURST", "FlipBurst", "0") == "1";
+        c.paceLeadFixedMs = PaceLeadSetting(&c.paceLeadAuto);
+        std::string lead = Setting("XEFG_CUDA_FLIPLEADUS", "FlipLeadUs", "auto");
+        lead.erase(0, lead.find_first_not_of(" \t\r\n"));
+        lead.erase(lead.find_last_not_of(" \t\r\n") + 1);
+        c.flipLeadAuto = lead.empty() || lead == "auto";
+        if (!c.flipLeadAuto)
+            c.flipLeadUs = static_cast<uint32_t>(std::clamp(atoi(lead.c_str()), 0, 8000));
+        c.fixedDisplay = Setting("XEFG_CUDA_FIXEDPACING", "FixedPacing", "auto") == "display";
+        auto* p = new pacecore::Pacer(c);
+        *out = reinterpret_cast<F5LowPacer>(p);
+        Log("pacer: created, GPU sm_%d, flip metering %s (FlipMetering=%s), clock %.0f ticks/s", info->gpuSm, p->Metering() ? "on" : "off", c.flipMetering,
+            c.ticksPerSecond);
+        return 0;
+    }
+    catch (...)
+    {
+        return -5;
+    }
+}
+F5LOW_PACER_API void f5lowPacerDestroy(F5LowPacer p)
+{
+    try
+    {
+        if (p)
+        {
+            pacewait::RaiseTimer(reinterpret_cast<pacecore::Pacer*>(p)->timerMu, reinterpret_cast<pacecore::Pacer*>(p)->timerHold, false);
+            delete reinterpret_cast<pacecore::Pacer*>(p);
+        }
+    }
+    catch (...)
+    {
+    }
+}
+F5LOW_PACER_API int32_t f5lowPacerFrameArrived(F5LowPacer p, const F5LowPacerFrame* frame, F5LowPacerBatch* batch)
+{
+    if (!p || !frame || !batch)
+        return -1;
+    reinterpret_cast<pacecore::Pacer*>(p)->FrameArrived(*frame, *batch);
+    return 0;
+}
+F5LOW_PACER_API int32_t f5lowPacerTarget(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, F5LowPacerTarget* out)
+{
+    if (!p || !batch || !out)
+        return -1;
+    reinterpret_cast<pacecore::Pacer*>(p)->Target(*batch, k, *out);
+    return 0;
+}
+F5LOW_PACER_API int32_t f5lowPacerStale(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, int64_t nowTicks, uint32_t nextGameFrameDone)
+{
+    if (!p || !batch)
+        return -1;
+    return reinterpret_cast<pacecore::Pacer*>(p)->Stale(*batch, k, nowTicks, nextGameFrameDone != 0);
+}
+F5LOW_PACER_API int32_t f5lowPacerMeterResult(F5LowPacer p, F5LowPacerBatch* batch, int32_t status, uint32_t noIndependentFlip)
+{
+    if (!p || !batch)
+        return -1;
+    reinterpret_cast<pacecore::Pacer*>(p)->MeterResult(*batch, status, noIndependentFlip != 0);
+    return 0;
+}
+F5LOW_PACER_API int32_t f5lowPacerPresented(F5LowPacer p, const F5LowPacerBatch* batch, uint32_t k, const F5LowPacerPresented* what)
+{
+    if (!p || !batch || !what)
+        return -1;
+    reinterpret_cast<pacecore::Pacer*>(p)->Presented(*batch, k, *what);
+    return 0;
+}
+F5LOW_PACER_API int32_t f5lowPacerBatchDone(F5LowPacer p, const F5LowPacerBatch* batch)
+{
+    if (!p || !batch)
+        return -1;
+    reinterpret_cast<pacecore::Pacer*>(p)->BatchDone(*batch);
+    return 0;
+}
+F5LOW_PACER_API int32_t f5lowPacerGetInfo(F5LowPacer p, F5LowPacerInfo* out)
+{
+    if (!p || !out)
+        return -1;
+    reinterpret_cast<pacecore::Pacer*>(p)->Info(*out);
+    return 0;
+}
+F5LOW_PACER_API int64_t f5lowPacerNowTicks(void) { return pacewait::NowQpc(); }
+F5LOW_PACER_API int64_t f5lowPacerTicksPerSecond(void) { return static_cast<int64_t>(pacewait::FreqQpc()); }
+F5LOW_PACER_API void f5lowPacerWaitUntil(int64_t qpcTicks) { pacewait::WaitUntilQpc(qpcTicks); }
+F5LOW_PACER_API void f5lowPacerTimerRaise(F5LowPacer p, uint32_t on)
+{
+    if (p)
+        pacewait::RaiseTimer(reinterpret_cast<pacecore::Pacer*>(p)->timerMu, reinterpret_cast<pacecore::Pacer*>(p)->timerHold, on != 0);
+}
+
+F5LOW_FRAMES_API int32_t f5lowFramesGpuSm(F5LowFramesContext context)
+{
+    return context ? reinterpret_cast<xefgown::FramesCtx*>(context)->GpuSm() : 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)

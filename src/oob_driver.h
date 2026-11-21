@@ -150,6 +150,9 @@ inline double LoadShare(double arriveToReadyMs, double intervalMs)
     return s < kPacingMaxShare ? s : kPacingMaxShare;
 }
 
+// The smoothed load (1/8 per frame; the first sample as it is). `samples` counts the frames seen.
+inline double LoadEma(double ema, unsigned& samples, double share) { return samples++ ? ema + (share - ema) / 8.0 : share; }
+
 // Why the set may not run now. kHard: V-Sync or a display paced game, frame generation off, a swap chain the game made, no flip metering to
 // be had - it goes off at once. kTransient: a history reset, the metering refilling, a one-batch dropout - it only counts once it has
 // lasted kPacingTransientMs without a break (a few frames of it must not drop the set and then hold it off for the dwell time).

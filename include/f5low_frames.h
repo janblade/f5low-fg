@@ -141,6 +141,9 @@ F5LOW_FRAMES_API F5LowFramesResult f5lowFramesResize(F5LowFramesContext context,
 // Waits idle, releases everything. Null is fine.
 F5LOW_FRAMES_API void f5lowFramesDestroy(F5LowFramesContext context);
 
+// The NVIDIA GPU's compute capability behind the context's device as NN of sm_NN (RTX 50: 100 and up), for f5low_pacer.h's gpuSm. 0 for a null context.
+F5LOW_FRAMES_API int32_t f5lowFramesGpuSm(F5LowFramesContext context);
+
 // The last error's text for this context (or for Create when context is null), UTF-8, valid until the next call.
 F5LOW_FRAMES_API const char* f5lowFramesLastError(F5LowFramesContext context);
 

@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "pace_lead.h"
+
 namespace pacesched
 {
 // The rate the schedule spaces generated frames by: the app frame's interval, eased by 1/10, but when the game slows for good (two
@@ -278,5 +280,85 @@ inline bool CompressDrop(bool generated, bool gpuOk, bool timed, bool nextDone, 
     if (!gpuOk)
         return true;
     return timed && nextDone && afterNextDone;
+}
+// ---- the schedule arithmetic shared by the D3D12 presenter (xefg_own.h) and the host-agnostic pacer export (pace_api.h) ----------------
+// One place for each formula: Own and pacecore::Pacer both call these, so a pacing fix reaches every host with the DLL. `freq` is the tick
+// rate (QPC frequency) as a double; every time is in ticks.
+
+// The ready-to-ready time of two app frames, ms.
+inline double ReadyMs(long long ready, long long lastReady, double freq) { return static_cast<double>(ready - lastReady) * 1000.0 / freq; }
+// The schedule's clock for the next app frame (Pick): NextBase with the interval and the lag in ticks.
+inline long long NextScheduleBase(long long base, long long ready, double lagMs, double intervalMs, double freq)
+{
+    const long long iv = static_cast<long long>(intervalMs * freq / 1000.0);
+    return NextBase(base, ready, static_cast<long long>(lagMs * freq / 1000.0), iv);
+}
+// One step of a batch of n generated frames + the app's own: the smoothed interval over n + 1.
+inline long long StepTicks(double intervalMs, uint32_t n, double freq)
+{
+    return static_cast<long long>(intervalMs / static_cast<double>(n + 1) * freq / 1000.0);
+}
+// Frame k's time on the schedule that has no lead (PaceTarget: the generation lane's paths, GenBlock).
+inline long long ScheduleTarget(long long base, double intervalMs, uint32_t n, uint32_t k, double freq, long long lastAnyPresent)
+{
+    const double step = intervalMs / static_cast<double>(n + 1) * freq / 1000.0;
+    return Bound(base + static_cast<long long>(k * step), static_cast<long long>(step), lastAnyPresent);
+}
+// Frame k's time on a batch's own schedule (Target, with the lead of pace_lead.h frozen for the batch).
+inline long long BatchTarget(long long base, long long lead, long long step, uint32_t k, long long lastAnyPresent)
+{
+    return Bound(base + pacelead::Offset(lead, step, k), step, lastAnyPresent);
+}
+
+// The app frame's time on the GPU timeline as the flip metering and the clock keep it (ClockObserve): smoothed (1/8), a delta over 1.5x left
+// out at most twice in a row (one game stutter must not stretch the spacing for the frames after it), none outside 1-250 ms (set anew).
+inline void ObserveBatch(double& batch, double& var, unsigned& hitchRun, unsigned& hitches, double ms)
+{
+    if (ms < 1 || ms > 250)
+    {
+        batch = var = 0;
+        hitchRun = 0;
+        return;
+    }
+    if (batch <= 0)
+    {
+        batch = ms;
+        return;
+    }
+    if (ms > 1.5 * batch && hitchRun < 2)
+    {
+        ++hitchRun;
+        ++hitches;
+        return;
+    }
+    hitchRun = 0;
+    const double d = ms - batch;
+    batch += d / 8;
+    var += (d * d - var) / 8;
+}
+
+// Flip metering of a batch (MeterBatch). kFlipMaxBatch: the most frames the driver meters in a batch; kFlipSamples: app frames with generation on
+// before a batch is metered (3 and 8: the first batch got the start-up frames' 11-13 ms of 33; the batch time eases 1/8); kFlipGrowth: one long
+// frame must not hold the whole next batch to it: up by an eighth per batch at most; kFlipRefusals: refusals in a row after which it is off.
+constexpr unsigned kFlipMaxBatch = 8, kFlipSamples = 24, kFlipRefusals = 8;
+constexpr double kFlipGrowth = 1.125;
+// Why a batch is not metered (null: it is). `samples`: app frames with generation on in a row, including this one.
+inline const char* FlipSkip(uint32_t n, bool displayPaced, bool refused, unsigned samples, double batchMs)
+{
+    return !n ? "not generating" : displayPaced ? "V-Sync" : refused ? "refused by the driver"
+           : n + 1 > kFlipMaxBatch ? "too many frames per batch" : samples < kFlipSamples || batchMs <= 0 ? "frame time unknown" : nullptr;
+}
+// The batch time a metered batch of n + 1 is configured with: `prevOutputs` / `prevBatchMs` what was configured last (0: nothing).
+inline double FlipBatchMs(double batchMs, uint32_t prevOutputs, double prevBatchMs, uint32_t n)
+{
+    return prevOutputs == n + 1 ? std::min(batchMs, prevBatchMs * kFlipGrowth) : batchMs;
+}
+// How early a metered frame after a batch's first is released (ticks, `spacing` the step). Auto: flipLeadUs at most 0.45 of the spacing (2500 us at
+// 180 out), a set value wins.
+constexpr double kFlipLeadShare = 0.45;
+inline long long FlipLeadTicks(long long spacing, uint32_t flipLeadUs, bool flipLeadAuto, double freq)
+{
+    const long long set = static_cast<long long>(flipLeadUs * freq / 1e6);
+    return flipLeadAuto && spacing > 0 ? std::min(set, static_cast<long long>(kFlipLeadShare * static_cast<double>(spacing))) : set;
 }
 } // namespace pacesched

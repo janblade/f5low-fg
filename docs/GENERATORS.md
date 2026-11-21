@@ -474,6 +474,39 @@ pacing and hands over one app frame at a time; f5low writes the 1 to 5 in-betwee
 - **Test**: `tests\build_frames_only_test.ps1`, then `build\frames_only_test.exe build\f5low.dll` (needs an NVIDIA GPU and the player's libxess_fg.dll):
   a moving bar, counts 1 and 3, positions within 1 px, fences, an argument error, a frame gap, `Resize`. `FRAMES_DEBUG=1` runs it under the debug layer.
 
+### Pacer export (`include/f5low_pacer.h`)
+
+A host that presents itself (OptiScaler's Vulkan output) must space the generated frames. Instead of its own `interval / (n + 1)`, it calls the pacer
+of f5low, a CPU-only C API (`f5lowPacerCreate` / `FrameArrived` / `Target` / `Stale` / `MeterResult` / `Presented` / `BatchDone` / `GetInfo`, plus
+`f5lowPacerNowTicks`, `WaitUntil`, `TimerRaise`) with no D3D12, DXGI or Vulkan types. It is the same code the D3D12 presenter runs: `src/pace_api.h`
+(`pacecore::Pacer`) keeps the presenter's pacing state and calls the shared functions in `src/pace_sched.h`, `pace_lead.h`, `oob_driver.h` and
+`pace_wait.h`, which `xefg_own.h` (class `Own`) calls too (`ReadyMs`, `NextScheduleBase`, `StepTicks`, `ScheduleTarget`, `BatchTarget`, `ObserveBatch`,
+`FlipSkip`, `FlipBatchMs`, `FlipLeadTicks`, `LoadEma`, `WaitUntilQpc`, `RaiseTimer`). A fix to one of them reaches the Vulkan host with the DLL.
+The settings are the D3D12 context's: `FlipMetering=` (`XEFG_CUDA_FLIPMETERING`), `DriverPacing=`, `FlipBurst=`, `PaceLead=`, `FlipLeadUs=`, `FixedPacing=`.
+`f5lowFramesGpuSm(context)` gives the `gpuSm` the pacer's flip metering decision needs (`FlipMetering=auto`: on from sm_100, RTX 50).
+
+| D3D12 presenter | Pacer call |
+|---|---|
+| `Pick`: ready-to-ready time into `ReadyInterval` (eased 1/10, raised at once after two slow frames, lowered after three fast ones), `ClockObserve`, `NextBase` (a clock of its own, drawn a fifth towards the ready stamp), the GPU load share | `FrameArrived(arriveTicks, readyTicks, generated, displayPaced)` |
+| `Submit`: the step (`interval / (n + 1)`), the lead frozen for the batch (`pacelead::Lead`, none under V-Sync) | the returned `F5LowPacerBatch` (`baseTicks`, `stepTicks`, `leadTicks`) |
+| `MeterBatch`: flip metering per batch (not generating / V-Sync / refused / more than 8 frames / fewer than 24 frames of known frame time: no), the batch time (growth limited to 1/8 per batch) | `meterWanted`, `numFramesPerBatch`, `batchMs`; the driver's answer to `MeterResult` (8 refusals in a row: off for the context) |
+| `Target(f, k)` = `Bound(base + Offset(lead, step, k))`, half a step to two steps after the last present | `Target(batch, k)` -> `targetTicks` |
+| `PresentReal`: sleep to the target less the flip lead (metered frames after the first go `FlipLeadUs` early, at most 0.45 of a step); the burst (metered, `DriverPacing`'s load rule) is not waited for | `releaseTicks` (0: do not sleep), flags `BURST`, `METERED`, `PACED` |
+| `PresentReal` `LateGen=auto` stale rule (no flip metering): not presented when the game's next frame is done and the slot is half a step past | `Stale(batch, k, nowTicks, nextGameFrameDone)` |
+| `PresentReal` tail: `lastAnyPresent = lastShown = t`; a dropped frame keeps its slot; `Show`: a generated frame whose own GPU work came out late raises the lead; `Lead::EndFrame` | `Presented(batch, k, presentTicks, gpuDoneTicks, flags)`, `BatchDone` |
+| `WaitUntil` (high-resolution timer, then a spin), `SetTimerRaised` (1 ms system timer while generating) | `f5lowPacerWaitUntil`, `f5lowPacerTimerRaise` |
+
+Not expressible host-agnostically, so not in the pacer (the host does these with its own objects): waiting for a frame's GPU work (`WaitGpu`, the
+`gpuOk` timeout drop of `LateGen`), the swap chain's frame latency token and its debt (`tokenDebt`, the DXGI waitable object), `GenBlock` and the
+generation lane's queue waits (`BlockDone`, `blockFence`, `aheadRead`), `Consumed`/`retireFence`, the NVAPI calls themselves (`SetFlipConfig`,
+Reflex Sync with the multiplier, out of band markers; the host uses `VK_NV_present_metering` with `numFramesPerBatch` / `batchMs`), XeLL, and the
+`DriverPacing=1` arming machine (`PacingMachine`: its settle frames exist for OptiScaler's cap export and Reflex Sync, so on the pacer the load rule
+switches `burstNow` directly). The refresh rate and the VRR flag are accepted but not read: the D3D12 presenter's pacing does not read them either.
+`LateGen=drop` / `compress` / `early` (experiments) and the clock pacer (`Pacer=clock`, CUDA path) are not exported. The median interval mode of
+`feat/pacer-round2` is not in this branch, so it is not here either; when it lands in `ReadyInterval` the pacer has it with no change.
+Host test: `tests\build_pacer_api_test.ps1 [-Dll build\f5low.dll]` (`tests\pacer_api_test.cpp`): synthetic timelines at 2X to 6X compared to a model of the
+presenter built from the same functions, evenness and ordering checks, the metering decision and plan, and (with the DLL) the exports.
+
 ## Not in the interface on purpose
 
 - Vulkan: the swap chain API stays D3D12 (D3D11 games reach it through OptiScaler's bridge); a host that presents itself, such as a Vulkan output, uses the swapchain-less "Frames only API" above.
