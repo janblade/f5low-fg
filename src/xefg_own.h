@@ -60,6 +60,7 @@
 #include "xefg_interop.h"
 #include "xefg_convert_cs.h"
 #include "xefg_formats.h"
+#include "sl_unwrap.h"
 
 #include <dxgi1_6.h>
 
@@ -1721,6 +1722,16 @@ public:
     }
 
     void Retire();  // xefgSwapChainDestroy: let go of the real swap chain now (after Proxy, below)
+
+    // InitFromSwapChainDesc made the chain through Streamline's factory and presents on the chain under its proxy (sl_unwrap.h): the
+    // proxy's reference is kept until the chain goes (ReleaseSwapChain)
+    void KeepSlProxy(IUnknown* p)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (slProxy)
+            slProxy->Release();
+        slProxy = p;
+    }
 
     // The app releases its swap chain: stop presenting and let go of the real one.
     void Detach()
@@ -5271,6 +5282,9 @@ private:
         if (real)
             real->Release();
         real = nullptr;
+        if (slProxy)
+            slProxy->Release();     // Streamline's proxy of the chain (sl_unwrap.h): after the chain under it
+        slProxy = nullptr;
         // latencySem stays until ~Own (or the next Wrap): an app may still wait on its duplicate of our handle, and
         // OnPresent keeps releasing it once there is no real swap chain.
         // The handle GetFrameLatencyWaitableObject gave us is ours to close (the presenter has stopped, nothing waits on it any more);
@@ -5858,6 +5872,7 @@ private:
 
     // The swap chain: the real one, our backbuffers, the frame-latency wait.
     IDXGISwapChain4* real = nullptr;
+    IUnknown* slProxy = nullptr;    // Streamline's proxy of `real` when the chain was made through its factory (KeepSlProxy)
     DXGI_SWAP_CHAIN_DESC1 scDesc {};
     std::vector<ID3D12Resource*> appBufs;
     UINT appIndex = 0;

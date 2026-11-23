@@ -68,6 +68,7 @@
 // Only what Intel's 1.3.4.95 uses is implemented with care (see the plan, Story 3 step 1); the rest is forwarded.
 #pragma once
 #include "scproxy.h"
+#include "../sl_unwrap.h"
 #include "../pace_lead.h"
 #include "../pace_sched.h"
 #include "release_rule.h"
@@ -1219,6 +1220,9 @@ public:
     unsigned FullWaits() const { return fullWaits; }
 
     SinkSwapChain** owner = nullptr;    // the factory's pointer to this sink, cleared when it goes (under g_linkMu)
+    // Streamline's proxy of the real chain when it was made through Streamline's factory (sl_unwrap.h): released with the sink
+    void KeepSlProxy(IUnknown* p) { slProxy = p; }
+    IUnknown* slProxy = nullptr;
 
     ULONG STDMETHODCALLTYPE Release() override
     {
@@ -1291,6 +1295,8 @@ public:
             if (dev)
                 dev->Release();
             r->Release();
+            if (slProxy)
+                slProxy->Release();     // Streamline's proxy of r (sl_unwrap.h): after the chain under it
             delete this;
         }
         return n;
@@ -1510,6 +1516,14 @@ public:
             return h;
         }
         real1->Release();
+        // Made through a factory Streamline wraps (the game's own sl.interposer): the pacer thread presents on the chain under Streamline's
+        // proxy, so its present hook only runs for the game's Present (sl_unwrap.h); the proxy goes with the sink
+        IUnknown* slProxy = nullptr;
+        IDXGISwapChain4* proxyChain = real4;
+        const bool unwrapped = slunwrap::Unwrap(real4, &slProxy);
+        if (unwrapped && g_log)
+            g_log("sink: chain made through Streamline's factory - the pacer presents on the chain under its proxy (%p -> %p)", static_cast<void*>(proxyChain),
+                  static_cast<void*>(real4));
         ID3D12CommandQueue* sq = nullptr;
         {
             std::lock_guard<std::mutex> g(g_linkMu);
@@ -1518,6 +1532,7 @@ public:
                 sq->AddRef();
         }
         auto* sink = new SinkSwapChain(real4, desc->BufferCount, d, stable, sq);
+        sink->KeepSlProxy(slProxy);
         if (g_log && sink->Ok())
             g_log("sink: chain made on library queue %p; GPU stamps on the application queue %p (%s)", static_cast<void*>(sink->LibraryQueue()), static_cast<void*>(sq),
                   !sq ? "none given: CPU stamps" : !sink->StampQueue() ? "not on the sink's device: CPU stamps" : sink->StampQueue() == sink->LibraryQueue() ? "the same queue" : "a different queue");
