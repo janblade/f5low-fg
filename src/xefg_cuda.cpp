@@ -2107,6 +2107,18 @@ xefg_swapchain_result_t xefgSwapChainD3D12InitFromSwapChainDesc(xefg_swapchain_h
             return XEFG_SWAPCHAIN_RESULT_ERROR_DXGI_INVALID_CALL;
         }
         sc1->Release();
+        {
+            // Made through a factory Streamline wraps (the game's own sl.interposer): our presenter presents on the chain under
+            // Streamline's proxy, so its present hook only runs for the game's Present (sl_unwrap.h)
+            IUnknown* slProxy = nullptr;
+            IDXGISwapChain4* proxyChain = sc4;
+            if (slunwrap::Unwrap(sc4, &slProxy))
+            {
+                Log("swap chain: made through Streamline's factory - presenting on the chain under its proxy (%p -> %p)",
+                    static_cast<void*>(proxyChain), static_cast<void*>(sc4));
+                o->KeepSlProxy(slProxy);
+            }
+        }
         o->initFlags = ip->initFlags;
         o->initParams = *ip;
         {
